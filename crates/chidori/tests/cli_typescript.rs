@@ -3727,31 +3727,22 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
         String::from_utf8_lossy(&request).contains("POST /v1/chat/completions");
 
     // The provider is blocked after the Engine has persisted Pending state.
-    // Observe whether cmd_chat retained A before the test changes the lease.
-    // Current main has no lease here because its tokenless SQLite attempt
-    // warns and continues; a corrected command must report its own owner.
+    // Observe cmd_chat's persisted lease before any test-side lease change.
     let owner_a = format!("chidori-chat-{}", child.id());
     let lease_at_safepoint = store.get_blob("lease.json").unwrap();
-    let observed_chat_generation = lease_at_safepoint
+    let lease_bytes = lease_at_safepoint
         .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .filter(|lease| lease["owner"] == owner_a)
-        .and_then(|lease| lease["generation"].as_u64());
-    let chat_owned_a = observed_chat_generation.is_some();
-
-    // On vulnerable main, create A only after recording the missing chat
-    // tenure. This continues the fixture through the stale Engine-write
-    // oracle instead of letting setup obscure that second gap.
-    let _tenure_a =
-        acquire_lease_with_token(store.as_ref(), &owner_a, chrono::Duration::minutes(10))
-            .unwrap()
-            .expect("chat-owner tenure is available at provider safepoint");
-    let lease_bytes = store.get_blob("lease.json").unwrap().unwrap();
-    let generation_a = serde_json::from_slice::<serde_json::Value>(&lease_bytes).unwrap()
-        ["generation"]
+        .expect("cmd_chat must have persisted its lease before the provider request");
+    let observed_lease: serde_json::Value = serde_json::from_slice(lease_bytes).unwrap();
+    let chat_owned_a = observed_lease["owner"] == owner_a;
+    assert_eq!(
+        observed_lease["owner"], owner_a,
+        "observe cmd_chat's lease owner before any test-side acquisition"
+    );
+    let generation_a = observed_lease["generation"]
         .as_u64()
-        .unwrap();
-    let mut expired_lease: serde_json::Value = serde_json::from_slice(&lease_bytes).unwrap();
+        .expect("cmd_chat lease must include its generation");
+    let mut expired_lease = observed_lease;
     expired_lease["expires_at"] =
         serde_json::Value::String((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
     store
@@ -3794,6 +3785,20 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
                 .ok()
                 .is_some_and(|record| record["state"] == "pending")
     });
+    let pending_promises_before_release = blobs_before_release
+        .iter()
+        .filter(|(key, bytes)| {
+            key.starts_with("host_promises/")
+                && serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .is_some_and(|record| record["state"] == "pending")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let pending_blob_before_release = blobs_before_release
+        .iter()
+        .find(|(key, _)| key == "pending.json")
+        .cloned();
 
     // Queue another turn behind the already-dispatched request. A stale chat
     // must fail its tenure check after the first response and exit before it
@@ -3840,6 +3845,23 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
     let mirror_unchanged = blobs_after == blobs_before_release;
     let lease_unchanged = lease_after == lease_b;
     let local_unchanged = local_after == local_before_release;
+    let pending_promises_after = blobs_after
+        .iter()
+        .filter(|(key, bytes)| {
+            key.starts_with("host_promises/")
+                && serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .is_some_and(|record| record["state"] == "pending")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let pending_promise_unchanged = !pending_promises_before_release.is_empty()
+        && pending_promises_after == pending_promises_before_release;
+    let pending_blob_after = blobs_after
+        .iter()
+        .find(|(key, _)| key == "pending.json")
+        .cloned();
+    let pending_blob_unchanged = pending_blob_after == pending_blob_before_release;
     let stale_write_rejected = stderr_text.contains("SQLite lease ownership lost");
     assert!(
         request_is_expected
@@ -3855,9 +3877,11 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
             && prompt_count == 2
             && journal_unchanged
             && mirror_unchanged
+            && pending_promise_unchanged
+            && pending_blob_unchanged
             && lease_unchanged
             && local_unchanged,
-        "cmd_chat must retain A at the provider safepoint, reject A's stale Engine write, preserve B's SQLite/FS state, and stop before a queued follow-up turn: status={status}; stdout-before-prompt={}; prompt_count={prompt_count}; stderr={stderr_text}; chat_owned_a={chat_owned_a}; observed_generation={observed_chat_generation:?}; stale_write_rejected={stale_write_rejected}; journal_unchanged={journal_unchanged}; mirror_unchanged={mirror_unchanged}; lease_unchanged={lease_unchanged}; local_unchanged={local_unchanged}",
+        "cmd_chat must retain A at the provider safepoint, reject A's stale Engine write, preserve B's SQLite/FS state, and stop before a queued follow-up turn: status={status}; stdout-before-prompt={}; prompt_count={prompt_count}; stderr={stderr_text}; chat_owned_a={chat_owned_a}; observed_generation={generation_a}; stale_write_rejected={stale_write_rejected}; journal_unchanged={journal_unchanged}; mirror_unchanged={mirror_unchanged}; pending_promise_unchanged={pending_promise_unchanged}; pending_blob_unchanged={pending_blob_unchanged}; lease_unchanged={lease_unchanged}; local_unchanged={local_unchanged}",
         String::from_utf8_lossy(&prompt_prefix)
     );
 }
