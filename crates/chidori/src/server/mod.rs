@@ -44,6 +44,13 @@ mod sessions;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use sessions::stream::{
+    observe_next_signal_timeout_arm, observe_signal_resume_dispatch,
+    observe_signal_resume_lease_attempt, observe_signal_resume_result,
+    observe_signal_timeout_dispatch,
+};
+
 use detached::{
     get_detached_agent, list_detached_agents, send_detached_agent, stop_detached_agent,
 };

@@ -4,6 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -14,6 +16,8 @@ use crate::runtime::context::{InputMode, RuntimeContext, RuntimeEvent};
 use crate::runtime::engine::RunResult;
 use crate::runtime::host_core::signal_timeout_sentinel;
 use crate::runtime::snapshot::PendingHostOperationKind;
+#[cfg(test)]
+use crate::runtime::snapshot::QueuedSignal;
 use crate::storage::{SessionStatus, StoredSession};
 
 use super::super::engine::build_engine;
@@ -25,6 +29,217 @@ use super::super::{
 };
 use super::resume::signal_resolution_record;
 use super::{agent_error_string, apply_run_outcome, validate_policy_profile, CreateSessionRequest};
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SignalResumeLeaseAttemptSnapshot {
+    pub session_status: SessionStatus,
+    pub pending_seq: Option<u64>,
+    pub durable_inbox: Vec<QueuedSignal>,
+    pub memory_inbox: Vec<QueuedSignal>,
+    pub acquisition: &'static str,
+}
+
+#[cfg(test)]
+fn lease_acquisition_label<E: std::fmt::Debug>(
+    result: &Result<Option<super::super::RunLeaseGuard>, E>,
+) -> &'static str {
+    match result {
+        Ok(Some(_)) => "acquired",
+        Ok(None) => "unavailable",
+        Err(error) => {
+            // This test-only observer runs against both the pre-fix main API
+            // (whose error is a bare RunLease) and the reviewed API
+            // (RunLeaseAcquisitionError::{Held, Failed}). Keep those cases
+            // distinct without changing the production lease result path.
+            let debug = format!("{error:?}");
+            if debug.starts_with("Failed(") || debug.contains("::Failed(") {
+                "failed"
+            } else {
+                "held"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SignalResumeDispatchSnapshot {
+    pub handled: bool,
+    pub remains_supervised: bool,
+    pub session_status: SessionStatus,
+    pub persisted_session_status: Option<SessionStatus>,
+    pub pending_seq: Option<u64>,
+    pub durable_inbox: Vec<QueuedSignal>,
+    pub memory_inbox: Vec<QueuedSignal>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SignalResumeResultSnapshot {
+    pub session_status: SessionStatus,
+    pub supervision_active: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SignalTimeoutDispatchSnapshot {
+    pub handled: bool,
+    pub remains_supervised: bool,
+    pub session_status: SessionStatus,
+    pub persisted_session_status: Option<SessionStatus>,
+    pub persisted_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub local_deadline_armed: bool,
+}
+
+#[cfg(test)]
+struct SignalResumeDispatchObserver {
+    snapshot: tokio::sync::oneshot::Sender<SignalResumeDispatchSnapshot>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct SignalTimeoutDispatchObserver {
+    snapshot: tokio::sync::oneshot::Sender<SignalTimeoutDispatchSnapshot>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct SignalTimeoutArmObserver {
+    run_id: tokio::sync::oneshot::Sender<String>,
+    expire: tokio::sync::oneshot::Receiver<chrono::DateTime<chrono::Utc>>,
+}
+
+#[cfg(test)]
+static SIGNAL_RESUME_LEASE_OBSERVERS: OnceLock<
+    Mutex<
+        std::collections::HashMap<
+            String,
+            tokio::sync::oneshot::Sender<SignalResumeLeaseAttemptSnapshot>,
+        >,
+    >,
+> = OnceLock::new();
+
+#[cfg(test)]
+static SIGNAL_RESUME_DISPATCH_OBSERVERS: OnceLock<
+    Mutex<std::collections::HashMap<String, SignalResumeDispatchObserver>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static SIGNAL_TIMEOUT_DISPATCH_OBSERVERS: OnceLock<
+    Mutex<std::collections::HashMap<String, SignalTimeoutDispatchObserver>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static SIGNAL_TIMEOUT_ARM_OBSERVER: OnceLock<Mutex<Option<SignalTimeoutArmObserver>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static SIGNAL_RESUME_RESULT_OBSERVERS: OnceLock<
+    Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<SignalResumeResultSnapshot>>,
+    >,
+> = OnceLock::new();
+
+/// Observe the exact point after an in-process signal resume attempts its
+/// lease and before it mutates the paused run. The observer is test-only and
+/// keyed by run id so parallel server tests cannot observe each other's runs.
+#[cfg(test)]
+pub(crate) fn observe_signal_resume_lease_attempt(
+    run_id: &str,
+    sender: tokio::sync::oneshot::Sender<SignalResumeLeaseAttemptSnapshot>,
+) {
+    SIGNAL_RESUME_LEASE_OBSERVERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(run_id.to_string(), sender);
+}
+
+#[cfg(test)]
+fn notify_signal_resume_lease_observer(
+    state: &AppState,
+    session: &StoredSession,
+    ctx_slot: &Arc<StdMutex<RuntimeContext>>,
+    run_id: &str,
+    acquisition: &'static str,
+) {
+    if let Some(sender) = SIGNAL_RESUME_LEASE_OBSERVERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .remove(run_id)
+    {
+        let snapshot = SignalResumeLeaseAttemptSnapshot {
+            session_status: session.status.clone(),
+            pending_seq: session.pending_seq,
+            durable_inbox: super::super::load_persisted_signal_inbox(
+                &state.run_base,
+                session.run_id.as_deref(),
+            ),
+            memory_inbox: ctx_slot.lock().unwrap().signal_inbox(),
+            acquisition,
+        };
+        let _ = sender.send(snapshot);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_next_signal_timeout_arm(
+    run_id: tokio::sync::oneshot::Sender<String>,
+    expire: tokio::sync::oneshot::Receiver<chrono::DateTime<chrono::Utc>>,
+) {
+    *SIGNAL_TIMEOUT_ARM_OBSERVER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(SignalTimeoutArmObserver { run_id, expire });
+}
+
+/// Pause the test stream immediately after the in-process resume handler
+/// returns, before the event loop clears supervision or consumes result_rx.
+#[cfg(test)]
+pub(crate) fn observe_signal_resume_dispatch(
+    run_id: &str,
+    snapshot: tokio::sync::oneshot::Sender<SignalResumeDispatchSnapshot>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    SIGNAL_RESUME_DISPATCH_OBSERVERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            run_id.to_string(),
+            SignalResumeDispatchObserver { snapshot, release },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn observe_signal_timeout_dispatch(
+    run_id: &str,
+    snapshot: tokio::sync::oneshot::Sender<SignalTimeoutDispatchSnapshot>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    SIGNAL_TIMEOUT_DISPATCH_OBSERVERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            run_id.to_string(),
+            SignalTimeoutDispatchObserver { snapshot, release },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn observe_signal_resume_result(
+    run_id: &str,
+    sender: tokio::sync::oneshot::Sender<SignalResumeResultSnapshot>,
+) {
+    SIGNAL_RESUME_RESULT_OBSERVERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(run_id.to_string(), sender);
+}
 
 /// POST /sessions/stream — run the agent and stream each host-function call
 /// as a Server-Sent Event while it executes. Final event has `event: done`
@@ -383,7 +598,21 @@ fn resume_signal_pause_in_process(
     // in-process resume mutates the run's durable state and re-drives the
     // run. A lease held elsewhere (a second server, a CLI resume) means we
     // stand down — the pause stays supervised and the holder drives it.
-    let lease = match super::super::acquire_run_lease(state, session.run_id.as_deref()) {
+    #[cfg(test)]
+    let lease_result = {
+        let result = super::super::acquire_run_lease(state, session.run_id.as_deref());
+        notify_signal_resume_lease_observer(
+            state,
+            session,
+            ctx_slot,
+            &run_id,
+            lease_acquisition_label(&result),
+        );
+        result
+    };
+    #[cfg(not(test))]
+    let lease_result = super::super::acquire_run_lease(state, session.run_id.as_deref());
+    let lease = match lease_result {
         Ok(lease) => lease,
         Err(holder) => {
             tracing::warn!(
@@ -671,6 +900,7 @@ pub(in crate::server) async fn stream_session(
                                     "payload": entry.payload,
                                     "from": entry.from,
                                 });
+                                #[cfg(not(test))]
                                 if resume_signal_pause_in_process(
                                     &state_for_stream, &mut session, &ctx_slot,
                                     &event_tx, &result_tx, &permit,
@@ -679,6 +909,55 @@ pub(in crate::server) async fn stream_session(
                                     supervising = None;
                                     deadline = None;
                                 }
+                                #[cfg(test)]
+                                {
+                                let resumed = resume_signal_pause_in_process(
+                                    &state_for_stream, &mut session, &ctx_slot,
+                                    &event_tx, &result_tx, &permit,
+                                    policy_profile.clone(), seq, value,
+                                );
+                                #[cfg(test)]
+                                let dispatch_observer = {
+                                    SIGNAL_RESUME_DISPATCH_OBSERVERS
+                                        .get_or_init(|| {
+                                            Mutex::new(std::collections::HashMap::new())
+                                        })
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&session
+                                            .run_id
+                                            .clone()
+                                            .unwrap_or_else(|| session.id.clone()))
+                                };
+                                #[cfg(test)]
+                                if let Some(observer) = dispatch_observer {
+                                    let persisted = state_for_stream
+                                        .session_store
+                                        .get(&session.id)
+                                        .ok()
+                                        .flatten();
+                                    let snapshot = SignalResumeDispatchSnapshot {
+                                        handled: resumed,
+                                        remains_supervised: !resumed && supervising.is_some(),
+                                        session_status: session.status.clone(),
+                                        persisted_session_status: persisted
+                                            .as_ref()
+                                            .map(|stored| stored.status.clone()),
+                                        pending_seq: session.pending_seq,
+                                        durable_inbox: super::super::load_persisted_signal_inbox(
+                                            &state_for_stream.run_base,
+                                            session.run_id.as_deref(),
+                                        ),
+                                        memory_inbox: ctx_slot.lock().unwrap().signal_inbox(),
+                                    };
+                                    let _ = observer.snapshot.send(snapshot);
+                                    let _ = observer.release.await;
+                                }
+                                if resumed {
+                                    supervising = None;
+                                    deadline = None;
+                                }
+                                }
                             }
                         }
                     }
@@ -686,6 +965,8 @@ pub(in crate::server) async fn stream_session(
                 _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
                     // `timeoutMs` deadline passed with no matching delivery:
                     // resolve the supervised pause with the timeout sentinel.
+                    #[cfg(not(test))]
+                    {
                     if let Some((seq, names)) = supervising.clone() {
                         let sentinel = signal_timeout_sentinel(&names);
                         if resume_signal_pause_in_process(
@@ -695,6 +976,50 @@ pub(in crate::server) async fn stream_session(
                         ) {
                             supervising = None;
                         }
+                    }
+                    }
+                    #[cfg(test)]
+                    {
+                    let resumed = if let Some((seq, names)) = supervising.clone() {
+                        let sentinel = signal_timeout_sentinel(&names);
+                        resume_signal_pause_in_process(
+                            &state_for_stream, &mut session, &ctx_slot,
+                            &event_tx, &result_tx, &permit,
+                            policy_profile.clone(), seq, sentinel,
+                        )
+                    } else {
+                        false
+                    };
+                    #[cfg(test)]
+                    let timeout_observer = SIGNAL_TIMEOUT_DISPATCH_OBSERVERS
+                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                        .lock()
+                        .unwrap()
+                        .remove(&session.run_id.clone().unwrap_or_else(|| session.id.clone()));
+                    #[cfg(test)]
+                    if let Some(observer) = timeout_observer {
+                        let persisted = state_for_stream
+                            .session_store
+                            .get(&session.id)
+                            .ok()
+                            .flatten();
+                        let snapshot = SignalTimeoutDispatchSnapshot {
+                            handled: resumed,
+                            remains_supervised: !resumed && supervising.is_some(),
+                            session_status: session.status.clone(),
+                            persisted_session_status: persisted
+                                .as_ref()
+                                .map(|stored| stored.status.clone()),
+                            persisted_deadline: persisted
+                                .and_then(|stored| stored.pending_signal_deadline),
+                            local_deadline_armed: deadline.is_some(),
+                        };
+                        let _ = observer.snapshot.send(snapshot);
+                        let _ = observer.release.await;
+                    }
+                    if resumed {
+                        supervising = None;
+                    }
                     }
                     deadline = None;
                 }
@@ -715,6 +1040,21 @@ pub(in crate::server) async fn stream_session(
                         session.error = Some("session cancelled".to_string());
                     }
                     let _ = state_for_stream.session_store.put(&session);
+                    #[cfg(test)]
+                    {
+                        let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
+                        let observer = SIGNAL_RESUME_RESULT_OBSERVERS
+                            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                            .lock()
+                            .unwrap()
+                            .remove(&run_id);
+                        if let Some(sender) = observer {
+                            let _ = sender.send(SignalResumeResultSnapshot {
+                                session_status: session.status.clone(),
+                                supervision_active: supervising.is_some(),
+                            });
+                        }
+                    }
 
                     if session.status == SessionStatus::Paused
                         && !session.pending_signal_names.is_empty()
@@ -760,6 +1100,21 @@ pub(in crate::server) async fn stream_session(
                                 let wait = (d - chrono::Utc::now()).to_std().unwrap_or_default();
                                 tokio::time::Instant::now() + wait
                             });
+                        }
+                        #[cfg(test)]
+                        let timeout_arm_observer = SIGNAL_TIMEOUT_ARM_OBSERVER
+                            .get_or_init(|| Mutex::new(None))
+                            .lock()
+                            .unwrap()
+                            .take();
+                        #[cfg(test)]
+                        if let Some(observer) = timeout_arm_observer {
+                            let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
+                            let _ = observer.run_id.send(run_id);
+                            if let Ok(expired_deadline) = observer.expire.await {
+                                session.pending_signal_deadline = Some(expired_deadline);
+                                deadline = Some(tokio::time::Instant::now());
+                            }
                         }
                         continue;
                     }

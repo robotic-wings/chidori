@@ -2573,6 +2573,869 @@ async fn start_stream(
     })
 }
 
+/// A real external fenced SQLite tenure must prevent in-process signal resume
+/// from consuming the acknowledged delivery. The child process isolates the
+/// environment-driven RunStoreFactory; test-only observers snapshot the real
+/// acquisition and post-dispatch state.
+#[tokio::test]
+async fn stream_signal_held_lease_keeps_delivery_recoverable() {
+    const CHILD: &str = "CHIDORI_TEST_SIGNAL_LEASE_HELD_CHILD";
+    const ROOT: &str = "CHIDORI_TEST_SIGNAL_LEASE_HELD_ROOT";
+    const TEST: &str = "server::tests::stream_signal_held_lease_keeps_delivery_recoverable";
+    if std::env::var_os(CHILD).is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runs.sqlite3");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, temp.path())
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "in-process signal lease recovery contract failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(ROOT).expect("child root"));
+    let source = r#"
+        export async function agent(input, chidori) {
+            const review = await chidori.signal("review");
+            return { nonce: review.payload.nonce, by: review.from.id };
+        }
+    "#;
+    let agent_path = write_agent(&root, source);
+    let state = signal_test_state(&root, agent_path);
+    let mut sse = start_stream(&state, "lease-held-live-signal", json!({})).await;
+    let paused = wait_for_status(&state, "lease-held-live-signal", SessionStatus::Paused).await;
+    let run_id = paused
+        .run_id
+        .clone()
+        .expect("streamed session has a run id");
+    assert_eq!(paused.pending_signal_name.as_deref(), Some("review"));
+
+    // Hold a real token-bearing tenure for this exact run. On current main the
+    // legacy tokenless call reports unavailable; the test separately requires
+    // actual Held classification and the no-mutation/recoverable-inbox oracle.
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
+    let journal_before =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_before = store
+        .get_blob(super::PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("paused signal has a persisted pending host operation");
+    let mut external_lease = match crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        "external-signal-holder",
+        chrono::Duration::minutes(1),
+    )
+    .expect("acquire external tenure")
+    {
+        Ok(lease) => Some(lease),
+        Err(holder) => panic!("unexpected pre-existing lease holder: {}", holder.owner),
+    };
+
+    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_lease_attempt(&run_id, attempt_tx);
+    let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_dispatch(&run_id, dispatch_tx, dispatch_release_rx);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_result(&run_id, result_tx);
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("lease-held-live-signal".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"nonce": "keep-this-delivery"}),
+                from: json!({"kind": "test", "id": "lease-red"}),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["status"], json!("delivered_live"));
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
+        .await
+        .expect("in-process signal resume reached its lease attempt")
+        .expect("lease attempt observer was notified");
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx)
+        .await
+        .expect("in-process resume handler returned")
+        .expect("dispatch observer was notified");
+    let journal_at_dispatch =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    if let Some(lease) = external_lease.take() {
+        crate::runtime::store::release_lease_with_token(
+            store.as_ref(),
+            lease.lease(),
+            lease.token(),
+        )
+        .expect("release external test tenure before cleanup");
+    }
+    let result = if dispatch.handled {
+        let _ = dispatch_release_tx.send(());
+        match tokio::time::timeout(std::time::Duration::from_secs(5), result_rx).await {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            _ => None,
+        }
+    } else {
+        let cancel_tx = state
+            .active_sessions
+            .lock()
+            .unwrap()
+            .get("lease-held-live-signal")
+            .map(|active| active.cancel_tx.clone());
+        if let Some(cancel_tx) = cancel_tx {
+            let _ = cancel_tx.send("test cleanup".to_string());
+        }
+        let _ = dispatch_release_tx.send(());
+        None
+    };
+    if result
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.session_status == SessionStatus::Paused)
+        || (dispatch.handled && result.is_none())
+    {
+        let cancel_tx = state
+            .active_sessions
+            .lock()
+            .unwrap()
+            .get("lease-held-live-signal")
+            .map(|active| active.cancel_tx.clone());
+        if let Some(cancel_tx) = cancel_tx {
+            let _ = cancel_tx.send("test cleanup".to_string());
+        }
+    }
+    let sse_text = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut sse).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => format!("stream task failed: {error}"),
+        Err(_) => {
+            sse.abort();
+            "stream did not terminate after test cleanup".to_string()
+        }
+    };
+    let attempt_memory_matches = snapshot
+        .memory_inbox
+        .iter()
+        .filter(|signal| signal.name == "review" && signal.payload["nonce"] == "keep-this-delivery")
+        .count();
+    let attempt_durable_matches = snapshot
+        .durable_inbox
+        .iter()
+        .filter(|signal| signal.name == "review" && signal.payload["nonce"] == "keep-this-delivery")
+        .count();
+    let dispatch_durable_matches = dispatch
+        .durable_inbox
+        .iter()
+        .filter(|signal| signal.name == "review" && signal.payload["nonce"] == "keep-this-delivery")
+        .count();
+    let dispatch_memory_matches = dispatch
+        .memory_inbox
+        .iter()
+        .filter(|signal| signal.name == "review" && signal.payload["nonce"] == "keep-this-delivery")
+        .count();
+    let contract_state = format!(
+        "acquisition={}, attempt_session={:?}, dispatch={dispatch:?}, result={result:?}, pending_seq={:?}, inbox_before_return=({:?}, {:?}), sse={sse_text:?}",
+        snapshot.acquisition,
+        snapshot.session_status,
+        snapshot.pending_seq,
+        snapshot.durable_inbox,
+        snapshot.memory_inbox,
+    );
+    let mut violations = Vec::new();
+    if snapshot.acquisition != "held" {
+        violations.push(format!(
+            "lease result was {}, expected actual Held",
+            snapshot.acquisition
+        ));
+    }
+    if snapshot.session_status != SessionStatus::Paused {
+        violations.push(format!(
+            "session became {:?}, expected Paused",
+            snapshot.session_status
+        ));
+    }
+    if snapshot.pending_seq != paused.pending_seq {
+        violations.push(format!(
+            "pending seq changed from {:?} to {:?}",
+            paused.pending_seq, snapshot.pending_seq
+        ));
+    }
+    if attempt_durable_matches != 0 {
+        violations.push(format!(
+            "durable matching delivery count at lease attempt was {attempt_durable_matches}, expected the dequeued state 0"
+        ));
+    }
+    // The stream removes this exact delivery from the in-memory mailbox just
+    // before attempting the lease. A rejected attempt must put it back; that
+    // recoverability assertion is made against the post-dispatch snapshot.
+    if attempt_memory_matches != 0 {
+        violations.push(format!(
+            "in-memory delivery count at lease attempt was {attempt_memory_matches}, expected the dequeued state 0"
+        ));
+    }
+    if dispatch.handled {
+        violations.push("held lease was reported as handled/resumed".to_string());
+    }
+    if !dispatch.remains_supervised {
+        violations.push("signal pause supervision was cleared while lease was held".to_string());
+    }
+    if dispatch.session_status != SessionStatus::Paused {
+        violations.push(format!(
+            "post-attempt session was {:?}, expected Paused",
+            dispatch.session_status
+        ));
+    }
+    if dispatch.persisted_session_status != Some(SessionStatus::Paused) {
+        violations.push(format!(
+            "post-attempt persisted session was {:?}, expected Paused",
+            dispatch.persisted_session_status
+        ));
+    }
+    if dispatch_durable_matches != 1 {
+        violations.push(format!(
+            "post-attempt durable matching delivery count was {dispatch_durable_matches}, expected 1"
+        ));
+    }
+    if dispatch_memory_matches != 1 {
+        violations.push(format!(
+            "post-attempt in-memory matching delivery count was {dispatch_memory_matches}, expected 1"
+        ));
+    }
+    if journal_at_dispatch != journal_before {
+        violations.push("held signal changed the journal before lease recovery".to_string());
+    }
+    if pending_at_dispatch.as_deref() != Some(pending_before.as_slice()) {
+        violations.push(
+            "held signal changed the pending host operation before lease recovery".to_string(),
+        );
+    }
+    if let Some(result) = &result {
+        if result.session_status != SessionStatus::Paused || !result.supervision_active {
+            violations.push(format!(
+                "post-result state was {:?} with supervision={}, expected Paused/supervised",
+                result.session_status, result.supervision_active
+            ));
+        }
+    }
+    if !sse_text.contains("\"status\":\"cancelled\"") || sse_text.contains("\"status\":\"failed\"")
+    {
+        violations
+            .push("stream did not remain supervised until test cleanup cancellation".to_string());
+    }
+    assert!(
+        violations.is_empty(),
+        "{}; {contract_state}",
+        violations.join("; ")
+    );
+}
+
+/// A real SQLite write failure during lease acquisition is distinct from an
+/// occupied lease. The trigger injects the store failure; the normal stream
+/// acquisition and lease-result path must keep the dequeued delivery and
+/// paused session recoverable instead of terminalizing or resuming it.
+#[tokio::test]
+async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
+    const CHILD: &str = "CHIDORI_TEST_SIGNAL_LEASE_FAILED_CHILD";
+    const ROOT: &str = "CHIDORI_TEST_SIGNAL_LEASE_FAILED_ROOT";
+    const TEST: &str = "server::tests::stream_signal_failed_lease_keeps_delivery_recoverable";
+    if std::env::var_os(CHILD).is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runs.sqlite3");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, temp.path())
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed lease acquisition did not preserve the live signal pause:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(ROOT).expect("child root"));
+    let agent_path = write_agent(
+        &root,
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { nonce: review.payload.nonce, by: review.from.id };
+            }
+        "#,
+    );
+    let state = signal_test_state(&root, agent_path);
+    let mut sse = start_stream(&state, "lease-failed-live-signal", json!({})).await;
+    let paused = wait_for_status(&state, "lease-failed-live-signal", SessionStatus::Paused).await;
+    let run_id = paused.run_id.clone().expect("paused stream has a run id");
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
+    let journal_before =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_before = store
+        .get_blob(super::PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("paused signal has a persisted pending host operation");
+
+    // Fail writes only to the lease blob. The signal inbox, session, and
+    // journal remain writable so this drives the production lease-acquisition
+    // error path rather than failing fixture setup or signal delivery.
+    let db_path = PathBuf::from(std::env::var_os("CHIDORI_RUN_DB").expect("SQLite DB path"));
+    let connection = rusqlite::Connection::open(&db_path).expect("open SQLite test DB");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER test_fail_lease_insert BEFORE INSERT ON run_blobs
+             WHEN NEW.key = 'lease.json'
+             BEGIN SELECT RAISE(ABORT, 'injected lease acquisition failure'); END;
+             CREATE TRIGGER test_fail_lease_update BEFORE UPDATE OF data ON run_blobs
+             WHEN OLD.key = 'lease.json'
+             BEGIN SELECT RAISE(ABORT, 'injected lease acquisition failure'); END;",
+        )
+        .expect("install lease-only failure trigger");
+    drop(connection);
+    let injected_error = crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        "lease-failure-probe",
+        chrono::Duration::minutes(1),
+    )
+    .expect_err("lease-only trigger must fail the real token-aware store operation");
+    assert!(
+        format!("{injected_error:#}").contains("injected lease acquisition failure"),
+        "the SQLite failpoint was not reached: {injected_error:#}"
+    );
+    assert!(
+        store
+            .get_blob(crate::runtime::store::LEASE_FILE)
+            .unwrap()
+            .is_none(),
+        "the failed lease acquisition must not leave a lease blob"
+    );
+
+    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_lease_attempt(&run_id, attempt_tx);
+    let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_dispatch(&run_id, dispatch_tx, dispatch_release_rx);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_result(&run_id, result_tx);
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("lease-failed-live-signal".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"nonce": "keep-after-failed-acquire"}),
+                from: json!({"kind": "test", "id": "lease-failed-red"}),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["status"], json!("delivered_live"));
+
+    let attempt = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
+        .await
+        .expect("live signal reached lease acquisition")
+        .expect("lease attempt observer was notified");
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx)
+        .await
+        .expect("lease-result handler returned")
+        .expect("dispatch observer was notified");
+    let attempt_durable_matches = attempt
+        .durable_inbox
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let attempt_memory_matches = attempt
+        .memory_inbox
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let journal_at_dispatch =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    let durable_at_dispatch = super::load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+
+    // Remove the failpoint before cancellation/cleanup. No synthetic result is
+    // sent to result_tx: the database error flows through the real acquisition
+    // result and stream handler used by production.
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen SQLite test DB");
+    connection
+        .execute_batch(
+            "DROP TRIGGER test_fail_lease_insert;
+             DROP TRIGGER test_fail_lease_update;",
+        )
+        .expect("remove lease-only failure trigger");
+    drop(connection);
+    let _ = dispatch_release_tx.send(());
+
+    let result = if dispatch.handled {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), result_rx).await {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Observe the durable and in-memory state after the lease result has
+    // passed through the stream loop, before cleanup cancellation can change
+    // the session status.
+    let post_result_session = state
+        .session_store
+        .get("lease-failed-live-signal")
+        .unwrap()
+        .expect("session remains persisted after lease result");
+    let post_result_active = state
+        .active_sessions
+        .lock()
+        .unwrap()
+        .get("lease-failed-live-signal")
+        .cloned();
+    let post_result_supervised = post_result_active.is_some();
+    let post_result_memory = post_result_active
+        .and_then(|active| active.signals)
+        .map(|signals| signals.ctx_slot.lock().unwrap().signal_inbox())
+        .unwrap_or_default();
+    let post_result_durable = super::load_persisted_signal_inbox(&state.run_base, Some(&run_id));
+    let post_result_journal =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let post_result_pending = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    if let Some(cancel_tx) = state
+        .active_sessions
+        .lock()
+        .unwrap()
+        .get("lease-failed-live-signal")
+        .map(|active| active.cancel_tx.clone())
+    {
+        let _ = cancel_tx.send("test cleanup".to_string());
+    }
+    let sse_text = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut sse).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => format!("stream task failed: {error}"),
+        Err(_) => {
+            sse.abort();
+            "stream did not terminate after test cleanup".to_string()
+        }
+    };
+    let final_session = state
+        .session_store
+        .get("lease-failed-live-signal")
+        .unwrap()
+        .expect("session remains persisted");
+    let durable_matches = durable_at_dispatch
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let memory_matches = dispatch
+        .memory_inbox
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let post_result_durable_matches = post_result_durable
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let post_result_memory_matches = post_result_memory
+        .iter()
+        .filter(|signal| {
+            signal.name == "review" && signal.payload["nonce"] == "keep-after-failed-acquire"
+        })
+        .count();
+    let state_report = format!(
+        "acquisition={}, dispatch={dispatch:?}, result={result:?}, post_result_session={:?}, post_result_supervised={post_result_supervised}, post_result_durable={post_result_durable:?}, post_result_memory={post_result_memory:?}, final_status={:?}, durable_inbox={durable_at_dispatch:?}, sse={sse_text:?}",
+        attempt.acquisition,
+        post_result_session.status,
+        final_session.status,
+    );
+    let mut violations = Vec::new();
+    if attempt.acquisition != "failed" {
+        violations.push(format!(
+            "injected lease write failure was classified as {}, expected Failed",
+            attempt.acquisition
+        ));
+    }
+    if attempt_durable_matches != 0 || attempt_memory_matches != 0 {
+        violations.push(format!(
+            "signal was not at the expected dequeued lease-attempt cut: durable={attempt_durable_matches}, memory={attempt_memory_matches}"
+        ));
+    }
+    if dispatch.handled {
+        violations.push("failed lease acquisition was handled as a resumed run".to_string());
+    }
+    if !dispatch.remains_supervised
+        || dispatch.session_status != SessionStatus::Paused
+        || dispatch.persisted_session_status != Some(SessionStatus::Paused)
+    {
+        violations.push(format!(
+            "failed lease acquisition changed paused/supervised state: {dispatch:?}"
+        ));
+    }
+    if durable_matches != 1 {
+        violations.push(format!(
+            "durable matching signal count after Failed was {durable_matches}, expected 1"
+        ));
+    }
+    if memory_matches != 1 {
+        violations.push(format!(
+            "memory matching signal count after Failed was {memory_matches}, expected 1"
+        ));
+    }
+    if dispatch.pending_seq != paused.pending_seq {
+        violations.push(format!(
+            "pending seq changed after Failed: {:?} -> {:?}",
+            paused.pending_seq, dispatch.pending_seq
+        ));
+    }
+    if journal_at_dispatch != journal_before {
+        violations.push("Failed lease acquisition changed the journal".to_string());
+    }
+    if pending_at_dispatch.as_deref() != Some(pending_before.as_slice()) {
+        violations.push("Failed lease acquisition changed the pending host operation".to_string());
+    }
+    if let Some(snapshot) = &result {
+        if snapshot.session_status != SessionStatus::Paused || !snapshot.supervision_active {
+            violations.push(format!(
+                "post-result state was {:?}/supervision={}, expected Paused/supervised",
+                snapshot.session_status, snapshot.supervision_active
+            ));
+        }
+    } else if dispatch.handled || !dispatch.remains_supervised {
+        violations.push(
+            "lease failure produced no nonterminal result while dispatch also cleared supervision"
+                .to_string(),
+        );
+    }
+    if post_result_session.status != SessionStatus::Paused || !post_result_supervised {
+        violations.push(format!(
+            "post-result session/supervision was {:?}/{post_result_supervised}, expected Paused/supervised",
+            post_result_session.status
+        ));
+    }
+    if post_result_durable_matches != 1 || post_result_memory_matches != 1 {
+        violations.push(format!(
+            "post-result inbox counts were durable={post_result_durable_matches}, memory={post_result_memory_matches}, expected exactly one in each"
+        ));
+    }
+    if post_result_journal != journal_before {
+        violations
+            .push("Failed lease acquisition changed the journal after result handling".to_string());
+    }
+    if post_result_pending.as_deref() != Some(pending_before.as_slice()) {
+        violations.push(
+            "Failed lease acquisition changed the pending host operation after result handling"
+                .to_string(),
+        );
+    }
+    if final_session.status != SessionStatus::Cancelled {
+        violations.push(format!(
+            "after cleanup, stream/session terminal state is {:?}, expected explicit test cancellation",
+            final_session.status
+        ));
+    }
+    if sse_text.contains("\"status\":\"failed\"") || sse_text.contains("\"status\":\"completed\"") {
+        violations
+            .push("stream emitted Failed/completed instead of retaining the pause".to_string());
+    }
+    if !sse_text.contains("\"status\":\"cancelled\"") {
+        violations
+            .push("stream did not end through explicit test cleanup cancellation".to_string());
+    }
+    assert!(
+        violations.is_empty(),
+        "{}; {state_report}",
+        violations.join("; ")
+    );
+}
+
+/// A timeout that expires while another process owns the run tenure remains
+/// pending and resumes exactly once after that tenure is released. The test
+/// gate expires the persisted deadline and releases the supervisor directly
+/// into its real `sleep_until(deadline)` arm, without a wall-clock sleep.
+#[tokio::test]
+async fn stream_timeout_held_lease_remains_retryable_after_release() {
+    const CHILD: &str = "CHIDORI_TEST_SIGNAL_TIMEOUT_HELD_CHILD";
+    const ROOT: &str = "CHIDORI_TEST_SIGNAL_TIMEOUT_HELD_ROOT";
+    const TEST: &str = "server::tests::stream_timeout_held_lease_remains_retryable_after_release";
+    if std::env::var_os(CHILD).is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("runs.sqlite3");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(ROOT, temp.path())
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "expired timeout was not recoverable after lease release:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(ROOT).expect("child root"));
+    let agent_path = write_agent(
+        &root,
+        r#"
+            export async function agent(input, chidori) {
+                const result = await chidori.signal("review", { timeoutMs: 60000 });
+                return { timedOut: result.timedOut === true };
+            }
+        "#,
+    );
+    let state = signal_test_state(&root, agent_path);
+
+    // The arm observer pauses the real supervisor after it has entered the
+    // signal-pause branch. This lets the test hold the SQLite tenure, set the
+    // persisted deadline into the past, and then enter `sleep_until` due-now.
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let (expire_tx, expire_rx) = tokio::sync::oneshot::channel();
+    super::observe_next_signal_timeout_arm(armed_tx, expire_rx);
+    let mut sse = start_stream(&state, "lease-held-timeout", json!({})).await;
+    let run_id = tokio::time::timeout(std::time::Duration::from_secs(5), armed_rx)
+        .await
+        .expect("signal pause reached its timeout arm")
+        .expect("timeout arm observer sent the run id");
+    let mut paused = state
+        .session_store
+        .get("lease-held-timeout")
+        .unwrap()
+        .expect("paused session persisted before timeout arm");
+    assert_eq!(paused.status, SessionStatus::Paused);
+    assert_eq!(paused.run_id.as_deref(), Some(run_id.as_str()));
+    let original_deadline = paused
+        .pending_signal_deadline
+        .clone()
+        .expect("timeout pause persists its deadline");
+
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
+    let external_lease = crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        "external-timeout-holder",
+        chrono::Duration::minutes(1),
+    )
+    .expect("open SQLite tenure store")
+    .expect("the timeout fixture run lease must be free");
+    let expired_deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
+    paused.pending_signal_deadline = Some(expired_deadline.clone());
+    state.session_store.put(&paused).unwrap();
+
+    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_lease_attempt(&run_id, attempt_tx);
+    let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_timeout_dispatch(&run_id, dispatch_tx, dispatch_release_rx);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_result(&run_id, result_tx);
+    let journal_before =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_before = store
+        .get_blob(super::PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("timeout signal has a persisted pending host operation");
+    let pending_operation: crate::runtime::snapshot::PendingHostOperation =
+        serde_json::from_slice(&pending_before).expect("decode pending timeout operation");
+    expire_tx
+        .send(expired_deadline.clone())
+        .expect("expire pause deadline");
+
+    let attempt = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
+        .await
+        .expect("expired timeout reached the real lease attempt")
+        .expect("lease attempt observer was notified");
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx)
+        .await
+        .expect("timeout resume helper returned")
+        .expect("timeout dispatch observer was notified");
+    let journal_at_dispatch =
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+    let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+
+    crate::runtime::store::release_lease_with_token(
+        store.as_ref(),
+        external_lease.lease(),
+        external_lease.token(),
+    )
+    .expect("release external timeout tenure before retry");
+    let _ = dispatch_release_tx.send(());
+
+    // A correct implementation keeps the expired deadline armed, retries the
+    // same timeout after release, and persists one resolved signal record.
+    // A bounded receive is the failure detector; no sleep is used to order the
+    // lease attempt, release, or supervisor retry.
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(3), result_rx).await {
+        Ok(Ok(snapshot)) => Some(snapshot),
+        _ => None,
+    };
+    if result.is_none() {
+        if let Some(cancel_tx) = state
+            .active_sessions
+            .lock()
+            .unwrap()
+            .get("lease-held-timeout")
+            .map(|active| active.cancel_tx.clone())
+        {
+            let _ = cancel_tx.send("test cleanup".to_string());
+        }
+    }
+    let sse_text = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut sse).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => format!("stream task failed: {error}"),
+        Err(_) => {
+            sse.abort();
+            "stream did not terminate after timeout recovery or test cleanup".to_string()
+        }
+    };
+    let final_session = state
+        .session_store
+        .get("lease-held-timeout")
+        .unwrap()
+        .expect("final session remains persisted");
+    let records = store.load_call_log().unwrap().unwrap();
+    let signal_records = records
+        .iter()
+        .filter(|record| record.function == "signal")
+        .collect::<Vec<_>>();
+    let resolved_promises = crate::runtime::snapshot::load_host_promise_records(store.as_ref())
+        .expect("load resolved timeout host-promise record");
+    let resolved_timeout = resolved_promises
+        .iter()
+        .find(|record| record.operation.id == pending_operation.id);
+    let timeout_sentinel = json!({
+        "name": "review",
+        "payload": null,
+        "from": null,
+        "timedOut": true,
+    });
+    let pending_after = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+
+    let mut violations = Vec::new();
+    if attempt.acquisition != "held" {
+        violations.push(format!(
+            "lease result was {}, expected actual Held for external-timeout-holder",
+            attempt.acquisition
+        ));
+    }
+    if dispatch.handled {
+        violations.push("timeout was resolved while external tenure was held".to_string());
+    }
+    if !dispatch.remains_supervised || dispatch.session_status != SessionStatus::Paused {
+        violations.push(format!(
+            "held-timeout dispatch left {:?}, supervised={}; expected Paused/supervised",
+            dispatch.session_status, dispatch.remains_supervised
+        ));
+    }
+    if dispatch.persisted_session_status != Some(SessionStatus::Paused)
+        || dispatch.persisted_deadline.as_ref() != Some(&expired_deadline)
+        || !dispatch.local_deadline_armed
+    {
+        violations.push(format!(
+            "expired persisted deadline or paused state was not retained at the Held cut: {dispatch:?}"
+        ));
+    }
+    if original_deadline <= expired_deadline {
+        violations
+            .push("original deadline was not later than the forced expired deadline".to_string());
+    }
+    if journal_at_dispatch != journal_before {
+        violations.push("held timeout changed the journal before lease recovery".to_string());
+    }
+    if pending_at_dispatch.as_deref() != Some(pending_before.as_slice()) {
+        violations.push(
+            "held timeout changed the pending host operation before lease recovery".to_string(),
+        );
+    }
+    if !result.as_ref().is_some_and(|snapshot| {
+        snapshot.session_status == SessionStatus::Completed && !snapshot.supervision_active
+    }) {
+        violations.push(format!(
+            "timeout did not complete after lease recovery: result={result:?}, final={:?}",
+            final_session.status
+        ));
+    }
+    if final_session.status != SessionStatus::Completed
+        || final_session.output != Some(json!({ "timedOut": true }))
+    {
+        violations.push(format!(
+            "final timeout result was {:?}/{:?}, expected Completed/timedOut",
+            final_session.status, final_session.output
+        ));
+    }
+    if signal_records.len() != 1 || signal_records[0].result.get("timedOut") != Some(&json!(true)) {
+        violations.push(format!(
+            "durable timeout signal rows were {signal_records:?}, expected exactly one resolved timeout"
+        ));
+    }
+    if signal_records.len() == 1
+        && (signal_records[0].seq != pending_operation.seq
+            || signal_records[0].result != timeout_sentinel)
+    {
+        violations.push(format!(
+            "timeout journal row did not match pending operation id/seq {} / {} and exact sentinel {timeout_sentinel}",
+            pending_operation.id.0,
+            pending_operation.seq,
+        ));
+    }
+    match resolved_timeout.map(|record| (&record.operation, &record.state)) {
+        Some((operation, crate::runtime::snapshot::HostPromiseState::Resolved { value, .. }))
+            if operation.seq == pending_operation.seq
+                && operation.kind == crate::runtime::snapshot::PendingHostOperationKind::Signal
+                && value == &timeout_sentinel => {}
+        other => violations.push(format!(
+            "host-promise completion for id {} seq {} was {other:?}, expected Resolved with {timeout_sentinel}",
+            pending_operation.id.0,
+            pending_operation.seq,
+        )),
+    }
+    if final_session.pending_seq.is_some()
+        || final_session.pending_signal_name.is_some()
+        || !final_session.pending_signal_names.is_empty()
+        || final_session.pending_signal_deadline.is_some()
+        || pending_after.is_some()
+    {
+        violations.push(format!(
+            "completed timeout retained pending fields: session={:?}, pending_host_operation={pending_after:?}",
+            final_session
+        ));
+    }
+    if !sse_text.contains("\"status\":\"completed\"") {
+        violations.push(format!(
+            "stream did not report completed timeout: {sse_text}"
+        ));
+    }
+    assert!(violations.is_empty(), "{}", violations.join("; "));
+}
+
 /// A streaming run that pauses on `signal()` stays live: the delivery
 /// endpoint reports `delivered_live` and the supervisor resolves the pause
 /// in-process (no `/resume` round-trip), the stream carrying a `paused`
