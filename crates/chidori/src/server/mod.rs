@@ -603,7 +603,7 @@ fn persist_signal_consumption_intent_in_store(
         operation,
         record,
     };
-    if let Some(bytes) = store.get_blob(SIGNAL_CONSUMPTION_INTENT_FILE)? {
+    let intent_to_persist = if let Some(bytes) = store.get_blob(SIGNAL_CONSUMPTION_INTENT_FILE)? {
         let existing: SignalConsumptionIntent = serde_json::from_slice(&bytes)?;
         if existing.version != intent.version
             || existing.delivery_seq != intent.delivery_seq
@@ -613,23 +613,21 @@ fn persist_signal_consumption_intent_in_store(
         {
             anyhow::bail!("a conflicting signal consumption intent is already present");
         }
-        // A Tee may expose the intent from its filesystem primary even when
-        // the previous primary-first write failed on the durable secondary.
-        // Re-put and flush the validated value so callers cannot proceed with
-        // promise/inbox/journal mutation until both copies have it.
-        store.put_blob(
-            SIGNAL_CONSUMPTION_INTENT_FILE,
-            &serde_json::to_vec_pretty(&existing)?,
-        )?;
-        store.flush()?;
-        return Ok(existing);
-    }
+        // Preserve the validated value and its original timestamp on retry.
+        existing
+    } else {
+        intent
+    };
+    // A Tee may expose the intent from its filesystem primary even when the
+    // previous primary-first write failed on the durable secondary. Re-put
+    // and flush either selected value before callers can proceed with
+    // promise/inbox/journal mutation.
     store.put_blob(
         SIGNAL_CONSUMPTION_INTENT_FILE,
-        &serde_json::to_vec_pretty(&intent)?,
+        &serde_json::to_vec_pretty(&intent_to_persist)?,
     )?;
     store.flush()?;
-    Ok(intent)
+    Ok(intent_to_persist)
 }
 
 /// Complete an interrupted live signal consumption before replay loads its
