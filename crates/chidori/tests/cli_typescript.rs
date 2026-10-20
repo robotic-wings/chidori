@@ -2306,6 +2306,14 @@ fn cli_plain_run_reports_prompt_progress_on_stderr() {
 /// provider either). Used to force a deterministic provider failure — and to
 /// prove `verify` needs no provider.
 fn run_chidori_without_providers(args: &[&str], cwd: &Path) -> Output {
+    run_chidori_without_providers_with_env(args, cwd, &[])
+}
+
+fn run_chidori_without_providers_with_env(
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(&str, &str)],
+) -> Output {
     let mut command = Command::new(chidori_bin());
     command.args(args).current_dir(cwd).env("HOME", cwd);
     for key in [
@@ -2320,6 +2328,9 @@ fn run_chidori_without_providers(args: &[&str], cwd: &Path) -> Output {
         "CHIDORI_TEST_LLM_RESPONSE",
     ] {
         command.env_remove(key);
+    }
+    for (key, value) in envs {
+        command.env(key, value);
     }
     command.output().unwrap()
 }
@@ -2342,32 +2353,70 @@ fn first_run_id(dir: &Path) -> String {
 // `--until-seq` surgery.
 #[test]
 fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
+    let server = LocalHttpServer::start();
     let dir = temp_project("retry-failed");
     let agent = dir.join("agent.ts");
     fs::write(
         &agent,
-        r#"
-            export async function agent(input, chidori) {
-                await chidori.log("start", {});
+        format!(
+            r#"
+            export async function agent(input, chidori) {{
+                await chidori.log("start", {{}});
+                const response = await fetch("http://{}/resolved-prefix");
+                const effect = await response.json();
                 const text = await chidori.prompt("say hi");
-                return { text };
-            }
+                return {{ effect, text }};
+            }}
         "#,
+            server.address
+        ),
     )
     .unwrap();
 
     // Force the failure: no provider configured, so the prompt call fails
-    // and journals as the run's trailing failed record.
-    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    // and journals as the run's trailing failed record. The HTTP result in
+    // the prefix is already resolved and must not be contacted again by retry.
+    let run_env = [
+        ("CHIDORI_DURABILITY", "effect"),
+        ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+    ];
+    let output = run_chidori_without_providers_with_env(
+        &["run", agent.to_str().unwrap(), "--trusted"],
+        &dir,
+        &run_env,
+    );
     assert_failure(&output);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "initial HTTP effect must run once"
+    );
     let run_id = first_run_id(&dir);
     let run_dir = dir.join(".chidori").join("runs").join(&run_id);
     let promise_path = run_dir.join("host_promises.json");
     let promises: serde_json::Value =
         serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
-    assert!(promises[1]["state"].get("rejected").is_some());
+    let rejected_prompt = promises
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|promise| promise["operation"]["kind"] == "prompt")
+        .expect("failed prompt must have a durable host-promise record");
+    assert!(rejected_prompt["state"].get("rejected").is_some());
     let journal_before = journal_records(&run_dir.join("records.jsonl"));
     assert!(journal_before.last().unwrap()["error"].is_string());
+    let prefix_before = journal_before[..2].to_vec();
+    assert_eq!(prefix_before[1]["function"], "http");
+    let resolved_http_before = promises
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|promise| promise["operation"]["kind"] == "http")
+        .expect("the completed HTTP prefix must have a durable promise record")
+        .clone();
+    assert!(resolved_http_before["state"]
+        .get("resolved_in_journal")
+        .is_some());
 
     // A plain resume would replay the recorded failure. --retry-failed
     // strips it and re-executes the prompt live against the now-working
@@ -2375,7 +2424,36 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
     let output = run_chidori_with_str_env(
         &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
         &dir,
-        &[("CHIDORI_TEST_LLM_RESPONSE", "repaired")],
+        &[
+            ("CHIDORI_TEST_LLM_RESPONSE", "repaired"),
+            ("CHIDORI_DURABILITY", "effect"),
+            ("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1"),
+        ],
+    );
+    // Check the external effect and preserved promise before assert_success:
+    // on vulnerable main, replay incorrectly returns the old Rejected prompt.
+    let request_count_after_retry = server.request_count();
+    let journal_after_retry = journal_records(&run_dir.join("records.jsonl"));
+    let promises_after_retry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    let resolved_http_after = promises_after_retry
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|promise| promise["operation"]["kind"] == "http")
+        .expect("retry must retain the completed HTTP promise");
+    assert_eq!(
+        request_count_after_retry, 1,
+        "retry must not repeat an already resolved prefix HTTP effect"
+    );
+    assert_eq!(
+        journal_after_retry[..2],
+        prefix_before,
+        "retry must preserve the completed prefix records"
+    );
+    assert_eq!(
+        resolved_http_after, &resolved_http_before,
+        "retry must preserve the unrelated resolved HTTP promise"
     );
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2389,10 +2467,19 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
     );
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["text"], "repaired");
+    assert_eq!(stdout["effect"]["ok"], true);
     let promises: serde_json::Value =
         serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    let repaired_prompt = promises
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|promise| promise["operation"]["kind"] == "prompt")
+        .expect("retried prompt must retain its durable host-promise record");
     assert!(
-        promises[1]["state"].get("resolved_in_journal").is_some(),
+        repaired_prompt["state"]
+            .get("resolved_in_journal")
+            .is_some(),
         "retry must replace the old rejected completion with the repaired durable result"
     );
 
@@ -2400,6 +2487,11 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
     // identical output with NO provider configured.
     let output = run_chidori_without_providers(&["verify", agent.to_str().unwrap(), &run_id], &dir);
     assert_success(&output);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "verify must replay the HTTP prefix"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
