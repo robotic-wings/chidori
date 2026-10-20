@@ -69,6 +69,13 @@ use sessions::{
     session_policy,
 };
 
+/// One-shot observer for tests that need to synchronize with startup's
+/// actual held-lease branch. Production builds contain no observer state.
+#[cfg(test)]
+pub(crate) static STARTUP_LEASE_HELD_TEST_OBSERVER: StdMutex<
+    Option<tokio::sync::oneshot::Sender<()>>,
+> = StdMutex::new(None);
+
 // Test-only re-imports: they keep the flat namespace the test module's
 // `use super::*` saw when this module was a single file.
 #[cfg(test)]
@@ -1264,6 +1271,8 @@ pub async fn serve(
         .list()
         .context("listing sessions for signal recovery")?;
     for session in startup_sessions {
+        #[cfg(test)]
+        let mut startup_lease_held = false;
         let recovered = if session.status == SessionStatus::Paused {
             if let Some(run_id) = session.run_id.as_deref() {
                 match acquire_signal_resume_lease(&state, Some(run_id)) {
@@ -1297,6 +1306,10 @@ pub async fn serve(
                             session.clone(),
                             run_id.to_string(),
                         );
+                        #[cfg(test)]
+                        {
+                            startup_lease_held = true;
+                        }
                         true
                     }
                     Err(RunLeaseAcquisitionError::Failed(error)) => {
@@ -1313,6 +1326,12 @@ pub async fn serve(
         };
         if !recovered {
             arm_signal_timeout(&state, &session);
+        }
+        #[cfg(test)]
+        if startup_lease_held {
+            if let Some(observer) = STARTUP_LEASE_HELD_TEST_OBSERVER.lock().unwrap().take() {
+                let _ = observer.send(());
+            }
         }
     }
 

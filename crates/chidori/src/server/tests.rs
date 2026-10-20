@@ -4309,6 +4309,14 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
             })
             .unwrap();
 
+        let held_observed = if hold_external_lease {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            *super::STARTUP_LEASE_HELD_TEST_OBSERVER.lock().unwrap() = Some(sender);
+            Some(receiver)
+        } else {
+            None
+        };
+
         let server = tokio::spawn(serve(
             Arc::new(ProviderRegistry::new()),
             Arc::new(TemplateEngine::new(root.to_string_lossy().into_owned())),
@@ -4319,10 +4327,14 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
             "test".to_string(),
             None,
         ));
-        if let Some(grant) = external_lease {
-            // `serve` returns from startup only after installing its retry
-            // task and binding the listener. Keep the real holder in place
-            // past the deadline, then verify all durable pieces remain intact.
+        if let (Some(grant), Some(held_observed)) = (external_lease, held_observed) {
+            // Wait for the actual startup Held branch, then keep the lease
+            // past the expired deadline so an incorrectly armed timer has
+            // time to run before checking durable state.
+            tokio::time::timeout(std::time::Duration::from_secs(10), held_observed)
+                .await
+                .expect("startup reached held-lease branch")
+                .expect("startup held-lease notification delivered");
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             assert!(
                 !server.is_finished(),
