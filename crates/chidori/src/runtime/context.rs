@@ -1770,6 +1770,31 @@ impl RuntimeContext {
         self.inner.lock().unwrap().signal_inbox.clone()
     }
 
+    /// Clone one queued signal without consuming it. Live resume uses this to
+    /// identify a candidate before lease acquisition while keeping its durable
+    /// and in-memory copies available if another owner holds the run.
+    pub fn queued_signal_by_delivery_seq(&self, delivery_seq: u64) -> Option<QueuedSignal> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signal_inbox
+            .iter()
+            .find(|signal| signal.delivery_seq == delivery_seq)
+            .cloned()
+    }
+
+    /// Clone the earliest matching signal without consuming it.
+    pub fn peek_queued_signal_any(&self, names: &[String]) -> Option<QueuedSignal> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signal_inbox
+            .iter()
+            .filter(|signal| names.iter().any(|name| name == &signal.name))
+            .min_by_key(|signal| signal.delivery_seq)
+            .cloned()
+    }
+
     /// Drain the lowest-`delivery_seq` queued signal whose name matches `name`,
     /// removing it from the in-memory mailbox and — if persistence is enabled —
     /// atomically removing that exact `delivery_seq` from `SIGNAL_INBOX_FILE`
@@ -1819,49 +1844,6 @@ impl RuntimeContext {
         let signal = inner.signal_inbox.remove(idx);
         remove_persisted_signal(&mut inner, delivery_seq);
         Some(signal)
-    }
-
-    /// Restore an exact signal removed for an in-process resume attempt that
-    /// could not acquire the run lease. Persistence is updated before the
-    /// entry is published to the in-memory mailbox; duplicate delivery
-    /// sequence values are treated as an idempotent restore.
-    pub fn restore_queued_signal(&self, signal: QueuedSignal) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut persist_error = None;
-        if let Some(store) = inner.store.clone() {
-            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
-                let mut inbox: Vec<QueuedSignal> = current
-                    .as_deref()
-                    .map(serde_json::from_slice)
-                    .transpose()?
-                    .unwrap_or_default();
-                if !inbox
-                    .iter()
-                    .any(|queued| queued.delivery_seq == signal.delivery_seq)
-                {
-                    inbox.push(signal.clone());
-                    inbox.sort_by_key(|queued| queued.delivery_seq);
-                }
-                Ok(serde_json::to_vec_pretty(&inbox)?)
-            };
-            persist_error = store.update_blob(SIGNAL_INBOX_FILE, &mut update).err();
-        }
-
-        if !inner
-            .signal_inbox
-            .iter()
-            .any(|queued| queued.delivery_seq == signal.delivery_seq)
-        {
-            inner.signal_inbox.push(signal);
-            inner.signal_inbox.sort_by_key(|queued| queued.delivery_seq);
-        }
-
-        match persist_error {
-            Some(error) => Err(anyhow::anyhow!(
-                "restoring refused live signal to durable inbox failed: {error}"
-            )),
-            None => Ok(()),
-        }
     }
 
     /// Append a signal delivered to a LIVE run into its in-memory mailbox,

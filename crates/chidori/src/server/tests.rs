@@ -2663,6 +2663,10 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
     assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durably queued");
 
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
         .await
@@ -2675,6 +2679,10 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
     let journal_at_dispatch =
         serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
     let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    let inbox_at_dispatch = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("held signal remains durably queued");
     if let Some(lease) = external_lease.take() {
         crate::runtime::store::release_lease_with_token(
             store.as_ref(),
@@ -2772,17 +2780,14 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
             paused.pending_seq, snapshot.pending_seq
         ));
     }
-    if attempt_durable_matches != 0 {
+    if attempt_durable_matches != 1 {
         violations.push(format!(
-            "durable matching delivery count at lease attempt was {attempt_durable_matches}, expected the dequeued state 0"
+            "durable matching delivery count at lease attempt was {attempt_durable_matches}, expected 1 until lease acquisition"
         ));
     }
-    // The stream removes this exact delivery from the in-memory mailbox just
-    // before attempting the lease. A rejected attempt must put it back; that
-    // recoverability assertion is made against the post-dispatch snapshot.
-    if attempt_memory_matches != 0 {
+    if attempt_memory_matches != 1 {
         violations.push(format!(
-            "in-memory delivery count at lease attempt was {attempt_memory_matches}, expected the dequeued state 0"
+            "in-memory delivery count at lease attempt was {attempt_memory_matches}, expected 1 until lease acquisition"
         ));
     }
     if dispatch.handled {
@@ -2821,6 +2826,9 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
             "held signal changed the pending host operation before lease recovery".to_string(),
         );
     }
+    if inbox_at_dispatch != inbox_after_ack {
+        violations.push("held lease changed the acknowledged durable inbox bytes".to_string());
+    }
     if let Some(result) = &result {
         if result.session_status != SessionStatus::Paused || !result.supervision_active {
             violations.push(format!(
@@ -2843,8 +2851,8 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
 
 /// A real SQLite write failure during lease acquisition is distinct from an
 /// occupied lease. The trigger injects the store failure; the normal stream
-/// acquisition and lease-result path must keep the dequeued delivery and
-/// paused session recoverable instead of terminalizing or resuming it.
+/// path must leave the acknowledged delivery in both inboxes, byte-for-byte
+/// durable, and keep the paused session recoverable.
 #[tokio::test]
 async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     const CHILD: &str = "CHIDORI_TEST_SIGNAL_LEASE_FAILED_CHILD";
@@ -2949,6 +2957,10 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
     assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durably queued");
 
     let attempt = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
         .await
@@ -2975,6 +2987,10 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     let journal_at_dispatch =
         serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
     let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    let inbox_at_dispatch = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("signal remains durably queued after failed lease acquisition");
     let durable_at_dispatch = super::load_persisted_signal_inbox(&state.run_base, Some(&run_id));
 
     // Remove the failpoint before cancellation/cleanup. No synthetic result is
@@ -3081,10 +3097,15 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
             attempt.acquisition
         ));
     }
-    if attempt_durable_matches != 0 || attempt_memory_matches != 0 {
+    if attempt_durable_matches != 1 || attempt_memory_matches != 1 {
         violations.push(format!(
-            "signal was not at the expected dequeued lease-attempt cut: durable={attempt_durable_matches}, memory={attempt_memory_matches}"
+            "signal was not retained in both inboxes through failed lease acquisition: durable={attempt_durable_matches}, memory={attempt_memory_matches}"
         ));
+    }
+    if inbox_at_dispatch != inbox_after_ack {
+        violations.push(
+            "failed lease acquisition changed the acknowledged durable inbox bytes".to_string(),
+        );
     }
     if dispatch.handled {
         violations.push("failed lease acquisition was handled as a resumed run".to_string());

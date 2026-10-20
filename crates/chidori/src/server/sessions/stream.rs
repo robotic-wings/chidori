@@ -577,8 +577,8 @@ fn spawn_streaming_run(
 /// appends the synthetic resolution record, swaps a fresh replay context into
 /// the live slot — carrying over the in-memory mailbox so a delivery racing
 /// this resume is not lost — persists the session as Running, and spawns the
-/// blocking re-run, which reports back on `result_tx`. A lease refusal leaves
-/// the pause supervised and restores the exact consumed signal for retry.
+/// blocking re-run, which reports back on `result_tx`. A signal candidate stays
+/// in both inboxes until acquisition succeeds; only then is that delivery consumed.
 #[allow(clippy::too_many_arguments)]
 fn resume_signal_pause_in_process(
     state: &AppState,
@@ -590,7 +590,7 @@ fn resume_signal_pause_in_process(
     policy_profile: Option<String>,
     seq: u64,
     value: Value,
-    refused_signal: Option<QueuedSignal>,
+    signal_to_consume: Option<QueuedSignal>,
 ) -> SignalResumeOutcome {
     let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
     // Single-writer arbitration, same as the HTTP resume routes: this
@@ -626,9 +626,24 @@ fn resume_signal_pause_in_process(
                     "in-process signal resume could not acquire the run lease; preserving the pause"
                 ),
             }
-            restore_refused_signal(ctx_slot, refused_signal);
             return SignalResumeOutcome::Retry;
         }
+    };
+    let value = if let Some(candidate) = signal_to_consume {
+        let consumed = ctx_slot
+            .lock()
+            .unwrap()
+            .take_queued_signal_by_delivery_seq(candidate.delivery_seq);
+        let Some(consumed) = consumed else {
+            return SignalResumeOutcome::Retry;
+        };
+        json!({
+            "name": consumed.name,
+            "payload": consumed.payload,
+            "from": consumed.from,
+        })
+    } else {
+        value
     };
     let mut call_log = match load_persisted_replay_journal(
         &state.run_base,
@@ -654,7 +669,6 @@ fn resume_signal_pause_in_process(
     let pending = match completed {
         Ok(Some(pending)) => pending,
         Ok(None) => {
-            restore_refused_signal(ctx_slot, refused_signal);
             return SignalResumeOutcome::Retry;
         }
         Err(error) => {
@@ -730,17 +744,6 @@ fn resume_signal_pause_in_process(
 enum SignalResumeOutcome {
     Started,
     Retry,
-}
-
-fn restore_refused_signal(ctx_slot: &Arc<StdMutex<RuntimeContext>>, signal: Option<QueuedSignal>) {
-    if let Some(signal) = signal {
-        if let Err(error) = ctx_slot.lock().unwrap().restore_queued_signal(signal) {
-            tracing::error!(
-                error = %error,
-                "could not fully restore a signal after lease refusal; retained it in live memory"
-            );
-        }
-    }
 }
 
 pub(in crate::server) async fn stream_session(
@@ -924,7 +927,7 @@ pub(in crate::server) async fn stream_session(
                     if let Some((seq, names)) = supervising.clone() {
                         if names.iter().any(|n| n == &name) {
                             let entry = ctx_slot.lock().unwrap()
-                                .take_queued_signal_by_delivery_seq(delivery_seq);
+                                .queued_signal_by_delivery_seq(delivery_seq);
                             if let Some(entry) = entry {
                                 let value = json!({
                                     "name": entry.name,
@@ -1093,7 +1096,7 @@ pub(in crate::server) async fn stream_session(
                         event_log.append("paused", &data);
                         yield Ok::<_, std::convert::Infallible>(Event::default().event("paused").data(data));
 
-                        let queued = ctx_slot.lock().unwrap().take_queued_signal_any(&names);
+                        let queued = ctx_slot.lock().unwrap().peek_queued_signal_any(&names);
                         let mut outcome = SignalResumeOutcome::Retry;
                         let mut queued_delivery = None;
                         if let Some(entry) = queued {
