@@ -413,19 +413,40 @@ fn run_lease_ttl() -> chrono::Duration {
 }
 
 /// The run lease held across one server-side resume leg. Dropping it releases
-/// the lease conditionally — a lease taken over in the meantime is left alone
-/// (see [`crate::runtime::store::release_lease`]).
+/// only the owner or fenced tenure acquired by this guard; a later owner is
+/// left untouched.
 struct RunLeaseGuard {
     store: Arc<dyn crate::runtime::store::RunStore>,
-    owner: String,
+    release: RunLeaseRelease,
+}
+
+enum RunLeaseRelease {
+    Owner(String),
+    Fenced(crate::runtime::store::FencedLease),
 }
 
 impl Drop for RunLeaseGuard {
     fn drop(&mut self) {
-        if let Err(err) = crate::runtime::store::release_lease(self.store.as_ref(), &self.owner) {
+        let result = match &self.release {
+            RunLeaseRelease::Owner(owner) => {
+                crate::runtime::store::release_lease(self.store.as_ref(), owner)
+            }
+            RunLeaseRelease::Fenced(grant) => crate::runtime::store::release_lease_with_token(
+                self.store.as_ref(),
+                grant.lease(),
+                grant.token(),
+            ),
+        };
+        if let Err(err) = result {
             tracing::warn!("releasing run lease: {err}");
         }
     }
+}
+
+#[derive(Debug)]
+enum RunLeaseAcquisitionError {
+    Held(crate::runtime::store::RunLease),
+    Failed(anyhow::Error),
 }
 
 /// Take the run's single-writer lease before a resume/signal/approve mutates
@@ -453,11 +474,54 @@ fn acquire_run_lease(
     {
         Ok(Ok(_)) => Ok(Some(RunLeaseGuard {
             store,
-            owner: state.lease_owner.as_str().to_string(),
+            release: RunLeaseRelease::Owner(state.lease_owner.as_str().to_string()),
         })),
         Ok(Err(holder)) => Err(holder),
         Err(err) => {
             tracing::warn!("could not take the run lease for {run_id}: {err}");
+            Ok(None)
+        }
+    }
+}
+
+/// Acquire a lease for an in-process signal resume. Unlike legacy route
+/// callers, this path must distinguish a held SQLite tenure from an SQLite
+/// acquisition failure so neither case consumes the queued signal or ends
+/// supervision.
+fn acquire_signal_resume_lease(
+    state: &AppState,
+    run_id: Option<&str>,
+) -> std::result::Result<Option<RunLeaseGuard>, RunLeaseAcquisitionError> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
+    if crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref()) {
+        return match crate::runtime::store::acquire_lease_with_token(
+            store.as_ref(),
+            &state.lease_owner,
+            run_lease_ttl(),
+        ) {
+            Ok(Ok(grant)) => Ok(Some(RunLeaseGuard {
+                store,
+                release: RunLeaseRelease::Fenced(grant),
+            })),
+            Ok(Err(holder)) => Err(RunLeaseAcquisitionError::Held(holder)),
+            Err(error) => Err(RunLeaseAcquisitionError::Failed(error.context(format!(
+                "could not acquire the SQLite run lease for {run_id}"
+            )))),
+        };
+    }
+
+    match crate::runtime::store::acquire_lease(store.as_ref(), &state.lease_owner, run_lease_ttl())
+    {
+        Ok(Ok(_)) => Ok(Some(RunLeaseGuard {
+            store,
+            release: RunLeaseRelease::Owner(state.lease_owner.as_str().to_string()),
+        })),
+        Ok(Err(holder)) => Err(RunLeaseAcquisitionError::Held(holder)),
+        Err(error) => {
+            tracing::warn!("could not take the run lease for {run_id}: {error}");
             Ok(None)
         }
     }

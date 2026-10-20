@@ -15,9 +15,7 @@ use serde_json::{json, Value};
 use crate::runtime::context::{InputMode, RuntimeContext, RuntimeEvent};
 use crate::runtime::engine::RunResult;
 use crate::runtime::host_core::signal_timeout_sentinel;
-use crate::runtime::snapshot::PendingHostOperationKind;
-#[cfg(test)]
-use crate::runtime::snapshot::QueuedSignal;
+use crate::runtime::snapshot::{PendingHostOperationKind, QueuedSignal};
 use crate::storage::{SessionStatus, StoredSession};
 
 use super::super::engine::build_engine;
@@ -25,7 +23,7 @@ use super::super::hardening::acquire_run_slot;
 use super::super::{
     complete_persisted_pending_host_operation, load_persisted_host_promises,
     load_persisted_replay_journal, load_persisted_vfs, ActiveSession, AppState,
-    HostPromiseCompletion, LiveSignalSession,
+    HostPromiseCompletion, LiveSignalSession, RunLeaseAcquisitionError,
 };
 use super::resume::signal_resolution_record;
 use super::{agent_error_string, apply_run_outcome, validate_policy_profile, CreateSessionRequest};
@@ -579,8 +577,8 @@ fn spawn_streaming_run(
 /// appends the synthetic resolution record, swaps a fresh replay context into
 /// the live slot — carrying over the in-memory mailbox so a delivery racing
 /// this resume is not lost — persists the session as Running, and spawns the
-/// blocking re-run, which reports back on `result_tx`. Returns false (leaving
-/// the pause supervised) when no matching pending op exists on disk.
+/// blocking re-run, which reports back on `result_tx`. A lease refusal leaves
+/// the pause supervised and restores the exact consumed signal for retry.
 #[allow(clippy::too_many_arguments)]
 fn resume_signal_pause_in_process(
     state: &AppState,
@@ -592,7 +590,8 @@ fn resume_signal_pause_in_process(
     policy_profile: Option<String>,
     seq: u64,
     value: Value,
-) -> bool {
+    refused_signal: Option<QueuedSignal>,
+) -> SignalResumeOutcome {
     let run_id = session.run_id.clone().unwrap_or_else(|| session.id.clone());
     // Single-writer arbitration, same as the HTTP resume routes: this
     // in-process resume mutates the run's durable state and re-drives the
@@ -600,7 +599,7 @@ fn resume_signal_pause_in_process(
     // stand down — the pause stays supervised and the holder drives it.
     #[cfg(test)]
     let lease_result = {
-        let result = super::super::acquire_run_lease(state, session.run_id.as_deref());
+        let result = super::super::acquire_signal_resume_lease(state, session.run_id.as_deref());
         notify_signal_resume_lease_observer(
             state,
             session,
@@ -611,16 +610,24 @@ fn resume_signal_pause_in_process(
         result
     };
     #[cfg(not(test))]
-    let lease_result = super::super::acquire_run_lease(state, session.run_id.as_deref());
+    let lease_result = super::super::acquire_signal_resume_lease(state, session.run_id.as_deref());
     let lease = match lease_result {
         Ok(lease) => lease,
-        Err(holder) => {
-            tracing::warn!(
-                run_id = %run_id,
-                holder = %holder.owner,
-                "in-process signal resume stood down: run lease held elsewhere"
-            );
-            return false;
+        Err(error) => {
+            match &error {
+                RunLeaseAcquisitionError::Held(holder) => tracing::warn!(
+                    run_id = %run_id,
+                    holder = %holder.owner,
+                    "in-process signal resume stood down: run lease held elsewhere"
+                ),
+                RunLeaseAcquisitionError::Failed(error) => tracing::error!(
+                    run_id = %run_id,
+                    error = %error,
+                    "in-process signal resume could not acquire the run lease; preserving the pause"
+                ),
+            }
+            restore_refused_signal(ctx_slot, refused_signal);
+            return SignalResumeOutcome::Retry;
         }
     };
     let mut call_log = match load_persisted_replay_journal(
@@ -631,7 +638,7 @@ fn resume_signal_pause_in_process(
         Ok(records) => records,
         Err(error) => {
             let _ = result_tx.send(Err(error.context("loading replay journal")));
-            return true;
+            return SignalResumeOutcome::Started;
         }
     };
     let completed = {
@@ -646,10 +653,13 @@ fn resume_signal_pause_in_process(
     };
     let pending = match completed {
         Ok(Some(pending)) => pending,
-        Ok(None) => return false,
+        Ok(None) => {
+            restore_refused_signal(ctx_slot, refused_signal);
+            return SignalResumeOutcome::Retry;
+        }
         Err(error) => {
             let _ = result_tx.send(Err(error.context("completing persisted signal operation")));
-            return true;
+            return SignalResumeOutcome::Started;
         }
     };
     let resolution = signal_resolution_record(&pending, seq, value);
@@ -666,14 +676,14 @@ fn resume_signal_pause_in_process(
             Ok(host_promises) => host_promises,
             Err(error) => {
                 let _ = result_tx.send(Err(error.context("loading persisted host promises")));
-                return true;
+                return SignalResumeOutcome::Started;
             }
         };
     let vfs = match load_persisted_vfs(&state.run_base, session.run_id.as_deref()) {
         Ok(vfs) => vfs,
         Err(error) => {
             let _ = result_tx.send(Err(error.context("loading replay snapshot")));
-            return true;
+            return SignalResumeOutcome::Started;
         }
     };
 
@@ -713,7 +723,24 @@ fn resume_signal_pause_in_process(
         permit.clone(),
         lease,
     );
-    true
+    SignalResumeOutcome::Started
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalResumeOutcome {
+    Started,
+    Retry,
+}
+
+fn restore_refused_signal(ctx_slot: &Arc<StdMutex<RuntimeContext>>, signal: Option<QueuedSignal>) {
+    if let Some(signal) = signal {
+        if let Err(error) = ctx_slot.lock().unwrap().restore_queued_signal(signal) {
+            tracing::error!(
+                error = %error,
+                "could not fully restore a signal after lease refusal; retained it in live memory"
+            );
+        }
+    }
 }
 
 pub(in crate::server) async fn stream_session(
@@ -794,6 +821,7 @@ pub(in crate::server) async fn stream_session(
     // re-attach via GET /sessions/{id}/stream, catch up, and follow live.
     let event_log = Arc::new(SessionEventLog::new());
 
+    let signal_retry_tx = signal_tx.clone();
     state.active_sessions.lock().unwrap().insert(
         session_id.clone(),
         ActiveSession {
@@ -855,6 +883,9 @@ pub(in crate::server) async fn stream_session(
         // deadline) resumes it in-process without an HTTP round-trip.
         let mut supervising: Option<(u64, Vec<String>)> = None;
         let mut deadline: Option<tokio::time::Instant> = None;
+        let mut signal_retry: Option<(u64, String)> = None;
+        let mut signal_retry_deadline: Option<tokio::time::Instant> = None;
+        let lease_retry_delay = std::time::Duration::from_millis(250);
         loop {
             tokio::select! {
                 Some(evt) = event_rx.recv() => {
@@ -900,97 +931,78 @@ pub(in crate::server) async fn stream_session(
                                     "payload": entry.payload,
                                     "from": entry.from,
                                 });
-                                #[cfg(not(test))]
-                                if resume_signal_pause_in_process(
+                                let outcome = resume_signal_pause_in_process(
                                     &state_for_stream, &mut session, &ctx_slot,
                                     &event_tx, &result_tx, &permit,
-                                    policy_profile.clone(), seq, value,
-                                ) {
-                                    supervising = None;
-                                    deadline = None;
-                                }
-                                #[cfg(test)]
-                                {
-                                let resumed = resume_signal_pause_in_process(
-                                    &state_for_stream, &mut session, &ctx_slot,
-                                    &event_tx, &result_tx, &permit,
-                                    policy_profile.clone(), seq, value,
+                                    policy_profile.clone(), seq, value, Some(entry.clone()),
                                 );
                                 #[cfg(test)]
-                                let dispatch_observer = {
-                                    SIGNAL_RESUME_DISPATCH_OBSERVERS
-                                        .get_or_init(|| {
-                                            Mutex::new(std::collections::HashMap::new())
-                                        })
-                                        .lock()
-                                        .unwrap()
-                                        .remove(&session
-                                            .run_id
-                                            .clone()
-                                            .unwrap_or_else(|| session.id.clone()))
-                                };
-                                #[cfg(test)]
-                                if let Some(observer) = dispatch_observer {
-                                    let persisted = state_for_stream
-                                        .session_store
-                                        .get(&session.id)
-                                        .ok()
-                                        .flatten();
-                                    let snapshot = SignalResumeDispatchSnapshot {
-                                        handled: resumed,
-                                        remains_supervised: !resumed && supervising.is_some(),
-                                        session_status: session.status.clone(),
-                                        persisted_session_status: persisted
-                                            .as_ref()
-                                            .map(|stored| stored.status.clone()),
-                                        pending_seq: session.pending_seq,
-                                        durable_inbox: super::super::load_persisted_signal_inbox(
-                                            &state_for_stream.run_base,
-                                            session.run_id.as_deref(),
-                                        ),
-                                        memory_inbox: ctx_slot.lock().unwrap().signal_inbox(),
+                                {
+                                    let resumed = outcome == SignalResumeOutcome::Started;
+                                    let dispatch_observer = {
+                                        SIGNAL_RESUME_DISPATCH_OBSERVERS
+                                            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                                            .lock()
+                                            .unwrap()
+                                            .remove(&session.run_id.clone().unwrap_or_else(|| session.id.clone()))
                                     };
-                                    let _ = observer.snapshot.send(snapshot);
-                                    let _ = observer.release.await;
+                                    if let Some(observer) = dispatch_observer {
+                                        let persisted = state_for_stream.session_store.get(&session.id).ok().flatten();
+                                        let snapshot = SignalResumeDispatchSnapshot {
+                                            handled: resumed,
+                                            remains_supervised: !resumed && supervising.is_some(),
+                                            session_status: session.status.clone(),
+                                            persisted_session_status: persisted.as_ref().map(|stored| stored.status.clone()),
+                                            pending_seq: session.pending_seq,
+                                            durable_inbox: super::super::load_persisted_signal_inbox(&state_for_stream.run_base, session.run_id.as_deref()),
+                                            memory_inbox: ctx_slot.lock().unwrap().signal_inbox(),
+                                        };
+                                        let _ = observer.snapshot.send(snapshot);
+                                        let _ = observer.release.await;
+                                    }
                                 }
-                                if resumed {
+                                if outcome == SignalResumeOutcome::Started {
                                     supervising = None;
                                     deadline = None;
-                                }
+                                    signal_retry = None;
+                                    signal_retry_deadline = None;
+                                } else {
+                                    signal_retry = Some((delivery_seq, name.clone()));
+                                    signal_retry_deadline = Some(tokio::time::Instant::now() + lease_retry_delay);
                                 }
                             }
+                        }
+                    }
+                }
+                _ = async { tokio::time::sleep_until(signal_retry_deadline.unwrap()).await }, if signal_retry_deadline.is_some() => {
+                    signal_retry_deadline = None;
+                    if let Some(delivery) = signal_retry.clone() {
+                        if signal_retry_tx.send(delivery).is_err() {
+                            signal_retry = None;
                         }
                     }
                 }
                 _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
                     // `timeoutMs` deadline passed with no matching delivery:
                     // resolve the supervised pause with the timeout sentinel.
-                    #[cfg(not(test))]
-                    {
-                    if let Some((seq, names)) = supervising.clone() {
+                    let outcome = if let Some((seq, names)) = supervising.clone() {
                         let sentinel = signal_timeout_sentinel(&names);
                         if resume_signal_pause_in_process(
                             &state_for_stream, &mut session, &ctx_slot,
                             &event_tx, &result_tx, &permit,
-                            policy_profile.clone(), seq, sentinel,
-                        ) {
-                            supervising = None;
+                            policy_profile.clone(), seq, sentinel, None,
+                        ) == SignalResumeOutcome::Started
+                        {
+                            SignalResumeOutcome::Started
+                        } else {
+                            SignalResumeOutcome::Retry
                         }
-                    }
-                    }
-                    #[cfg(test)]
-                    {
-                    let resumed = if let Some((seq, names)) = supervising.clone() {
-                        let sentinel = signal_timeout_sentinel(&names);
-                        resume_signal_pause_in_process(
-                            &state_for_stream, &mut session, &ctx_slot,
-                            &event_tx, &result_tx, &permit,
-                            policy_profile.clone(), seq, sentinel,
-                        )
                     } else {
-                        false
+                        SignalResumeOutcome::Retry
                     };
                     #[cfg(test)]
+                    {
+                    let resumed = outcome == SignalResumeOutcome::Started;
                     let timeout_observer = SIGNAL_TIMEOUT_DISPATCH_OBSERVERS
                         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
                         .lock()
@@ -1017,11 +1029,15 @@ pub(in crate::server) async fn stream_session(
                         let _ = observer.snapshot.send(snapshot);
                         let _ = observer.release.await;
                     }
-                    if resumed {
+                    }
+                    if outcome == SignalResumeOutcome::Started {
                         supervising = None;
+                        signal_retry = None;
+                        signal_retry_deadline = None;
+                        deadline = None;
+                    } else {
+                        deadline = Some(tokio::time::Instant::now() + lease_retry_delay);
                     }
-                    }
-                    deadline = None;
                 }
                 Some(result) = result_rx.recv() => {
                     let was_cancelled = cancelled.load(Ordering::SeqCst);
@@ -1078,28 +1094,36 @@ pub(in crate::server) async fn stream_session(
                         yield Ok::<_, std::convert::Infallible>(Event::default().event("paused").data(data));
 
                         let queued = ctx_slot.lock().unwrap().take_queued_signal_any(&names);
-                        let mut resumed = false;
+                        let mut outcome = SignalResumeOutcome::Retry;
+                        let mut queued_delivery = None;
                         if let Some(entry) = queued {
+                            queued_delivery = Some((entry.delivery_seq, entry.name.clone()));
                             let value = json!({
                                 "name": entry.name,
                                 "payload": entry.payload,
                                 "from": entry.from,
                             });
-                            resumed = resume_signal_pause_in_process(
+                            outcome = resume_signal_pause_in_process(
                                 &state_for_stream, &mut session, &ctx_slot,
                                 &event_tx, &result_tx, &permit,
-                                policy_profile.clone(), seq, value,
+                                policy_profile.clone(), seq, value, Some(entry),
                             );
                         }
-                        if resumed {
+                        if outcome == SignalResumeOutcome::Started {
                             supervising = None;
                             deadline = None;
+                            signal_retry = None;
+                            signal_retry_deadline = None;
                         } else {
                             supervising = Some((seq, names));
                             deadline = session.pending_signal_deadline.map(|d| {
                                 let wait = (d - chrono::Utc::now()).to_std().unwrap_or_default();
                                 tokio::time::Instant::now() + wait
                             });
+                            if let Some(delivery) = queued_delivery {
+                                signal_retry = Some(delivery);
+                                signal_retry_deadline = Some(tokio::time::Instant::now() + lease_retry_delay);
+                            }
                         }
                         #[cfg(test)]
                         let timeout_arm_observer = SIGNAL_TIMEOUT_ARM_OBSERVER

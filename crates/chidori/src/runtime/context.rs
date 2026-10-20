@@ -1821,6 +1821,49 @@ impl RuntimeContext {
         Some(signal)
     }
 
+    /// Restore an exact signal removed for an in-process resume attempt that
+    /// could not acquire the run lease. Persistence is updated before the
+    /// entry is published to the in-memory mailbox; duplicate delivery
+    /// sequence values are treated as an idempotent restore.
+    pub fn restore_queued_signal(&self, signal: QueuedSignal) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut persist_error = None;
+        if let Some(store) = inner.store.clone() {
+            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                let mut inbox: Vec<QueuedSignal> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                if !inbox
+                    .iter()
+                    .any(|queued| queued.delivery_seq == signal.delivery_seq)
+                {
+                    inbox.push(signal.clone());
+                    inbox.sort_by_key(|queued| queued.delivery_seq);
+                }
+                Ok(serde_json::to_vec_pretty(&inbox)?)
+            };
+            persist_error = store.update_blob(SIGNAL_INBOX_FILE, &mut update).err();
+        }
+
+        if !inner
+            .signal_inbox
+            .iter()
+            .any(|queued| queued.delivery_seq == signal.delivery_seq)
+        {
+            inner.signal_inbox.push(signal);
+            inner.signal_inbox.sort_by_key(|queued| queued.delivery_seq);
+        }
+
+        match persist_error {
+            Some(error) => Err(anyhow::anyhow!(
+                "restoring refused live signal to durable inbox failed: {error}"
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Append a signal delivered to a LIVE run into its in-memory mailbox,
     /// write-through persisting the grown inbox (`docs/signals.md` Phase 3).
     /// Persist a live signal before publishing it to the in-memory inbox, then
