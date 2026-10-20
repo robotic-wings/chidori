@@ -3279,6 +3279,205 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
     );
 }
 
+#[test]
+fn cli_chat_resume_renews_sqlite_lease_during_idle_and_provider_waits() {
+    use chidori::runtime::store::{
+        acquire_lease_with_token, release_lease_with_token, RunStore, SqliteRunStore,
+        SqliteRunStoreShared,
+    };
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const TTL_MS: i64 = 600;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    let db_path = dir.join("chat-renewal.sqlite3");
+    let db_text = db_path.to_string_lossy().to_string();
+    let initial = run_chidori_with_stdin(
+        &["chat"],
+        &dir,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", db_text.as_str()),
+            ("CHIDORI_TEST_LLM_RESPONSE", "initial reply"),
+        ],
+        "first message\nexit\n",
+    );
+    assert_success(&initial);
+    let session_id = String::from_utf8_lossy(&initial.stderr)
+        .lines()
+        .find(|line| line.starts_with("session ") && !line.starts_with("session saved"))
+        .and_then(|line| line.strip_prefix("session "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("initial chat announces its durable session id")
+        .to_string();
+    let shared = SqliteRunStoreShared::open(&db_path).unwrap();
+    let store: std::sync::Arc<dyn RunStore> =
+        std::sync::Arc::new(SqliteRunStore::new(shared, session_id.clone()));
+    let server = GatedChatProvider::start();
+    let mut child = KillChildOnDrop(Some(
+        Command::new(chidori_bin())
+            .args(["chat", "--resume", &session_id])
+            .current_dir(&dir)
+            .env_remove("CHIDORI_TEST_LLM_RESPONSE")
+            .env_remove("CHIDORI_OPENAI_COMPAT_URL")
+            .env_remove("CHIDORI_OPENAI_COMPAT_KEY")
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env("OPENAI_API_KEY", "local-test-key")
+            .env("OPENAI_BASE_URL", &server.base_url)
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", &db_path)
+            .env("CHIDORI_DURABILITY", "strict")
+            .env("CHIDORI_TEST_CHAT_LEASE_TTL_MS", TTL_MS.to_string())
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+
+    let stdout = child.stdout.take().unwrap();
+    let (prompt_tx, prompt_rx) = mpsc::channel();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut collected = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut notified = false;
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    collected.push(byte[0]);
+                    if !notified && collected.windows(5).any(|window| window == b"you> ") {
+                        let _ = prompt_tx.send(());
+                        notified = true;
+                    }
+                }
+            }
+        }
+        collected
+    });
+    let stderr = child.stderr.take().unwrap();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
+        bytes
+    });
+    prompt_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("resumed chat reaches its idle input prompt");
+
+    let owner = format!("chidori-chat-{}", child.id());
+    let lease_bytes = store
+        .get_blob("lease.json")
+        .unwrap()
+        .expect("resumed chat acquired a SQLite lease");
+    let lease_before: serde_json::Value = serde_json::from_slice(&lease_bytes).unwrap();
+    assert_eq!(lease_before["owner"], owner);
+    let initial_expiry =
+        chrono::DateTime::parse_from_rfc3339(lease_before["expires_at"].as_str().unwrap()).unwrap();
+    let idle_started = Instant::now();
+    let ttl = Duration::from_millis(TTL_MS as u64);
+    while idle_started.elapsed() <= ttl + Duration::from_millis(100) {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "chat exited while idle"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let idle_lease: serde_json::Value =
+        serde_json::from_slice(&store.get_blob("lease.json").unwrap().unwrap()).unwrap();
+    assert_eq!(idle_lease["owner"], owner);
+    assert_eq!(idle_lease["generation"], lease_before["generation"]);
+    let idle_expiry =
+        chrono::DateTime::parse_from_rfc3339(idle_lease["expires_at"].as_str().unwrap()).unwrap();
+    assert!(
+        idle_expiry > initial_expiry,
+        "the chat heartbeat must extend expiry while stdin is blocked"
+    );
+    assert!(idle_expiry.with_timezone(&chrono::Utc) > chrono::Utc::now());
+    let idle_contender = acquire_lease_with_token(
+        store.as_ref(),
+        "idle-chat-contender",
+        chrono::Duration::milliseconds(TTL_MS),
+    )
+    .unwrap();
+    assert!(matches!(idle_contender, Err(holder) if holder.owner == owner));
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"provider wait\n")
+        .unwrap();
+    let request = server
+        .request_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("resumed chat dispatches its provider request");
+    assert!(String::from_utf8_lossy(&request).contains("POST /v1/chat/completions"));
+    let provider_block_lease: serde_json::Value =
+        serde_json::from_slice(&store.get_blob("lease.json").unwrap().unwrap()).unwrap();
+    let provider_block_expiry =
+        chrono::DateTime::parse_from_rfc3339(provider_block_lease["expires_at"].as_str().unwrap())
+            .unwrap();
+    let renewal_deadline = Instant::now() + Duration::from_secs(4);
+    let mut renewed_during_provider_wait = false;
+    while Instant::now() < renewal_deadline {
+        let current: serde_json::Value =
+            serde_json::from_slice(&store.get_blob("lease.json").unwrap().unwrap()).unwrap();
+        let current_expiry =
+            chrono::DateTime::parse_from_rfc3339(current["expires_at"].as_str().unwrap()).unwrap();
+        if current_expiry > provider_block_expiry {
+            renewed_during_provider_wait = true;
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "chat exited during provider wait"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        renewed_during_provider_wait,
+        "chat lease expiry must advance while the provider response is blocked"
+    );
+    let provider_contender = acquire_lease_with_token(
+        store.as_ref(),
+        "provider-chat-contender",
+        chrono::Duration::milliseconds(TTL_MS),
+    )
+    .unwrap();
+    assert!(matches!(provider_contender, Err(holder) if holder.owner == owner));
+
+    server.release();
+    child.stdin.as_mut().unwrap().write_all(b"exit\n").unwrap();
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    child.0.take();
+    let stdout = stdout_thread.join().unwrap();
+    let stderr = stderr_thread.join().unwrap();
+    assert!(
+        status.success(),
+        "resumed chat should finish after the provider returns; stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("gated reply"));
+    let released = acquire_lease_with_token(
+        store.as_ref(),
+        "post-chat-renewal-contender",
+        chrono::Duration::minutes(1),
+    )
+    .unwrap()
+    .expect("chat must stop heartbeat before releasing its exact tenure");
+    release_lease_with_token(store.as_ref(), released.lease(), released.token()).unwrap();
+}
+
 fn snapshot_files(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn visit(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -3486,6 +3685,7 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
                 }
             }
         }
+        collected
     });
     let stderr = child.stderr.take().unwrap();
     let (stderr_tx, stderr_rx) = mpsc::channel();
@@ -3595,12 +3795,24 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
                 .is_some_and(|record| record["state"] == "pending")
     });
 
+    // Queue another turn behind the already-dispatched request. A stale chat
+    // must fail its tenure check after the first response and exit before it
+    // prints another prompt or starts another turn.
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"follow-up must not run\n")
+        .unwrap();
     server.release();
-    child.stdin.as_mut().unwrap().write_all(b"exit\n").unwrap();
     drop(child.stdin.take());
     let status = child.wait().unwrap();
     child.0.take();
-    stdout_thread.join().unwrap();
+    let stdout_after = stdout_thread.join().unwrap();
+    let prompt_count = stdout_after
+        .windows(5)
+        .filter(|window| *window == b"you> ")
+        .count();
     let stderr_text = String::from_utf8_lossy(
         &stderr_rx
             .recv_timeout(Duration::from_secs(10))
@@ -3637,11 +3849,15 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
             && has_pending_promise
             && chat_owned_a
             && stale_write_rejected
+            && !status.success()
+            // One `you>` is the restored transcript; one is the active input
+            // prompt. A third would show the chat loop accepted another turn.
+            && prompt_count == 2
             && journal_unchanged
             && mirror_unchanged
             && lease_unchanged
             && local_unchanged,
-        "cmd_chat must retain A at the provider safepoint, reject A's stale Engine write, and preserve B's SQLite/FS state: status={status}; stdout-before-prompt={}; stderr={stderr_text}; chat_owned_a={chat_owned_a}; observed_generation={observed_chat_generation:?}; stale_write_rejected={stale_write_rejected}; journal_unchanged={journal_unchanged}; mirror_unchanged={mirror_unchanged}; lease_unchanged={lease_unchanged}; local_unchanged={local_unchanged}",
+        "cmd_chat must retain A at the provider safepoint, reject A's stale Engine write, preserve B's SQLite/FS state, and stop before a queued follow-up turn: status={status}; stdout-before-prompt={}; prompt_count={prompt_count}; stderr={stderr_text}; chat_owned_a={chat_owned_a}; observed_generation={observed_chat_generation:?}; stale_write_rejected={stale_write_rejected}; journal_unchanged={journal_unchanged}; mirror_unchanged={mirror_unchanged}; lease_unchanged={lease_unchanged}; local_unchanged={local_unchanged}",
         String::from_utf8_lossy(&prompt_prefix)
     );
 }
