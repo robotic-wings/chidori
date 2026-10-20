@@ -3107,6 +3107,28 @@ fn cli_chat_resume_refuses_held_sqlite_tenure_before_turn_mutation() {
         "fixture must be a real interrupted SQLite chat run"
     );
 
+    // The killed resumed-chat process correctly leaves its SQLite lease in
+    // place. Expire that dead owner's tenure before this fixture acquires the
+    // next external lease; a process killed with SIGKILL cannot run its Drop.
+    let mut interrupted_lease: serde_json::Value = serde_json::from_slice(
+        &store
+            .get_blob("lease.json")
+            .unwrap()
+            .expect("chat lease is durable"),
+    )
+    .unwrap();
+    assert!(interrupted_lease["owner"]
+        .as_str()
+        .is_some_and(|owner| owner.starts_with("chidori-chat-")));
+    interrupted_lease["expires_at"] =
+        serde_json::Value::String((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+    store
+        .put_blob(
+            "lease.json",
+            &serde_json::to_vec(&interrupted_lease).unwrap(),
+        )
+        .unwrap();
+
     // Removing the local journal/checkpoint forces factory hydration from the
     // SQLite mirror. A failed held-lease resume must refuse before it
     // recreates these files or replaces this intentionally divergent input.
@@ -3606,7 +3628,7 @@ fn cli_chat_resume_rejects_stale_sqlite_engine_write_after_tenure_transfer() {
     let mirror_unchanged = blobs_after == blobs_before_release;
     let lease_unchanged = lease_after == lease_b;
     let local_unchanged = local_after == local_before_release;
-    let stale_write_rejected = stderr_text.contains("run is owned by `external-chat-takeover`");
+    let stale_write_rejected = stderr_text.contains("SQLite lease ownership lost");
     assert!(
         request_is_expected
             && b_has_newer_generation

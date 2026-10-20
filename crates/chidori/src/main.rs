@@ -2453,6 +2453,20 @@ fn cmd_chat(
     let lease_owner = format!("chidori-chat-{}", std::process::id());
     let mut messages: Vec<String> = Vec::new();
     let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
+    let (_chat_lease_guard, resumed_run_store) = if let Some(session_id) = resume.as_deref() {
+        // Refuse a competing resume before hydration or any transcript and
+        // journal reads. Keep this exact tenure alive through replay and every
+        // interactive turn below.
+        let store = factory.store_for(session_id);
+        let guard = acquire_cli_run_lease(store.clone(), &lease_owner, session_id)?;
+        let store = match &guard {
+            Some(guard) => guard.bind_store(store)?,
+            None => store,
+        };
+        (guard, Some(store))
+    } else {
+        (None, None)
+    };
     let session_id = match &resume {
         Some(session_id) => {
             let run_dir = run_base.join(session_id);
@@ -2460,35 +2474,13 @@ fn cmd_chat(
             // configured, and unions the last checkpoint with any
             // crash-stranded `records.jsonl` tail — same path as `resume`.
             factory.hydrate(session_id)?;
-            call_log = factory
-                .store_for(session_id)
+            call_log = resumed_run_store
+                .as_ref()
+                .expect("resumed chat has a run store")
                 .load_call_log()?
                 .ok_or_else(|| {
                     anyhow::anyhow!("no chat session found under {}", run_dir.display())
                 })?;
-            // One driver per session journal, same guard (and same
-            // unrenewed-lease limitation) as `chidori resume`.
-            match crate::runtime::store::acquire_lease(
-                factory.store_for(session_id).as_ref(),
-                &lease_owner,
-                chrono::Duration::minutes(10),
-            ) {
-                Ok(Ok(_)) => {}
-                // As in `resume`: a dead holder's lease lapses on its own, and
-                // with a mirror configured it isn't a local file to delete.
-                Ok(Err(holder)) => anyhow::bail!(
-                    "chat session {session_id} is already being driven by another process \
-                     (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
-                     the journal — close the other chat, or retry after {} if the holder \
-                     is dead.",
-                    holder.owner,
-                    holder.expires_at,
-                    holder.expires_at
-                ),
-                Err(err) => {
-                    eprintln!("warning: could not take the session lease: {err}");
-                }
-            }
             // Each turn rewrites the run's `input.json` with the full driven
             // input, so it is the durable record of the dialogue state:
             // restore the message list, and (unless overridden by flags) the
@@ -2546,11 +2538,14 @@ fn cmd_chat(
     let tools = Arc::new(ToolRegistry::new());
     let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
 
-    let engine = Engine::new(providers, template_engine, tokio_rt)
+    let mut engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(run_base.clone())
         .with_workspace_root(abs_dir(&base_dir));
+    if let Some(store) = resumed_run_store {
+        engine = engine.with_run_store_for_run(session_id.clone(), store);
+    }
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
     eprintln!(
