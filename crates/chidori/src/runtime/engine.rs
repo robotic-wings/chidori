@@ -40,6 +40,9 @@ pub struct Engine {
     /// (`CHIDORI_RUN_STORE`, `docs/durable-storage.md`). Built alongside
     /// `persist_base`; None when persistence is disabled.
     run_store: Option<crate::runtime::store::RunStoreFactory>,
+    /// Optional per-run store view bound to the lease tenure that authorized
+    /// a CLI resume. Other runs continue to use the configured factory.
+    run_store_override: Option<(String, Arc<dyn crate::runtime::store::RunStore>)>,
     /// Warm-resume bridge installed on every run leg's context (see
     /// [`crate::runtime::context::WarmInputBridge`]): the session server sets
     /// this so an `input()` pause parks the live VM instead of unwinding, and
@@ -438,6 +441,7 @@ impl Engine {
             approvals: Vec::new(),
             persist_base: None,
             run_store: None,
+            run_store_override: None,
             warm_input_bridge: None,
             workspace_root: None,
             default_model: None,
@@ -493,6 +497,19 @@ impl Engine {
     pub fn with_run_store(mut self, factory: crate::runtime::store::RunStoreFactory) -> Self {
         self.persist_base = Some(factory.run_base().to_path_buf());
         self.run_store = Some(factory);
+        self
+    }
+
+    /// Bind persistence for one run to a caller-provided store view.
+    ///
+    /// CLI resume uses this for SQLite lease fencing so journal, promise,
+    /// and scaffold writes are checked against the tenure owning the run.
+    pub fn with_run_store_for_run(
+        mut self,
+        run_id: impl Into<String>,
+        store: Arc<dyn crate::runtime::store::RunStore>,
+    ) -> Self {
+        self.run_store_override = Some((run_id.into(), store));
         self
     }
 
@@ -1031,7 +1048,13 @@ impl Engine {
         let persist_run_dir = if let Some(ref factory) = self.run_store {
             let run_id = ctx.run_id();
             let run_dir = factory.run_base().join(&run_id);
-            ctx.enable_persistence_with_store(run_dir.clone(), factory.store_for(&run_id));
+            let store = self
+                .run_store_override
+                .as_ref()
+                .filter(|(override_run_id, _)| override_run_id == &run_id)
+                .map(|(_, store)| store.clone())
+                .unwrap_or_else(|| factory.store_for(&run_id));
+            ctx.enable_persistence_with_store(run_dir.clone(), store);
             // Save the input alongside the checkpoint for later resume/trace.
             if let Some(store) = ctx.store() {
                 let _ = store.put_blob(

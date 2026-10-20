@@ -34,6 +34,73 @@ static GLOBAL: mem_guard::CountingAllocator = mem_guard::CountingAllocator;
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 
+/// Holds the exact lease tenure for the full CLI resume lifecycle.
+struct CliRunLeaseGuard {
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    grant: crate::runtime::store::FencedLease,
+}
+
+impl Drop for CliRunLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = crate::runtime::store::release_lease_with_token(
+            self.store.as_ref(),
+            self.grant.lease(),
+            self.grant.token(),
+        ) {
+            eprintln!("warning: releasing run lease: {err}");
+        }
+    }
+}
+
+impl CliRunLeaseGuard {
+    fn bind_store(
+        &self,
+        store: Arc<dyn crate::runtime::store::RunStore>,
+    ) -> Result<Arc<dyn crate::runtime::store::RunStore>> {
+        if !crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref()) {
+            return Ok(store);
+        }
+        Ok(Arc::new(
+            crate::runtime::store::LeaseFencedRunStore::new_with_token(
+                store,
+                self.grant.lease().clone(),
+                self.grant.token().clone(),
+            )?,
+        ))
+    }
+}
+
+fn acquire_cli_run_lease(
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    owner: &str,
+    run_id: &str,
+) -> Result<Option<CliRunLeaseGuard>> {
+    let fencing = crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref());
+    match crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        owner,
+        chrono::Duration::minutes(10),
+    ) {
+        Ok(Ok(grant)) => Ok(Some(CliRunLeaseGuard { store, grant })),
+        Ok(Err(holder)) => anyhow::bail!(
+            "run {run_id} is already being driven by another process (lease holder \
+             `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
+             wait for it to finish, or retry after {} if the holder is dead.",
+            holder.owner,
+            holder.expires_at,
+            holder.expires_at
+        ),
+        Err(err) if fencing => Err(err).with_context(|| {
+            format!("refusing resume of run {run_id}: could not acquire its SQLite lease")
+        }),
+        Err(err) => {
+            eprintln!("warning: could not take the run lease: {err}");
+            // Preserve historical advisory behavior for non-fencing stores.
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "chidori",
@@ -2793,8 +2860,17 @@ fn cmd_resume(
     // last checkpoint with any crash-stranded `records.jsonl` tail.
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
     factory.ensure_initialized()?;
-    factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
+    // Take ownership before hydration or reading the retry frontier. SQLite
+    // needs the opaque token so every later fenced write belongs to this
+    // tenure; the guard releases that exact tenure on every exit path.
+    let cli_lease_owner = format!("chidori-cli-{}", std::process::id());
+    let _cli_lease_guard = acquire_cli_run_lease(store.clone(), &cli_lease_owner, run_id)?;
+    let store = match &_cli_lease_guard {
+        Some(guard) => guard.bind_store(store)?,
+        None => store,
+    };
+    factory.hydrate(run_id)?;
     let mut records = store
         .load_call_log()?
         .ok_or_else(|| anyhow::anyhow!("No checkpoint found under {}", run_dir.display()))?;
@@ -2805,6 +2881,7 @@ fn cmd_resume(
         records_path.display()
     );
     let mut host_promises = crate::runtime::snapshot::load_host_promise_records(&*store)?;
+    let mut retry_frontier: Option<(Vec<u64>, u64, u64)> = None;
 
     // `--retry-failed`: first-class repair for a failed run. The trailing
     // failed record(s) — the crash frontier — are stripped with the exact
@@ -2853,17 +2930,9 @@ fn cmd_resume(
             .into_iter()
             .filter(|seq| !kept.contains(seq))
             .collect();
-        host_promises =
-            crate::runtime::snapshot::SnapshotStore::with_store(run_dir.clone(), store.clone())
-                .retire_rejected_host_promises_for_retry(&host_promises, &removed, &records)?;
         let low = removed.iter().min().copied().unwrap_or_default();
         let high = removed.iter().max().copied().unwrap_or_default();
-        eprintln!(
-            "retry-failed: stripped {} failed record(s) (seqs {low}..{high}), \
-             replaying {} records then executing live",
-            removed.len(),
-            records.len()
-        );
+        retry_frontier = Some((removed, low, high));
     }
 
     // Time travel: truncate the journal at the requested frontier; replay
@@ -2890,7 +2959,9 @@ fn cmd_resume(
     // source fingerprints recorded in the run's snapshot manifest, exactly as
     // the server resume routes do, so cached results are never paired with
     // changed code. (Runs persisted before manifests existed skip with a
-    // warning; `--allow-source-change` is the edit-and-resume opt-in.)
+    // warning; `--allow-source-change` is the edit-and-resume opt-in.) Do
+    // this and build the runtime before retiring any rejected promise state,
+    // so setup failures leave the retry frontier untouched.
     crate::runtime::snapshot::validate_manifest_for_resume(
         &run_base,
         Some(run_id),
@@ -2898,33 +2969,6 @@ fn cmd_resume(
         allow_source_change,
     )
     .context("resume refused: the agent source no longer matches this run's checkpoint")?;
-
-    // One driver per run dir: two concurrent resumes of the same run would
-    // interleave writes into one journal. The same lease file detached agents
-    // use guards the CLI; a dead holder's lease expires on its own.
-    let cli_lease_owner = format!("chidori-cli-{}", std::process::id());
-    match crate::runtime::store::acquire_lease(
-        factory.store_for(run_id).as_ref(),
-        &cli_lease_owner,
-        chrono::Duration::minutes(10),
-    ) {
-        Ok(Ok(_)) => {}
-        // A dead holder stops renewing, so the lease lapses at `expires` and
-        // the next attempt takes it over — hence "wait", not "delete a file":
-        // with a durable mirror configured the lease is fleet state living in
-        // the mirror, not `<run_dir>/lease.json`.
-        Ok(Err(holder)) => anyhow::bail!(
-            "run {run_id} is already being driven by another process (lease holder \
-             `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
-             wait for it to finish, or retry after {} if the holder is dead.",
-            holder.owner,
-            holder.expires_at,
-            holder.expires_at
-        ),
-        Err(err) => {
-            eprintln!("warning: could not take the run lease: {err}");
-        }
-    }
 
     // The run's model travels with it: an explicit `--model` (or a
     // pre-existing CHIDORI_MODEL) wins, then the model recorded in the run's
@@ -2953,6 +2997,7 @@ fn cmd_resume(
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(run_base.clone())
+        .with_run_store_for_run(run_id.to_string(), store.clone())
         .with_default_model(default_model)
         // Both `--until-seq` and `--retry-failed` intentionally hand the
         // engine a journal SHORTER than the durable one; without the opt-in
@@ -2962,6 +3007,18 @@ fn cmd_resume(
         // trip over.
         .with_history_rewrite_allowed(until_seq.is_some() || retry_failed)
         .with_workspace_root(abs_dir(&base_dir));
+
+    if let Some((removed, low, high)) = retry_frontier {
+        host_promises =
+            crate::runtime::snapshot::SnapshotStore::with_store(run_dir.clone(), store.clone())
+                .retire_rejected_host_promises_for_retry(&host_promises, &removed, &records)?;
+        eprintln!(
+            "retry-failed: stripped {} failed record(s) (seqs {low}..{high}), \
+             replaying {} records then executing live",
+            removed.len(),
+            records.len()
+        );
+    }
 
     // Journaled top-level workspace records re-execute on every replay by
     // design (the workspace is real disk state, re-materialized rather than
@@ -2993,8 +3050,6 @@ fn cmd_resume(
             engine.resume_run_with_host_promises(file, &input_value, records, host_promises, run_id)
         }
     };
-    let _ =
-        crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
     let result = result?;
 
     // A resume that lands back on a `chidori.signal(...)` listen point has no
