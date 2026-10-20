@@ -5411,11 +5411,12 @@ async fn sqlite_server_resume_signal_and_approve_refuse_external_tenure_then_ret
     .unwrap();
 }
 
-/// The guard's lifecycle: a free run is acquirable, the holder excludes other
-/// owners, the same server renews (a second leg re-acquires under the same
-/// owner), and dropping the guard releases the run for the next writer.
+/// The production signal-resume helper's guard lifecycle: a free run is
+/// acquirable, the holder excludes other owners, the same server renews (a
+/// second leg re-acquires under the same owner), and dropping the guard
+/// releases the run for the next writer.
 #[tokio::test]
-async fn run_lease_guard_excludes_other_owners_and_releases_on_drop() {
+async fn signal_resume_lease_guard_excludes_other_owners_and_releases_on_drop() {
     let run_base = test_run_base("chidori-srv-lease-guard");
     let agent_path = run_base.join("agent.ts");
     std::fs::write(&agent_path, "export async function agent() { return {}; }").unwrap();
@@ -5423,7 +5424,7 @@ async fn run_lease_guard_excludes_other_owners_and_releases_on_drop() {
     std::fs::create_dir_all(run_base.join(run_id)).unwrap();
     let state = test_state(run_base.clone(), agent_path);
 
-    let guard = acquire_run_lease(&state, Some(run_id))
+    let guard = acquire_signal_resume_lease(&state, Some(run_id))
         .expect("free run must be acquirable")
         .expect("run id present ⇒ a guard");
     // Another owner loses while the guard lives.
@@ -5439,7 +5440,7 @@ async fn run_lease_guard_excludes_other_owners_and_releases_on_drop() {
         state.lease_owner.as_str()
     );
     // The same server renews: a second leg re-acquires under the same owner.
-    let renewal = acquire_run_lease(&state, Some(run_id)).expect("same owner renews");
+    let renewal = acquire_signal_resume_lease(&state, Some(run_id)).expect("same owner renews");
     assert!(renewal.is_some());
     drop(renewal);
     drop(guard);
@@ -5452,7 +5453,7 @@ async fn run_lease_guard_excludes_other_owners_and_releases_on_drop() {
     .unwrap()
     .expect("released lease must be acquirable");
     // Sessions with no run id have nothing durable to contend for.
-    assert!(acquire_run_lease(&state, None).unwrap().is_none());
+    assert!(acquire_signal_resume_lease(&state, None).unwrap().is_none());
 }
 
 /// Strict routing (`CHIDORI_SERVE_ROUTES=strict`) narrows the ANY /* event
