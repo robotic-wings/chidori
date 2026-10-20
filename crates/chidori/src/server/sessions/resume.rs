@@ -15,11 +15,12 @@ use crate::storage::{SessionStatus, StoredSession};
 use super::super::engine::build_engine;
 use super::super::hardening::acquire_run_slot;
 use super::super::{
-    acquire_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
+    acquire_route_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
     install_warm_run, load_persisted_host_promises, load_persisted_replay_journal,
-    load_persisted_signal_inbox, load_persisted_vfs, release_warm_run_if_settled, session_view,
-    store_or_500, validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState,
-    HostPromiseCompletion,
+    load_persisted_signal_inbox, load_persisted_vfs, release_warm_run_if_settled,
+    route_lease_acquisition_failed_response, session_view, store_or_500,
+    validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState, HostPromiseCompletion,
+    RouteRunLeaseAcquireError,
 };
 use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_listen_names};
 
@@ -325,9 +326,12 @@ pub(in crate::server) async fn resume_session(
     // instead of both writers 200ing opposite continuations into one
     // journal. Held across BOTH paths below: the warm fast path's parked VM
     // appends to the same journal the replay path would.
-    let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+    let _lease = match acquire_route_run_lease(&state, original.run_id.as_deref()) {
         Ok(guard) => guard,
-        Err(holder) => return lease_conflict_response(&holder),
+        Err(RouteRunLeaseAcquireError::Held(holder)) => return lease_conflict_response(&holder),
+        Err(RouteRunLeaseAcquireError::Failed(error)) => {
+            return route_lease_acquisition_failed_response(&error)
+        }
     };
 
     // Warm fast path: this session's VM is parked on its thread awaiting
@@ -571,9 +575,14 @@ pub(in crate::server) async fn signal_session(
         // is a resume — the same journal writes, so the same lease as
         // /resume. The enqueue branches below stay lease-free (an inbox
         // append is not a resume).
-        let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+        let _lease = match acquire_route_run_lease(&state, original.run_id.as_deref()) {
             Ok(guard) => guard,
-            Err(holder) => return lease_conflict_response(&holder),
+            Err(RouteRunLeaseAcquireError::Held(holder)) => {
+                return lease_conflict_response(&holder)
+            }
+            Err(RouteRunLeaseAcquireError::Failed(error)) => {
+                return route_lease_acquisition_failed_response(&error)
+            }
         };
 
         if let Err(err) = validate_snapshot_manifest_for_resume(
@@ -756,9 +765,12 @@ pub(in crate::server) async fn approve_session(
     // Single-writer arbitration: an approval decision mutates the run's
     // durable state (host-promise completion) and, on allow, re-drives the
     // run — same lease as /resume, deny path included.
-    let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
+    let _lease = match acquire_route_run_lease(&state, original.run_id.as_deref()) {
         Ok(guard) => guard,
-        Err(holder) => return lease_conflict_response(&holder),
+        Err(RouteRunLeaseAcquireError::Held(holder)) => return lease_conflict_response(&holder),
+        Err(RouteRunLeaseAcquireError::Failed(error)) => {
+            return route_lease_acquisition_failed_response(&error)
+        }
     };
 
     if let Err(err) = validate_snapshot_manifest_for_resume(

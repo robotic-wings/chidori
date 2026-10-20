@@ -535,6 +535,73 @@ fn acquire_signal_resume_lease(
     }
 }
 
+/// Token-aware ownership guard for HTTP requests that resume a run. Kept
+/// separate from `acquire_run_lease`, which also serves the live signal
+/// stream and retains its retry contract.
+struct RouteRunLeaseGuard {
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    lease: crate::runtime::store::FencedLease,
+}
+
+impl Drop for RouteRunLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = crate::runtime::store::release_lease_with_token(
+            self.store.as_ref(),
+            self.lease.lease(),
+            self.lease.token(),
+        ) {
+            tracing::warn!("releasing HTTP route run lease: {err}");
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RouteRunLeaseAcquireError {
+    Held(crate::runtime::store::RunLease),
+    Failed(anyhow::Error),
+}
+
+/// Acquire and retain the exact lease tenure for an HTTP resume route.
+/// Fencing-capable backend errors are returned to the handler so it can fail
+/// closed; advisory backends preserve the existing warn-and-continue policy.
+fn acquire_route_run_lease(
+    state: &AppState,
+    run_id: Option<&str>,
+) -> Result<Option<RouteRunLeaseGuard>, RouteRunLeaseAcquireError> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    if let Err(error) = factory.ensure_initialized() {
+        return Err(RouteRunLeaseAcquireError::Failed(error));
+    }
+    let store = factory.store_for(run_id);
+    let fencing = store.supports_lease_fencing();
+    match crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        &state.lease_owner,
+        run_lease_ttl(),
+    ) {
+        Ok(Ok(lease)) => Ok(Some(RouteRunLeaseGuard { store, lease })),
+        Ok(Err(holder)) => Err(RouteRunLeaseAcquireError::Held(holder)),
+        Err(error) if fencing => Err(RouteRunLeaseAcquireError::Failed(error)),
+        Err(error) => {
+            tracing::warn!("could not take the run lease for {run_id}: {error}");
+            Ok(None)
+        }
+    }
+}
+
+fn route_lease_acquisition_failed_response(error: &anyhow::Error) -> axum::response::Response {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "error": format!("could not acquire the required fenced run lease: {error:#}")
+        })),
+    )
+        .into_response()
+}
+
 enum HostPromiseCompletion {
     Resolved(Value),
     Rejected(String),
