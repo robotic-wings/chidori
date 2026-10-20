@@ -3195,6 +3195,172 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     );
 }
 
+/// Missing or mismatched pending metadata must leave an acknowledged live
+/// signal queued until the exact pending operation becomes available again.
+#[tokio::test]
+async fn stream_signal_missing_or_mismatched_pending_keeps_delivery_recoverable() {
+    const CHILD: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_CHILD";
+    const ROOT: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_ROOT";
+    const CASE: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_CASE";
+    const TEST: &str =
+        "server::tests::stream_signal_missing_or_mismatched_pending_keeps_delivery_recoverable";
+    if std::env::var_os(CHILD).is_none() {
+        for case in ["missing", "mismatched-seq", "mismatched-kind"] {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("runs.sqlite3");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROOT, temp.path())
+                .env(CASE, case)
+                .env("CHIDORI_RUN_STORE", "sqlite")
+                .env("CHIDORI_RUN_DB", &db_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case} pending metadata lost or failed to recover the acknowledged signal:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(ROOT).expect("child root"));
+    let case = std::env::var(CASE).expect("pending recovery case");
+    let agent_path = write_agent(
+        &root,
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { nonce: review.payload.nonce, by: review.from.id };
+            }
+        "#,
+    );
+    let state = signal_test_state(&root, agent_path);
+    let session_id = format!("pending-recovery-{case}");
+    let mut sse = start_stream(&state, &session_id, json!({})).await;
+    let paused = wait_for_status(&state, &session_id, SessionStatus::Paused).await;
+    let run_id = paused.run_id.clone().expect("paused stream has a run id");
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
+    let pending_before = store
+        .get_blob(super::PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("paused signal has durable pending metadata");
+    let mut altered_pending: crate::runtime::snapshot::PendingHostOperation =
+        serde_json::from_slice(&pending_before).unwrap();
+    match case.as_str() {
+        "missing" => store
+            .delete_blob(super::PENDING_HOST_OPERATION_FILE)
+            .unwrap(),
+        "mismatched-seq" => {
+            altered_pending.seq += 1;
+            store
+                .put_blob(
+                    super::PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(&altered_pending).unwrap(),
+                )
+                .unwrap();
+        }
+        "mismatched-kind" => {
+            altered_pending.kind = crate::runtime::snapshot::PendingHostOperationKind::Http;
+            store
+                .put_blob(
+                    super::PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(&altered_pending).unwrap(),
+                )
+                .unwrap();
+        }
+        other => panic!("unexpected pending recovery case {other}"),
+    }
+
+    let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_dispatch(&run_id, dispatch_tx, dispatch_release_rx);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_result(&run_id, result_tx);
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"nonce": format!("recover-{case}")}),
+                from: json!({"kind": "test", "id": "pending-recovery"}),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durable");
+
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx)
+        .await
+        .expect("missing/mismatched pending op reached the resume result")
+        .expect("resume observer was notified");
+    let inbox_after_refusal = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("signal remains durably queued");
+    let matching_durable = dispatch
+        .durable_inbox
+        .iter()
+        .filter(|signal| signal.payload["nonce"] == format!("recover-{case}"))
+        .count();
+    let matching_memory = dispatch
+        .memory_inbox
+        .iter()
+        .filter(|signal| signal.payload["nonce"] == format!("recover-{case}"))
+        .count();
+
+    // Repair the exact pending bytes while the stream is held at the dispatch
+    // observer; its scheduled retry then exercises recovery through production.
+    store
+        .put_blob(super::PENDING_HOST_OPERATION_FILE, &pending_before)
+        .unwrap();
+    let _ = dispatch_release_tx.send(());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
+        .await
+        .expect("retained signal was not retried after pending metadata recovery")
+        .expect("resume result observer was notified");
+    let resumed = state
+        .session_store
+        .get(&session_id)
+        .unwrap()
+        .expect("resumed session persisted");
+    let sse_text = tokio::time::timeout(std::time::Duration::from_secs(5), &mut sse)
+        .await
+        .expect("recovered stream completed")
+        .unwrap();
+
+    assert!(!dispatch.handled, "invalid pending operation was resumed");
+    assert!(
+        dispatch.remains_supervised,
+        "paused stream lost supervision"
+    );
+    assert_eq!(dispatch.session_status, SessionStatus::Paused);
+    assert_eq!(matching_durable, 1, "durable delivery missing at retry cut");
+    assert_eq!(matching_memory, 1, "memory delivery missing at retry cut");
+    assert_eq!(
+        inbox_after_refusal, inbox_after_ack,
+        "pending validation changed durable inbox bytes"
+    );
+    assert_eq!(result.session_status, SessionStatus::Completed);
+    assert_eq!(resumed.status, SessionStatus::Completed);
+    assert_eq!(
+        resumed.output.as_ref().unwrap()["nonce"],
+        json!(format!("recover-{case}"))
+    );
+    assert!(sse_text.contains("\"status\":\"completed\""));
+}
+
 /// A timeout that expires while another process owns the run tenure remains
 /// pending and resumes exactly once after that tenure is released. The test
 /// gate expires the persisted deadline and releases the supervisor directly

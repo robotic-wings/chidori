@@ -578,7 +578,8 @@ fn spawn_streaming_run(
 /// the live slot — carrying over the in-memory mailbox so a delivery racing
 /// this resume is not lost — persists the session as Running, and spawns the
 /// blocking re-run, which reports back on `result_tx`. A signal candidate stays
-/// in both inboxes until acquisition succeeds; only then is that delivery consumed.
+/// in both inboxes until acquisition succeeds and the expected pending
+/// operation is validated; only then is that delivery consumed.
 #[allow(clippy::too_many_arguments)]
 fn resume_signal_pause_in_process(
     state: &AppState,
@@ -629,22 +630,16 @@ fn resume_signal_pause_in_process(
             return SignalResumeOutcome::Retry;
         }
     };
-    let value = if let Some(candidate) = signal_to_consume {
-        let consumed = ctx_slot
-            .lock()
-            .unwrap()
-            .take_queued_signal_by_delivery_seq(candidate.delivery_seq);
-        let Some(consumed) = consumed else {
-            return SignalResumeOutcome::Retry;
-        };
-        json!({
-            "name": consumed.name,
-            "payload": consumed.payload,
-            "from": consumed.from,
+    let value = signal_to_consume
+        .as_ref()
+        .map(|candidate| {
+            json!({
+                "name": candidate.name,
+                "payload": candidate.payload,
+                "from": candidate.from,
+            })
         })
-    } else {
-        value
-    };
+        .unwrap_or(value);
     let mut call_log = match load_persisted_replay_journal(
         &state.run_base,
         session.run_id.as_deref(),
@@ -676,6 +671,20 @@ fn resume_signal_pause_in_process(
             return SignalResumeOutcome::Started;
         }
     };
+    if let Some(candidate) = signal_to_consume {
+        let consumed = ctx_slot
+            .lock()
+            .unwrap()
+            .take_queued_signal_by_delivery_seq(candidate.delivery_seq);
+        if consumed.is_none() {
+            tracing::warn!(
+                run_id = %run_id,
+                delivery_seq = candidate.delivery_seq,
+                "signal completion was persisted but its queued delivery was no longer in memory"
+            );
+            return SignalResumeOutcome::Retry;
+        }
+    }
     let resolution = signal_resolution_record(&pending, seq, value);
     // Emit the consumed signal on the live stream. The resumed run replays
     // the log (replayed records deliberately re-emit nothing), so without
