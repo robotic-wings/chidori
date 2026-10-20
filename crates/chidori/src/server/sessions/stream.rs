@@ -239,6 +239,49 @@ pub(crate) fn observe_signal_resume_result(
         .insert(run_id.to_string(), sender);
 }
 
+#[cfg(test)]
+type SignalConsumptionCut = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static SIGNAL_CONSUMPTION_CUT: OnceLock<StdMutex<Option<SignalConsumptionCut>>> = OnceLock::new();
+
+/// Install a one-shot pause immediately before the supervisor removes a
+/// matching delivery from the inbox. Tests use it to terminate a child after
+/// durable host-promise completion but before inbox retirement.
+#[cfg(test)]
+pub(in crate::server) fn install_signal_consumption_cut() -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let cut = SIGNAL_CONSUMPTION_CUT.get_or_init(|| StdMutex::new(None));
+    assert!(
+        cut.lock()
+            .unwrap()
+            .replace((reached_tx, release_rx))
+            .is_none(),
+        "signal consumption cut already installed"
+    );
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_at_signal_consumption_cut() {
+    let cut = SIGNAL_CONSUMPTION_CUT
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap()
+        .take();
+    if let Some((reached, release)) = cut {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}
+
 /// POST /sessions/stream — run the agent and stream each host-function call
 /// as a Server-Sent Event while it executes. Final event has `event: done`
 /// carrying the session id and output.
@@ -935,6 +978,8 @@ pub(in crate::server) async fn stream_session(
                     // Otherwise it stays durably queued for a future drain.
                     if let Some((seq, names)) = supervising.clone() {
                         if names.iter().any(|n| n == &name) {
+                            #[cfg(test)]
+                            wait_at_signal_consumption_cut().await;
                             let entry = ctx_slot.lock().unwrap()
                                 .queued_signal_by_delivery_seq(delivery_seq);
                             if let Some(entry) = entry {
