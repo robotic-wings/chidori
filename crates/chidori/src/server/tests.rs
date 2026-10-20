@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::runtime::snapshot::{
-    RuntimePolicy, SnapshotAbi, SourceFingerprint, HOST_PROMISE_TABLE_FILE,
+    HostPromiseState, RuntimePolicy, SnapshotAbi, SourceFingerprint, HOST_PROMISE_TABLE_FILE,
+    PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE,
 };
 use axum::body;
 use axum::extract::{Path, State};
@@ -3735,6 +3736,240 @@ async fn stream_session_resolves_signal_pause_in_process() {
 
     let _ = std::fs::remove_dir_all(temp_dir);
     let _ = std::fs::remove_dir_all(dir_b);
+}
+
+/// A process cut after the completed host-promise write but before durable
+/// inbox retirement must recover the first consumption exactly once. The
+/// child uses the live signal route for the acknowledgment, pauses the real
+/// supervisor immediately before inbox removal, completes the persisted
+/// operation, and exits without running destructors. A fresh `AppState` opens
+/// the SQLite session store and filesystem run store, then exercises the
+/// replay-preserving server continuation. This does not test automatic server
+/// startup re-arm because it does not bind a `serve` listener.
+#[tokio::test]
+async fn signal_consumption_completion_before_inbox_removal_recovers_atomically() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SIGNAL_CONSUMPTION_CRASH_ROOT";
+    const TEST: &str =
+        "server::tests::signal_consumption_completion_before_inbox_removal_recovers_atomically";
+    const CRASH_EXIT: i32 = 87;
+    const SESSION_ID: &str = "signal-consumption-crash";
+    const SIGNAL_PAYLOAD: &str = "cut-1";
+    let source = r#"
+        export async function agent(input, chidori) {
+            const first = await chidori.signal("review", { timeoutMs: 60000 });
+            const second = await chidori.signal("review", { timeoutMs: 5 });
+            return {
+                first: first.payload,
+                secondTimedOut: second.timedOut === true,
+                second: second.payload ?? null,
+            };
+        }
+    "#;
+
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let agent_path = write_agent(&root, source);
+        let mut state = signal_test_state(&root, agent_path);
+        let session_db = root.join("sessions.sqlite3");
+        state.session_store = Arc::new(crate::storage::SqliteStore::open(session_db).unwrap());
+
+        let (reached_cut, _release_cut) = super::sessions::stream::install_signal_consumption_cut();
+        let _stream = start_stream(&state, SESSION_ID, json!({})).await;
+        let paused = wait_for_status(&state, SESSION_ID, SessionStatus::Paused).await;
+        let run_id = paused.run_id.clone().expect("paused session has run id");
+        let seq = paused.pending_seq.expect("paused signal has pending seq");
+
+        // Exercise the public route for the one acknowledged delivery. The
+        // worker reaches the test gate after receiving its wake, before it
+        // removes this exact delivery from the durable inbox.
+        let (status, response) = response_json(
+            signal_session(
+                State(state.clone()),
+                Path(SESSION_ID.to_string()),
+                Json(SignalRequest {
+                    allow_source_change: false,
+                    name: "review".to_string(),
+                    payload: json!({ "id": SIGNAL_PAYLOAD }),
+                    from: json!({ "kind": "test", "id": "crash-cut" }),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response["status"], json!("delivered_live"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_cut)
+            .await
+            .expect("supervisor reached the pre-removal cut")
+            .expect("cut notification sender remains alive");
+
+        let value = json!({
+            "name": "review",
+            "payload": { "id": SIGNAL_PAYLOAD },
+            "from": { "kind": "test", "id": "crash-cut" },
+        });
+        let completed = complete_persisted_pending_host_operation(
+            &state.run_base,
+            Some(&run_id),
+            Some((seq, PendingHostOperationKind::Signal)),
+            HostPromiseCompletion::Resolved(value),
+        )
+        .unwrap();
+        assert!(completed.is_some(), "the first listen promise was resolved");
+
+        // Model the OS process terminating at this exact durable cut. The
+        // pending blob and promise write have committed; inbox and journal
+        // still describe the pre-consumption state.
+        std::process::exit(CRASH_EXIT);
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(TEST)
+        .arg("--nocapture")
+        .env(CHILD_ROOT, temp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(CRASH_EXIT),
+        "cut child must exit immediately after durable promise completion; stdout={} stderr={}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr),
+    );
+
+    let agent_path = temp.path().join("agent.ts");
+    let mut restarted = signal_test_state(temp.path(), agent_path);
+    let session_db = temp.path().join("sessions.sqlite3");
+    restarted.session_store = Arc::new(crate::storage::SqliteStore::open(session_db).unwrap());
+    let original = restarted
+        .session_store
+        .get(SESSION_ID)
+        .unwrap()
+        .expect("SQLite session state survives child exit");
+    let run_id = original.run_id.clone().expect("session run id");
+    let seq = original.pending_seq.expect("pending signal seq");
+
+    let factory = crate::runtime::store::RunStoreFactory::shared(&restarted.run_base);
+    factory.hydrate(&run_id).unwrap();
+    let store = factory.store_for(&run_id);
+    let inbox_at_restart: Vec<crate::runtime::snapshot::QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)
+        .unwrap()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or_default();
+    let promises_at_restart =
+        crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap();
+    let resolved = promises_at_restart
+        .iter()
+        .find(|record| {
+            record.operation.seq == seq && record.operation.kind == PendingHostOperationKind::Signal
+        })
+        .expect("resolved first signal promise remains durable");
+    let resolved_value = match &resolved.state {
+        HostPromiseState::Resolved { value, .. } => value.clone(),
+        other => panic!("expected resolved cut promise, got {other:?}"),
+    };
+    let delivery_seq = inbox_at_restart
+        .iter()
+        .find(|signal| signal.payload["id"] == json!(SIGNAL_PAYLOAD))
+        .expect("acknowledged cut-1 is still in the inbox at restart")
+        .delivery_seq;
+    assert_eq!(
+        store.get_blob(PENDING_HOST_OPERATION_FILE).unwrap(),
+        None,
+        "crash cut persists promise completion before pending deletion"
+    );
+    assert_eq!(
+        inbox_at_restart.len(),
+        1,
+        "one acknowledged delivery at cut"
+    );
+    assert_eq!(
+        resolved_value,
+        json!({
+            "name": "review",
+            "payload": { "id": SIGNAL_PAYLOAD },
+            "from": { "kind": "test", "id": "crash-cut" },
+        })
+    );
+    assert!(
+        store
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default()
+            .is_empty(),
+        "the crash cut precedes the signal journal row"
+    );
+    assert_eq!(original.status, SessionStatus::Paused);
+
+    // Recovery reconstructs the first signal record from the durable
+    // completion, then invokes the existing replay-preserving server
+    // continuation with the persisted inbox. This exercises the replay tail;
+    // it does not claim automatic startup re-arm coverage.
+    let (status, recovered_view) = response_json(
+        super::sessions::resume::test_resume_from_resolved_signal(
+            &restarted,
+            original,
+            &resolved.operation,
+            resolved_value.clone(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "recovery response: {recovered_view}"
+    );
+
+    let recovered = wait_for_status(&restarted, SESSION_ID, SessionStatus::Completed).await;
+    let journal = store.load_call_log().unwrap().unwrap_or_default();
+    let inbox_after_recovery: Vec<crate::runtime::snapshot::QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)
+        .unwrap()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or_default();
+    let first_value_rows = journal
+        .iter()
+        .filter(|record| record.function == "signal" && record.result == resolved_value)
+        .count();
+    let exact_delivery_remaining = inbox_after_recovery
+        .iter()
+        .any(|signal| signal.delivery_seq == delivery_seq);
+    let output = recovered.output.clone().unwrap_or(Value::Null);
+    let violations = [
+        (
+            recovered.status == SessionStatus::Completed,
+            "recovered session completes",
+        ),
+        (
+            output["first"]["id"] == json!(SIGNAL_PAYLOAD),
+            "first listen returns cut-1",
+        ),
+        (
+            first_value_rows == 1,
+            "first resolved value is journaled exactly once",
+        ),
+        (
+            !exact_delivery_remaining,
+            "exact delivery_seq is absent from inbox",
+        ),
+        (
+            output["secondTimedOut"] == json!(true),
+            "second same-name listen does not receive the stale payload",
+        ),
+    ];
+    let failures: Vec<_> = violations
+        .iter()
+        .filter_map(|(passed, message)| (!passed).then_some(*message))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "signal consumption recovery violated {:?}; output={output}, first_value_rows={first_value_rows}, delivery_seq={delivery_seq}, inbox={inbox_after_recovery:?}, journal={journal:?}",
+        failures
+    );
 }
 
 #[tokio::test]

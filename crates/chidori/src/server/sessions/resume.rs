@@ -225,6 +225,19 @@ pub(super) async fn complete_pending_and_resume(
     }
 }
 
+/// Test-only entry point for recovery from a durable resolved signal promise
+/// whose synthetic journal row was interrupted by a process exit.
+#[cfg(test)]
+pub(in crate::server) async fn test_resume_from_resolved_signal(
+    state: &AppState,
+    original: StoredSession,
+    pending: &PendingHostOperation,
+    value: Value,
+) -> Response {
+    let record = signal_resolution_record(pending, pending.seq, value);
+    complete_pending_and_resume(state, original, vec![record]).await
+}
+
 /// POST /sessions/:id/resume — supply a response to the agent's pending
 /// `input()` call and continue the run. Body: `{"response": "<string>"}`,
 /// plus optional `"allow_source_change": true` — the edit-and-resume opt-in
