@@ -4057,6 +4057,118 @@ fn signal_consumption_intent_reconciles_idempotently() {
     ));
 }
 
+#[test]
+fn signal_consumption_intent_retry_repairs_tee_secondary_before_progress() {
+    use crate::runtime::store::{FailOneBlobPutStore, FsRunStore, RunStore, TeeRunStore};
+
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = format!("signal-intent-tee-retry-{}", uuid::Uuid::new_v4());
+    let agent_path = temp.path().join("agent.ts");
+    std::fs::write(&agent_path, "export function agent() { return {}; }").unwrap();
+    let state = signal_test_state(temp.path(), agent_path);
+    let run_dir = state.run_base.join(&run_id);
+    let mirror_dir = temp.path().join("mirror").join(&run_id);
+    let secondary = Arc::new(FailOneBlobPutStore::new(
+        &mirror_dir,
+        "signals/consumption-intent.json",
+    ));
+    let store: Arc<dyn RunStore> = Arc::new(TeeRunStore::new(
+        FsRunStore::new(&run_dir),
+        secondary.clone(),
+    ));
+    let operation = crate::runtime::snapshot::PendingHostOperation::new(
+        crate::runtime::snapshot::HostOperationId(74),
+        10,
+        PendingHostOperationKind::Signal,
+        json!({"name": "review"}),
+    )
+    .with_function("signal");
+    let queued = crate::runtime::snapshot::QueuedSignal {
+        name: "review".to_string(),
+        payload: json!({"id": "tee-retry"}),
+        from: json!({"kind": "test", "id": "tee-retry"}),
+        delivery_seq: 42,
+        enqueued_at: chrono::Utc::now(),
+    };
+    store
+        .put_blob(
+            PENDING_HOST_OPERATION_FILE,
+            &serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+    store
+        .put_blob(
+            SIGNAL_INBOX_FILE,
+            &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+        )
+        .unwrap();
+    crate::runtime::snapshot::SnapshotStore::with_store(run_dir, store.clone())
+        .compact_host_promises(
+            &[crate::runtime::snapshot::HostPromiseRecord {
+                operation: operation.clone(),
+                state: HostPromiseState::Pending,
+            }],
+            &[],
+        )
+        .unwrap();
+    let flushes_before_intent = secondary.flush_count();
+    let assert_unmutated = || {
+        let current_stores: [&dyn RunStore; 2] = [store.as_ref(), secondary.as_ref()];
+        for current in current_stores {
+            assert!(current
+                .get_blob(PENDING_HOST_OPERATION_FILE)
+                .unwrap()
+                .is_some());
+            let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = current
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            assert_eq!(inbox, vec![queued.clone()]);
+            let promises = crate::runtime::snapshot::load_host_promise_records(current).unwrap();
+            assert!(matches!(&promises[0].state, HostPromiseState::Pending));
+            assert!(current.load_call_log().unwrap().is_none());
+        }
+    };
+
+    let first_attempt =
+        super::persist_signal_consumption_intent_in_store(store.as_ref(), operation.seq, &queued);
+    assert!(
+        first_attempt.is_err(),
+        "secondary failure must stop before consumption proceeds"
+    );
+    assert_eq!(secondary.failure_count(), 1);
+    assert!(
+        store
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_some(),
+        "the FS primary has the intent from the partial Tee write"
+    );
+    assert!(
+        secondary
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_none(),
+        "the injected secondary write failed"
+    );
+    assert_eq!(secondary.flush_count(), flushes_before_intent);
+    assert_unmutated();
+
+    // The retry sees the matching primary copy. It must repair and flush the
+    // secondary before returning permission for promise/inbox/journal work.
+    let retried =
+        super::persist_signal_consumption_intent_in_store(store.as_ref(), operation.seq, &queued)
+            .unwrap();
+    assert_eq!(retried.delivery_seq, queued.delivery_seq);
+    assert!(secondary
+        .get_blob("signals/consumption-intent.json")
+        .unwrap()
+        .is_some());
+    assert_eq!(secondary.flush_count(), flushes_before_intent + 1);
+    assert_unmutated();
+}
+
 /// The same durable intent protocol runs over the configured FS-primary,
 /// SQLite-secondary mirror when selected in a child process.
 #[test]

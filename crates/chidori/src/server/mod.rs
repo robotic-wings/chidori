@@ -562,6 +562,14 @@ fn persist_signal_consumption_intent(
     let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
     factory.hydrate(run_id)?;
     let store = factory.store_for(run_id);
+    persist_signal_consumption_intent_in_store(store.as_ref(), seq, delivery)
+}
+
+fn persist_signal_consumption_intent_in_store(
+    store: &dyn crate::runtime::store::RunStore,
+    seq: u64,
+    delivery: &QueuedSignal,
+) -> anyhow::Result<SignalConsumptionIntent> {
     let pending_bytes = store
         .get_blob(PENDING_HOST_OPERATION_FILE)?
         .ok_or_else(|| anyhow::anyhow!("signal pending operation is missing"))?;
@@ -605,6 +613,15 @@ fn persist_signal_consumption_intent(
         {
             anyhow::bail!("a conflicting signal consumption intent is already present");
         }
+        // A Tee may expose the intent from its filesystem primary even when
+        // the previous primary-first write failed on the durable secondary.
+        // Re-put and flush the validated value so callers cannot proceed with
+        // promise/inbox/journal mutation until both copies have it.
+        store.put_blob(
+            SIGNAL_CONSUMPTION_INTENT_FILE,
+            &serde_json::to_vec_pretty(&existing)?,
+        )?;
+        store.flush()?;
         return Ok(existing);
     }
     store.put_blob(

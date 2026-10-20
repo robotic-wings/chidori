@@ -363,6 +363,81 @@ impl RunStore for FailSignalInboxStore {
     }
 }
 
+/// Test secondary that fails the first write to one selected blob key, then
+/// accepts the retry. Used to exercise Tee primary-success/secondary-failure
+/// recovery without depending on timing or filesystem permissions.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FailOneBlobPutStore {
+    inner: FsRunStore,
+    failed_key: String,
+    failure_count: std::sync::atomic::AtomicUsize,
+    flush_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FailOneBlobPutStore {
+    pub(crate) fn new(run_dir: impl Into<PathBuf>, failed_key: impl Into<String>) -> Self {
+        Self {
+            inner: FsRunStore::new(run_dir),
+            failed_key: failed_key.into(),
+            failure_count: std::sync::atomic::AtomicUsize::new(0),
+            flush_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn failure_count(&self) -> usize {
+        self.failure_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn flush_count(&self) -> usize {
+        self.flush_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl RunStore for FailOneBlobPutStore {
+    fn append_record(&self, record: &CallRecord) -> Result<()> {
+        self.inner.append_record(record)
+    }
+    fn write_call_log(&self, records: &[CallRecord]) -> Result<()> {
+        self.inner.write_call_log(records)
+    }
+    fn load_call_log(&self) -> Result<Option<Vec<CallRecord>>> {
+        self.inner.load_call_log()
+    }
+    fn put_blob(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if key == self.failed_key
+            && self
+                .failure_count
+                .compare_exchange(
+                    0,
+                    1,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            anyhow::bail!("injected first secondary write failure for {key}");
+        }
+        self.inner.put_blob(key, bytes)
+    }
+    fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_blob(key)
+    }
+    fn delete_blob(&self, key: &str) -> Result<()> {
+        self.inner.delete_blob(key)
+    }
+    fn list_blobs(&self) -> Result<Vec<String>> {
+        self.inner.list_blobs()
+    }
+    fn flush(&self) -> Result<()> {
+        self.flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.flush()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem backend
 // ---------------------------------------------------------------------------
