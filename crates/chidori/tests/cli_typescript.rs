@@ -2462,7 +2462,7 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
         "expected the stripped-count line on stderr, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("replaying 1 records then executing live"),
+        stderr.contains("replaying 2 records then executing live"),
         "expected the replay/live split in the stripped line, got:\n{stderr}"
     );
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2492,6 +2492,178 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
         1,
         "verify must replay the HTTP prefix"
     );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cli_resume_retry_failed_held_sqlite_tenure_preserves_journal_and_promise_bytes() {
+    use chidori::runtime::store::{
+        acquire_lease_with_token, release_lease_with_token, RunStore, SqliteRunStore,
+        SqliteRunStoreShared,
+    };
+
+    let dir = temp_project("retry-failed-held-sqlite-lease");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+    let db_path = dir.join("runs.sqlite3");
+    let db_path_text = db_path.to_string_lossy().to_string();
+    let sqlite_env = [
+        ("CHIDORI_RUN_STORE", "sqlite"),
+        ("CHIDORI_RUN_DB", db_path_text.as_str()),
+    ];
+    let failed = run_chidori_without_providers_with_env(
+        &["run", agent.to_str().unwrap()],
+        &dir,
+        &sqlite_env,
+    );
+    assert_failure(&failed);
+
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let journal_path = run_dir.join("records.jsonl");
+    let table_path = run_dir.join("host_promises.json");
+    let table_bytes_before = fs::read(&table_path).unwrap();
+    let table: serde_json::Value = serde_json::from_slice(&table_bytes_before).unwrap();
+    let rejected = table
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| {
+            record["operation"]["kind"] == "prompt" && record["state"].get("rejected").is_some()
+        })
+        .expect("failed prompt must have a rejected durable promise");
+    let promise_id = rejected["operation"]["id"]
+        .as_u64()
+        .expect("host promise id is numeric");
+    let event_path = run_dir
+        .join("host_promises")
+        .join(format!("{promise_id}.json"));
+    // The normal settled-run compaction has removed per-op blobs. Recreate
+    // the matching rejected event to model the persisted pre-compaction
+    // frontier that retry-failed is responsible for retiring.
+    let event_bytes_before = serde_json::to_vec_pretty(rejected).unwrap();
+    fs::create_dir_all(event_path.parent().unwrap()).unwrap();
+    fs::write(&event_path, &event_bytes_before).unwrap();
+    let journal_bytes_before = fs::read(&journal_path).unwrap();
+
+    let shared = SqliteRunStoreShared::open(&db_path).unwrap();
+    let sqlite = SqliteRunStore::new(shared, run_id.clone());
+    let event_key = format!("host_promises/{promise_id}.json");
+    sqlite.put_blob(&event_key, &event_bytes_before).unwrap();
+    let sqlite_journal_before = serde_json::to_vec(
+        &sqlite
+            .load_call_log()
+            .unwrap()
+            .expect("SQLite mirror must contain the failed journal"),
+    )
+    .unwrap();
+    let sqlite_table_before = sqlite
+        .get_blob("host_promises.json")
+        .unwrap()
+        .expect("SQLite mirror must contain the promise table");
+    let sqlite_event_before = sqlite
+        .get_blob(&event_key)
+        .unwrap()
+        .expect("SQLite mirror must contain the per-operation promise event");
+    let held = acquire_lease_with_token(
+        &sqlite,
+        "external-retry-holder",
+        chrono::Duration::minutes(10),
+    )
+    .unwrap()
+    .expect("the failed run must be free before acquiring the test tenure");
+
+    let refused = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", db_path_text.as_str()),
+            ("CHIDORI_TEST_LLM_RESPONSE", "repaired"),
+        ],
+    );
+    let refused_journal = fs::read(&journal_path).unwrap();
+    let refused_table = fs::read(&table_path).unwrap();
+    let refused_event = fs::read(&event_path).unwrap();
+    let refused_sqlite_journal = serde_json::to_vec(
+        &sqlite
+            .load_call_log()
+            .unwrap()
+            .expect("held retry must retain SQLite journal"),
+    )
+    .unwrap();
+    let refused_sqlite_table = sqlite.get_blob("host_promises.json").unwrap().unwrap();
+    let refused_sqlite_event = sqlite.get_blob(&event_key).unwrap().unwrap();
+
+    // Release the exact external tenure before assertions or fixture cleanup.
+    release_lease_with_token(&sqlite, held.lease(), held.token()).unwrap();
+
+    assert_failure(&refused);
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        diagnostic.contains("external-retry-holder"),
+        "held retry should identify the SQLite lease owner, got:\n{diagnostic}"
+    );
+    assert_eq!(
+        refused_journal, journal_bytes_before,
+        "refusal changed local journal bytes"
+    );
+    assert_eq!(
+        refused_table, table_bytes_before,
+        "refusal changed local promise-table bytes"
+    );
+    assert_eq!(
+        refused_event, event_bytes_before,
+        "refusal changed local promise-event bytes"
+    );
+    assert_eq!(
+        refused_sqlite_journal, sqlite_journal_before,
+        "refusal changed SQLite journal records"
+    );
+    assert_eq!(
+        refused_sqlite_table, sqlite_table_before,
+        "refusal changed SQLite promise-table bytes"
+    );
+    assert_eq!(
+        refused_sqlite_event, sqlite_event_before,
+        "refusal changed SQLite promise-event bytes"
+    );
+
+    let retry = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[
+            ("CHIDORI_RUN_STORE", "sqlite"),
+            ("CHIDORI_RUN_DB", db_path_text.as_str()),
+            ("CHIDORI_TEST_LLM_RESPONSE", "repaired"),
+        ],
+    );
+    assert_success(&retry);
+    let output: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(output["text"], "repaired");
+    let retried_journal = sqlite.load_call_log().unwrap().unwrap();
+    assert_eq!(retried_journal.last().unwrap().function, "prompt");
+    assert!(retried_journal.last().unwrap().error.is_none());
+    let retried_table: serde_json::Value =
+        serde_json::from_slice(&sqlite.get_blob("host_promises.json").unwrap().unwrap()).unwrap();
+    let retried_prompt = retried_table
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["operation"]["kind"] == "prompt")
+        .expect("retry must retain its prompt completion in SQLite");
+    assert!(retried_prompt["state"].get("resolved_in_journal").is_some());
 
     fs::remove_dir_all(dir).ok();
 }
