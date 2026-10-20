@@ -124,7 +124,7 @@ impl Drop for LocalHttpServer {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            thread.join().unwrap();
         }
     }
 }
