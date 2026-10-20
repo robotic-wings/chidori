@@ -1211,7 +1211,7 @@ pub async fn serve(
     for session in startup_sessions {
         let recovered = if session.status == SessionStatus::Paused {
             if let Some(run_id) = session.run_id.as_deref() {
-                match acquire_run_lease(&state, Some(run_id)) {
+                match acquire_signal_resume_lease(&state, Some(run_id)) {
                     Ok(Some(_lease)) => match reconcile_signal_consumption_intent(&state, run_id) {
                         Ok(Some(record)) => {
                             let mut call_log = session.call_log.clone();
@@ -1231,7 +1231,12 @@ pub async fn serve(
                             ));
                         }
                     },
-                    Ok(None) | Err(_) => false,
+                    Ok(None) | Err(RunLeaseAcquisitionError::Held(_)) => false,
+                    Err(RunLeaseAcquisitionError::Failed(error)) => {
+                        return Err(error).context(format!(
+                            "acquiring run lease for signal recovery on run {run_id}"
+                        ));
+                    }
                 }
             } else {
                 false

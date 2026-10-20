@@ -4189,6 +4189,176 @@ fn signal_consumption_intent_reconciles_with_sqlite_mirror() {
     );
 }
 
+/// Server boot must use a token-aware lease while recovering a durable signal
+/// intent. This subprocess configures the SQLite mirror before the run-store
+/// factory is initialized, seeds a paused session plus an intent, and starts
+/// the real `serve` entry point. Boot recovery must complete the session
+/// before the listener begins serving requests.
+#[tokio::test]
+async fn sqlite_server_startup_recovers_signal_consumption_intent() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("CHIDORI_RUN_STORE", "sqlite");
+        std::env::set_var("CHIDORI_RUN_DB", root.join("runs.sqlite3"));
+        std::env::set_var("CHIDORI_DB_PATH", root.join("sessions.sqlite3"));
+
+        let agent_path = write_agent(
+            &root,
+            r#"
+                export async function agent(input, chidori) {
+                    const first = await chidori.signal("review", { timeoutMs: 60000 });
+                    const second = await chidori.signal("review", { timeoutMs: 5 });
+                    return {
+                        first: first.payload,
+                        secondTimedOut: second.timedOut === true,
+                        second: second.payload ?? null,
+                    };
+                }
+            "#,
+        );
+        let run_base = root.join(".chidori").join("runs");
+        let run_id = "sqlite-startup-signal-recovery";
+        let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+        factory.ensure_initialized().unwrap();
+        factory.hydrate(run_id).unwrap();
+        let store = factory.store_for(run_id);
+        let operation = crate::runtime::snapshot::PendingHostOperation::new(
+            crate::runtime::snapshot::HostOperationId(301),
+            1,
+            PendingHostOperationKind::Signal,
+            json!({"name": "review"}),
+        )
+        .with_function("signal");
+        let queued = crate::runtime::snapshot::QueuedSignal {
+            name: "review".to_string(),
+            payload: json!({"id": "startup-cut"}),
+            from: json!({"kind": "test", "id": "startup"}),
+            delivery_seq: 1,
+            enqueued_at: chrono::Utc::now(),
+        };
+        store
+            .put_blob(
+                PENDING_HOST_OPERATION_FILE,
+                &serde_json::to_vec(&operation).unwrap(),
+            )
+            .unwrap();
+        store
+            .put_blob(
+                SIGNAL_INBOX_FILE,
+                &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+            )
+            .unwrap();
+        crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+            .compact_host_promises(
+                &[crate::runtime::snapshot::HostPromiseRecord {
+                    operation: operation.clone(),
+                    state: HostPromiseState::Pending,
+                }],
+                &[],
+            )
+            .unwrap();
+        super::persist_signal_consumption_intent(&run_base, run_id, operation.seq, &queued)
+            .unwrap();
+
+        let session_store = crate::storage::build_session_store(&root).unwrap();
+        session_store
+            .put(&StoredSession {
+                id: "sqlite-startup-signal-session".to_string(),
+                run_id: Some(run_id.to_string()),
+                status: SessionStatus::Paused,
+                input: json!({}),
+                output: None,
+                call_log: Vec::new(),
+                error: None,
+                pending_seq: Some(operation.seq),
+                pending_prompt: None,
+                pending_details: None,
+                pending_signal_name: Some("review".to_string()),
+                pending_signal_names: vec!["review".to_string()],
+                pending_signal_deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+                pending_approval: None,
+                approvals: Vec::new(),
+                policy_profile: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let server = tokio::spawn(serve(
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(root.to_string_lossy().into_owned())),
+            Some(agent_path),
+            "127.0.0.1".to_string(),
+            0,
+            PolicyConfig::from_env(),
+            "test".to_string(),
+            None,
+        ));
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(session) = session_store.get("sqlite-startup-signal-session").unwrap() {
+                    if session.status == SessionStatus::Completed {
+                        break session;
+                    }
+                }
+                assert!(
+                    !server.is_finished(),
+                    "serve exited before startup recovery"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server startup recovery completed");
+        assert_eq!(
+            recovered.output,
+            Some(json!({
+                "first": {"id": "startup-cut"},
+                "secondTimedOut": true,
+                "second": null,
+            }))
+        );
+        let journal = store.load_call_log().unwrap().unwrap_or_default();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|record| record.function == "signal"
+                    && record.result["payload"]["id"] == "startup-cut")
+                .count(),
+            1,
+            "startup recovery records the completed signal exactly once"
+        );
+        let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_default();
+        assert!(inbox.is_empty(), "startup left a consumed signal queued");
+        assert!(store
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_none());
+        server.abort();
+        let _ = server.await;
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ROOT, temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "SQLite-configured serve startup recovery failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 #[tokio::test]
 async fn live_signal_route_does_not_accept_when_inbox_persistence_fails() {
     const CHILD: &str = "CHIDORI_TEST_LIVE_SERVER_FAILURE_CHILD";
