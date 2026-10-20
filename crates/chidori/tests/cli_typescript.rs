@@ -2361,6 +2361,13 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
     let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
     assert_failure(&output);
     let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let promise_path = run_dir.join("host_promises.json");
+    let promises: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    assert!(promises[1]["state"].get("rejected").is_some());
+    let journal_before = journal_records(&run_dir.join("records.jsonl"));
+    assert!(journal_before.last().unwrap()["error"].is_string());
 
     // A plain resume would replay the recorded failure. --retry-failed
     // strips it and re-executes the prompt live against the now-working
@@ -2382,11 +2389,234 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
     );
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["text"], "repaired");
+    let promises: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    assert!(
+        promises[1]["state"].get("resolved_in_journal").is_some(),
+        "retry must replace the old rejected completion with the repaired durable result"
+    );
 
     // The repaired run is a coherent recorded run: verify replays it to the
     // identical output with NO provider configured.
     let output = run_chidori_without_providers(&["verify", agent.to_str().unwrap(), &run_id], &dir);
     assert_success(&output);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// Refusal control: prefix-only state with an old Rejected completion has no
+// durable retry-intent marker, so retry-failed must not infer authorization.
+#[test]
+fn cli_resume_retry_failed_refuses_unmarked_prefix_with_rejected_promise() {
+    let dir = temp_project("retry-failed-cut-before-pending");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let records = journal_records(&records_path);
+    assert_eq!(
+        records.len(),
+        2,
+        "fixture must have one prefix and one failed prompt"
+    );
+    assert_eq!(records[1]["function"], "prompt");
+    assert!(records[1]["error"].is_string());
+
+    // Construct prefix-only state without an authorization marker, while the
+    // per-operation blob still says Rejected. This is a refusal control.
+    let prefix = [serde_json::to_vec(&records[0]).unwrap(), b"\n".to_vec()].concat();
+    fs::write(&records_path, &prefix).unwrap();
+    let promise_path = run_dir.join("host_promises.json");
+    let promise_bytes_before = fs::read(&promise_path).unwrap();
+    let promises: serde_json::Value = serde_json::from_slice(&promise_bytes_before).unwrap();
+    assert!(promises[1]["state"].get("rejected").is_some());
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[("CHIDORI_TEST_LLM_RESPONSE", "recovered")],
+    );
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not in a failed state"));
+    assert!(
+        output.stdout.is_empty(),
+        "unmarked retry must not execute the prompt"
+    );
+    assert_eq!(fs::read(&records_path).unwrap(), prefix);
+    assert_eq!(fs::read(&promise_path).unwrap(), promise_bytes_before);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// Refusal control: Pending alone is not an authorization marker either. This
+// models the durable promise replacement without a recorded retry intent.
+#[test]
+fn cli_resume_retry_failed_refuses_unmarked_prefix_with_pending_promise() {
+    let dir = temp_project("retry-failed-cut-pending-before-dispatch");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let records = journal_records(&records_path);
+    assert_eq!(records.len(), 2);
+    let prefix = [serde_json::to_vec(&records[0]).unwrap(), b"\n".to_vec()].concat();
+    fs::write(&records_path, &prefix).unwrap();
+
+    let promise_path = run_dir.join("host_promises.json");
+    let mut promises: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    promises[1]["state"] = serde_json::json!("pending");
+    fs::write(&promise_path, serde_json::to_vec_pretty(&promises).unwrap()).unwrap();
+    let promise_bytes_before = fs::read(&promise_path).unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[("CHIDORI_TEST_LLM_RESPONSE", "must-not-dispatch")],
+    );
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not in a failed state"));
+    assert!(
+        output.stdout.is_empty(),
+        "unmarked retry must not dispatch the prompt"
+    );
+    assert_eq!(fs::read(&records_path).unwrap(), prefix);
+    assert_eq!(fs::read(&promise_path).unwrap(), promise_bytes_before);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// Refusal control: a prefix-only journal with the failed operation's promise
+// absent also lacks retry authorization and must not start live work.
+#[test]
+fn cli_resume_retry_failed_refuses_unmarked_prefix_without_promise() {
+    let dir = temp_project("retry-failed-cut-prefix-without-promise");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let records = journal_records(&records_path);
+    assert_eq!(records.len(), 2);
+    let prefix = [serde_json::to_vec(&records[0]).unwrap(), b"\n".to_vec()].concat();
+    fs::write(&records_path, &prefix).unwrap();
+
+    let promise_path = run_dir.join("host_promises.json");
+    let mut promises: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    promises.as_array_mut().unwrap().pop();
+    fs::write(&promise_path, serde_json::to_vec_pretty(&promises).unwrap()).unwrap();
+    let promise_bytes_before = fs::read(&promise_path).unwrap();
+
+    let output = run_chidori_with_str_env(
+        &["resume", agent.to_str().unwrap(), &run_id, "--retry-failed"],
+        &dir,
+        &[("CHIDORI_TEST_LLM_RESPONSE", "must-not-dispatch")],
+    );
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not in a failed state"));
+    assert!(
+        output.stdout.is_empty(),
+        "unmarked retry must not dispatch the prompt"
+    );
+    assert_eq!(fs::read(&records_path).unwrap(), prefix);
+    assert_eq!(fs::read(&promise_path).unwrap(), promise_bytes_before);
+
+    fs::remove_dir_all(dir).ok();
+}
+
+// Crash cut: the provider result is durably resolved, but its journal append
+// has not happened. A plain resume must consume that resolution without
+// contacting a provider, then write the missing journal row.
+#[test]
+fn cli_resume_retry_failed_replays_resolved_result_before_journal_append() {
+    let dir = temp_project("retry-failed-cut-resolved-before-journal");
+    let agent = dir.join("agent.ts");
+    fs::write(
+        &agent,
+        r#"
+            export async function agent(input, chidori) {
+                await chidori.log("start", {});
+                const text = await chidori.prompt("say hi");
+                return { text };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = run_chidori_without_providers(&["run", agent.to_str().unwrap()], &dir);
+    assert_failure(&output);
+    let run_id = first_run_id(&dir);
+    let run_dir = dir.join(".chidori").join("runs").join(&run_id);
+    let records_path = run_dir.join("records.jsonl");
+    let records = journal_records(&records_path);
+    assert_eq!(records.len(), 2);
+    fs::write(
+        &records_path,
+        [serde_json::to_vec(&records[0]).unwrap().as_slice(), b"\n"].concat(),
+    )
+    .unwrap();
+
+    let promise_path = run_dir.join("host_promises.json");
+    let mut promises: serde_json::Value =
+        serde_json::from_slice(&fs::read(&promise_path).unwrap()).unwrap();
+    promises[1]["state"] = serde_json::json!({
+        "resolved": {
+            "value": "resolved-before-journal",
+            "completed_at": "2026-10-20T00:00:00Z"
+        }
+    });
+    fs::write(&promise_path, serde_json::to_vec_pretty(&promises).unwrap()).unwrap();
+
+    let output = run_chidori_without_providers(&["resume", agent.to_str().unwrap(), &run_id], &dir);
+    assert_success(&output);
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["text"], "resolved-before-journal");
+    let repaired = journal_records(&records_path);
+    assert_eq!(repaired.len(), 2);
+    assert_eq!(repaired[1]["result"], "resolved-before-journal");
+    assert!(repaired[1]["error"].is_null());
 
     fs::remove_dir_all(dir).ok();
 }
