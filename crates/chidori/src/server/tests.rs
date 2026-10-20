@@ -3972,6 +3972,111 @@ async fn signal_consumption_completion_before_inbox_removal_recovers_atomically(
     );
 }
 
+/// The protocol's store-level recovery is idempotent: a restart may repeat
+/// reconciliation after any earlier write has succeeded.
+#[test]
+fn signal_consumption_intent_reconciles_idempotently() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = format!("signal-intent-{}", uuid::Uuid::new_v4());
+    let agent_path = temp.path().join("agent.ts");
+    std::fs::write(&agent_path, "export function agent() { return {}; }").unwrap();
+    let state = signal_test_state(temp.path(), agent_path);
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    factory.hydrate(&run_id).unwrap();
+    let store = factory.store_for(&run_id);
+    let operation = crate::runtime::snapshot::PendingHostOperation::new(
+        crate::runtime::snapshot::HostOperationId(73),
+        9,
+        PendingHostOperationKind::Signal,
+        json!({"name": "review"}),
+    )
+    .with_function("signal");
+    let queued = crate::runtime::snapshot::QueuedSignal {
+        name: "review".to_string(),
+        payload: json!({"id": "intent-cut"}),
+        from: json!({"kind": "test", "id": "intent"}),
+        delivery_seq: 41,
+        enqueued_at: chrono::Utc::now(),
+    };
+    store
+        .put_blob(
+            PENDING_HOST_OPERATION_FILE,
+            &serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+    store
+        .put_blob(
+            SIGNAL_INBOX_FILE,
+            &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+        )
+        .unwrap();
+    crate::runtime::snapshot::SnapshotStore::with_store(
+        state.run_base.join(&run_id),
+        store.clone(),
+    )
+    .compact_host_promises(
+        &[crate::runtime::snapshot::HostPromiseRecord {
+            operation: operation.clone(),
+            state: HostPromiseState::Pending,
+        }],
+        &[],
+    )
+    .unwrap();
+
+    super::persist_signal_consumption_intent(&state.run_base, &run_id, operation.seq, &queued)
+        .unwrap();
+    let recovered = super::reconcile_signal_consumption_intent(&state, &run_id)
+        .unwrap()
+        .expect("intent was reconciled");
+    assert_eq!(recovered.seq, operation.seq);
+    assert!(super::reconcile_signal_consumption_intent(&state, &run_id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_blob(PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_blob("signals/consumption-intent.json")
+        .unwrap()
+        .is_none());
+    let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)
+        .unwrap()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or_default();
+    assert!(inbox.is_empty(), "exact delivery remains queued: {inbox:?}");
+    let journal = store.load_call_log().unwrap().unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].seq, operation.seq);
+    assert_eq!(journal[0].result["payload"], queued.payload);
+    let promises = crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap();
+    assert!(matches!(
+        &promises[0].state,
+        HostPromiseState::Resolved { value, .. } if value == &journal[0].result
+    ));
+}
+
+/// The same durable intent protocol runs over the configured FS-primary,
+/// SQLite-secondary mirror when selected in a child process.
+#[test]
+fn signal_consumption_intent_reconciles_with_sqlite_mirror() {
+    const TEST: &str = "server::tests::signal_consumption_intent_reconciles_idempotently";
+    let temp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env("CHIDORI_RUN_STORE", "sqlite")
+        .env("CHIDORI_RUN_DB", temp.path().join("runs.sqlite3"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "SQLite mirror intent reconciliation failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn live_signal_route_does_not_accept_when_inbox_persistence_fails() {
     const CHILD: &str = "CHIDORI_TEST_LIVE_SERVER_FAILURE_CHILD";

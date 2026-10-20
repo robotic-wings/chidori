@@ -49,7 +49,7 @@ fn lease_conflict_response(holder: &crate::runtime::store::RunLease) -> Response
         .into_response()
 }
 
-pub(super) fn signal_resolution_record(
+pub(in crate::server) fn signal_resolution_record(
     pending: &PendingHostOperation,
     seq: u64,
     value: Value,
@@ -83,11 +83,20 @@ pub(super) fn signal_resolution_record(
 /// Threading the signal inbox here is what lets a resumed run that reaches a
 /// *second* `signal(name)`/`pollSignal(name)` listen point drain a queued entry
 /// instead of pausing (doc §9, §3 of the stage spec).
-pub(super) async fn complete_pending_and_resume(
+pub(in crate::server) async fn complete_pending_and_resume(
     state: &AppState,
     original: StoredSession,
     call_log: Vec<CallRecord>,
 ) -> Response {
+    if let Some(run_id) = original.run_id.as_deref() {
+        if let Err(error) = super::super::reconcile_signal_consumption_intent(state, run_id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("recovering signal consumption: {error:#}")})),
+            )
+                .into_response();
+        }
+    }
     let call_log =
         match load_persisted_replay_journal(&state.run_base, original.run_id.as_deref(), &call_log)
         {

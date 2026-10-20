@@ -26,7 +26,8 @@ use crate::runtime::context::RuntimeContext;
 use crate::runtime::engine::RunResult;
 use crate::runtime::snapshot::{
     HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
-    PendingHostOperationKind, SnapshotStore, PENDING_HOST_OPERATION_FILE,
+    PendingHostOperationKind, QueuedSignal, SnapshotStore, PENDING_HOST_OPERATION_FILE,
+    SIGNAL_INBOX_FILE,
 };
 use crate::runtime::template::TemplateEngine;
 use crate::scheduler::{self, SchedulerDeps};
@@ -532,6 +533,199 @@ enum HostPromiseCompletion {
     Rejected(String),
 }
 
+const SIGNAL_CONSUMPTION_INTENT_FILE: &str = "signals/consumption-intent.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SignalConsumptionIntent {
+    version: u8,
+    delivery_seq: u64,
+    operation: PendingHostOperation,
+    record: crate::runtime::call_log::CallRecord,
+}
+
+fn same_pending_signal(left: &PendingHostOperation, right: &PendingHostOperation) -> bool {
+    left.id == right.id
+        && left.seq == right.seq
+        && left.kind == right.kind
+        && left.function == right.function
+        && left.args == right.args
+}
+
+/// Persist the exact inbox delivery and pending host operation before either
+/// the promise or pending-operation artifact can be changed.
+fn persist_signal_consumption_intent(
+    run_base: &FsPath,
+    run_id: &str,
+    seq: u64,
+    delivery: &QueuedSignal,
+) -> anyhow::Result<SignalConsumptionIntent> {
+    let factory = crate::runtime::store::RunStoreFactory::shared(run_base);
+    factory.hydrate(run_id)?;
+    let store = factory.store_for(run_id);
+    let pending_bytes = store
+        .get_blob(PENDING_HOST_OPERATION_FILE)?
+        .ok_or_else(|| anyhow::anyhow!("signal pending operation is missing"))?;
+    let operation: PendingHostOperation = serde_json::from_slice(&pending_bytes)?;
+    if operation.seq != seq || operation.kind != PendingHostOperationKind::Signal {
+        anyhow::bail!("signal pending operation identity does not match seq {seq}");
+    }
+    let inbox: Vec<QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()?
+        .unwrap_or_default();
+    let persisted_delivery = inbox
+        .iter()
+        .find(|item| item.delivery_seq == delivery.delivery_seq)
+        .ok_or_else(|| {
+            anyhow::anyhow!("signal delivery {} is not durable", delivery.delivery_seq)
+        })?;
+    if persisted_delivery != delivery {
+        anyhow::bail!("signal delivery identity changed before consumption");
+    }
+    let value = serde_json::json!({
+        "name": delivery.name,
+        "payload": delivery.payload,
+        "from": delivery.from,
+    });
+    let record = crate::server::sessions::resume::signal_resolution_record(&operation, seq, value);
+    let intent = SignalConsumptionIntent {
+        version: 1,
+        delivery_seq: delivery.delivery_seq,
+        operation,
+        record,
+    };
+    if let Some(bytes) = store.get_blob(SIGNAL_CONSUMPTION_INTENT_FILE)? {
+        let existing: SignalConsumptionIntent = serde_json::from_slice(&bytes)?;
+        if existing.version != intent.version
+            || existing.delivery_seq != intent.delivery_seq
+            || !same_pending_signal(&existing.operation, &intent.operation)
+            || existing.record.args != intent.record.args
+            || existing.record.result != intent.record.result
+        {
+            anyhow::bail!("a conflicting signal consumption intent is already present");
+        }
+        return Ok(existing);
+    }
+    store.put_blob(
+        SIGNAL_CONSUMPTION_INTENT_FILE,
+        &serde_json::to_vec_pretty(&intent)?,
+    )?;
+    store.flush()?;
+    Ok(intent)
+}
+
+/// Complete an interrupted live signal consumption before replay loads its
+/// journal, promise table, or inbox. Each step is idempotent under the durable
+/// intent, so a restart can continue after any individual write.
+fn reconcile_signal_consumption_intent(
+    state: &AppState,
+    run_id: &str,
+) -> anyhow::Result<Option<crate::runtime::call_log::CallRecord>> {
+    let lock = state.signal_inbox_lock(run_id);
+    let _guard = lock.lock().unwrap();
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    factory.hydrate(run_id)?;
+    let store = factory.store_for(run_id);
+    let Some(bytes) = store.get_blob(SIGNAL_CONSUMPTION_INTENT_FILE)? else {
+        return Ok(None);
+    };
+    let intent: SignalConsumptionIntent = serde_json::from_slice(&bytes)?;
+    if intent.version != 1
+        || intent.operation.kind != PendingHostOperationKind::Signal
+        || intent.record.seq != intent.operation.seq
+        || intent.record.function != intent.operation.function.as_deref().unwrap_or("signal")
+        || intent.record.args != intent.operation.args
+    {
+        anyhow::bail!("invalid signal consumption intent identity");
+    }
+    let records = crate::runtime::snapshot::load_host_promise_records(store.as_ref())?;
+    let promise = records
+        .iter()
+        .find(|record| record.operation.id == intent.operation.id)
+        .ok_or_else(|| anyhow::anyhow!("signal consumption promise is missing"))?;
+    if !same_pending_signal(&promise.operation, &intent.operation) {
+        anyhow::bail!("signal consumption promise identity conflicts with intent");
+    }
+    match &promise.state {
+        HostPromiseState::Pending => {
+            let pending = store
+                .get_blob(PENDING_HOST_OPERATION_FILE)?
+                .ok_or_else(|| anyhow::anyhow!("pending signal is missing during recovery"))?;
+            let pending: PendingHostOperation = serde_json::from_slice(&pending)?;
+            if !same_pending_signal(&pending, &intent.operation) {
+                anyhow::bail!("pending signal identity conflicts with consumption intent");
+            }
+            complete_persisted_pending_host_operation(
+                &state.run_base,
+                Some(run_id),
+                Some((intent.operation.seq, PendingHostOperationKind::Signal)),
+                HostPromiseCompletion::Resolved(intent.record.result.clone()),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("pending signal disappeared during recovery"))?;
+        }
+        HostPromiseState::Resolved { value, .. } if *value == intent.record.result => {
+            if let Some(pending) = store.get_blob(PENDING_HOST_OPERATION_FILE)? {
+                let pending: PendingHostOperation = serde_json::from_slice(&pending)?;
+                if !same_pending_signal(&pending, &intent.operation) {
+                    anyhow::bail!("pending signal identity conflicts with completed intent");
+                }
+                store.delete_blob(PENDING_HOST_OPERATION_FILE)?;
+            }
+        }
+        HostPromiseState::ResolvedInJournal { .. } => {
+            // The loader only yields this state when the matching journal row
+            // exists; the exact row is verified below before intent removal.
+        }
+        other => anyhow::bail!("signal consumption promise conflicts with intent: {other:?}"),
+    }
+
+    let inbox: Vec<QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)?
+        .map(|bytes| serde_json::from_slice(&bytes))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(delivery) = inbox
+        .iter()
+        .find(|item| item.delivery_seq == intent.delivery_seq)
+    {
+        if intent.record.result["name"] != delivery.name
+            || intent.record.result["payload"] != delivery.payload
+            || intent.record.result["from"] != delivery.from
+        {
+            anyhow::bail!("queued delivery conflicts with signal consumption intent");
+        }
+        store.update_blob(SIGNAL_INBOX_FILE, &mut |current| {
+            let mut current: Vec<QueuedSignal> = current
+                .as_deref()
+                .map(serde_json::from_slice)
+                .transpose()?
+                .unwrap_or_default();
+            current.retain(|item| item.delivery_seq != intent.delivery_seq);
+            Ok(serde_json::to_vec_pretty(&current)?)
+        })?;
+    }
+
+    let journal = store.load_call_log()?.unwrap_or_default();
+    match journal
+        .iter()
+        .find(|record| record.seq == intent.record.seq)
+    {
+        Some(record)
+            if record.function == intent.record.function
+                && record.args == intent.record.args
+                && record.result == intent.record.result
+                && record.error == intent.record.error => {}
+        Some(_) => anyhow::bail!(
+            "journal seq {} conflicts with signal intent",
+            intent.record.seq
+        ),
+        None => store.append_record(&intent.record)?,
+    }
+    store.delete_blob(SIGNAL_CONSUMPTION_INTENT_FILE)?;
+    Ok(Some(intent.record))
+}
+
 fn complete_persisted_pending_host_operation(
     run_base: &FsPath,
     run_id: Option<&str>,
@@ -991,13 +1185,47 @@ pub async fn serve(
         )),
     };
 
-    // Re-arm signal-pause timeout timers (`timeoutMs`, `docs/signals.md`
-    // Phase 2) for sessions persisted with a deadline by a previous server
-    // process. Deadlines already in the past fire (resolve to the timeout
-    // sentinel) immediately.
-    if let Ok(sessions) = state.session_store.list() {
-        for session in &sessions {
-            arm_signal_timeout(&state, session);
+    // Recover durable signal-consumption intents before re-arming paused
+    // sessions. A cut intent has already resolved the matching host promise;
+    // resuming it first prevents the retained inbox entry reaching a later
+    // same-name listen. The lease spans reconciliation and replay continuation.
+    let startup_sessions = state
+        .session_store
+        .list()
+        .context("listing sessions for signal recovery")?;
+    for session in startup_sessions {
+        let recovered = if session.status == SessionStatus::Paused {
+            if let Some(run_id) = session.run_id.as_deref() {
+                match acquire_run_lease(&state, Some(run_id)) {
+                    Ok(Some(_lease)) => match reconcile_signal_consumption_intent(&state, run_id) {
+                        Ok(Some(record)) => {
+                            let mut call_log = session.call_log.clone();
+                            call_log.push(record);
+                            let _ = sessions::resume::complete_pending_and_resume(
+                                &state,
+                                session.clone(),
+                                call_log,
+                            )
+                            .await;
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            return Err(error).context(format!(
+                                "recovering signal consumption for run {run_id}"
+                            ));
+                        }
+                    },
+                    Ok(None) | Err(_) => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !recovered {
+            arm_signal_timeout(&state, &session);
         }
     }
 
