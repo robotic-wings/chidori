@@ -3742,9 +3742,10 @@ async fn stream_session_resolves_signal_pause_in_process() {
 /// inbox retirement must recover the first consumption exactly once. The
 /// child uses the live signal route for the acknowledgment, pauses the real
 /// supervisor immediately before inbox removal, completes the persisted
-/// operation, and exits without running destructors. A fresh server state
-/// then re-arms persisted signal recovery and re-drives the run; the old
-/// delivery must not satisfy the agent's second same-name listen.
+/// operation, and exits without running destructors. A fresh `AppState` opens
+/// the SQLite session store and filesystem run store, then exercises the
+/// replay-preserving server continuation. This does not test automatic server
+/// startup re-arm because it does not bind a `serve` listener.
 #[tokio::test]
 async fn signal_consumption_completion_before_inbox_removal_recovers_atomically() {
     const CHILD_ROOT: &str = "CHIDORI_TEST_SIGNAL_CONSUMPTION_CRASH_ROOT";
@@ -3850,14 +3851,6 @@ async fn signal_consumption_completion_before_inbox_removal_recovers_atomically(
     let run_id = original.run_id.clone().expect("session run id");
     let seq = original.pending_seq.expect("pending signal seq");
 
-    // This is the server boot recovery registration used for persisted
-    // signal deadlines. The future deadline keeps the fixture deterministic;
-    // the actual crash-state continuation is then driven through the same
-    // replay-preserving server helper used by signal resume.
-    for session in restarted.session_store.list().unwrap() {
-        arm_signal_timeout(&restarted, &session);
-    }
-
     let factory = crate::runtime::store::RunStoreFactory::shared(&restarted.run_base);
     factory.hydrate(&run_id).unwrap();
     let store = factory.store_for(&run_id);
@@ -3912,9 +3905,9 @@ async fn signal_consumption_completion_before_inbox_removal_recovers_atomically(
     assert_eq!(original.status, SessionStatus::Paused);
 
     // Recovery reconstructs the first signal record from the durable
-    // completion, then invokes the real server replay tail with the persisted
-    // inbox. The old delivery must be retired as part of recovering seq and
-    // must not become the result of the second same-name listen.
+    // completion, then invokes the existing replay-preserving server
+    // continuation with the persisted inbox. This exercises the replay tail;
+    // it does not claim automatic startup re-arm coverage.
     let (status, recovered_view) = response_json(
         super::sessions::resume::test_resume_from_resolved_signal(
             &restarted,
@@ -3931,11 +3924,7 @@ async fn signal_consumption_completion_before_inbox_removal_recovers_atomically(
         "recovery response: {recovered_view}"
     );
 
-    let recovered = restarted
-        .session_store
-        .get(SESSION_ID)
-        .unwrap()
-        .expect("recovered session persisted");
+    let recovered = wait_for_status(&restarted, SESSION_ID, SessionStatus::Completed).await;
     let journal = store.load_call_log().unwrap().unwrap_or_default();
     let inbox_after_recovery: Vec<crate::runtime::snapshot::QueuedSignal> = store
         .get_blob(SIGNAL_INBOX_FILE)
