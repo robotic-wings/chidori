@@ -1710,6 +1710,41 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// Retire rejected host-promise records whose failed calls are being
+    /// retried, then durably compact the remaining composed records.
+    ///
+    /// Resolved promises are retained even when their journal rows are in the
+    /// stripped retry frontier: they may represent a completed side effect
+    /// whose journal append was interrupted. `compact_host_promises` writes
+    /// the filtered table before deleting per-operation blobs, so an
+    /// interrupted compaction remains loadable against the original journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the compacted table or deleting covered
+    /// per-operation blobs fails. Callers must stop before dispatching any
+    /// provider or host effect when this operation fails.
+    pub fn retire_rejected_host_promises_for_retry(
+        &self,
+        records: &[HostPromiseRecord],
+        retry_seqs: &[u64],
+        effective_journal: &[CallRecord],
+    ) -> Result<Vec<HostPromiseRecord>> {
+        let remaining: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                !(retry_seqs.contains(&record.operation.seq)
+                    && matches!(record.state, HostPromiseState::Rejected { .. }))
+            })
+            .cloned()
+            .collect();
+        if remaining.len() != records.len() {
+            self.compact_host_promises(&remaining, effective_journal)
+                .context("retiring rejected host promises at the retry frontier")?;
+        }
+        Ok(remaining)
+    }
+
     /// Write (or, when `None`, remove) the pending-host-operation artifact.
     pub fn put_pending(&self, pending: Option<&PendingHostOperation>) -> Result<()> {
         match pending {
@@ -2489,6 +2524,98 @@ mod host_promise_union_tests {
             err.to_string().contains("no clean record at that seq"),
             "got: {err:#}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_frontier_retires_only_rejected_promises_and_preserves_resolved_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "chidori-host-promise-retry-frontier-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(FsRunStore::new(&dir));
+
+        let mut failed = journal_record(2, serde_json::Value::Null);
+        failed.error = Some("provider failed".to_string());
+        let mut later_failed = journal_record(3, serde_json::Value::Null);
+        later_failed.error = Some("later provider failed".to_string());
+        let original_journal = vec![
+            journal_record(1, serde_json::json!("prefix result")),
+            failed,
+            later_failed,
+        ];
+        store.write_call_log(&original_journal).unwrap();
+
+        let completed_at = chrono::Utc::now();
+        let promises = vec![
+            record(
+                1,
+                HostPromiseState::Resolved {
+                    value: serde_json::json!("prefix result"),
+                    completed_at,
+                },
+            ),
+            record(
+                2,
+                HostPromiseState::Rejected {
+                    error: "provider failed".to_string(),
+                    completed_at,
+                },
+            ),
+            record(
+                3,
+                HostPromiseState::Rejected {
+                    error: "later provider failed".to_string(),
+                    completed_at,
+                },
+            ),
+        ];
+        store
+            .put_blob(
+                HOST_PROMISE_TABLE_FILE,
+                &serde_json::to_vec_pretty(&promises).unwrap(),
+            )
+            .unwrap();
+        // A newer per-op rejection must also be retired from the union.
+        store
+            .put_blob(
+                &host_promise_blob_key(HostOperationId(2)),
+                &serde_json::to_vec_pretty(&promises[1]).unwrap(),
+            )
+            .unwrap();
+
+        let prefix = vec![original_journal[0].clone()];
+        let remaining = SnapshotStore::with_store(&dir, store.clone())
+            .retire_rejected_host_promises_for_retry(&promises, &[2], &prefix)
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].operation.id, HostOperationId(1));
+        assert_eq!(remaining[1].operation.id, HostOperationId(3));
+
+        let raw: Vec<HostPromiseRecord> =
+            serde_json::from_slice(&store.get_blob(HOST_PROMISE_TABLE_FILE).unwrap().unwrap())
+                .unwrap();
+        assert!(matches!(
+            raw[0].state,
+            HostPromiseState::ResolvedInJournal { .. }
+        ));
+        assert!(matches!(raw[1].state, HostPromiseState::Rejected { .. }));
+        assert!(!store
+            .list_blobs()
+            .unwrap()
+            .iter()
+            .any(|key| key == &host_promise_blob_key(HostOperationId(2))));
+
+        // The original journal is still present at this crash cut; the
+        // retained later rejection remains valid, while the retired seq 2
+        // promise is absent and the resolved prefix is transparently restored.
+        let loaded = load_host_promise_records(&*store).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(loaded[0].state, HostPromiseState::Resolved { .. }));
+        assert_eq!(loaded[1].operation.id, HostOperationId(3));
+        assert!(matches!(loaded[1].state, HostPromiseState::Rejected { .. }));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

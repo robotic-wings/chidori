@@ -2804,7 +2804,7 @@ fn cmd_resume(
         "corrupt top-level run journal {} line 1: expected its first record at seq 1 before replay",
         records_path.display()
     );
-    let host_promises = crate::runtime::snapshot::load_host_promise_records(&*store)?;
+    let mut host_promises = crate::runtime::snapshot::load_host_promise_records(&*store)?;
 
     // `--retry-failed`: first-class repair for a failed run. The trailing
     // failed record(s) — the crash frontier — are stripped with the exact
@@ -2853,6 +2853,9 @@ fn cmd_resume(
             .into_iter()
             .filter(|seq| !kept.contains(seq))
             .collect();
+        host_promises =
+            crate::runtime::snapshot::SnapshotStore::with_store(run_dir.clone(), store.clone())
+                .retire_rejected_host_promises_for_retry(&host_promises, &removed, &records)?;
         let low = removed.iter().min().copied().unwrap_or_default();
         let high = removed.iter().max().copied().unwrap_or_default();
         eprintln!(

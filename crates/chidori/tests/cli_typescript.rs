@@ -2462,7 +2462,7 @@ fn cli_resume_retry_failed_repairs_failed_run_and_verify_passes() {
         "expected the stripped-count line on stderr, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("replaying 1 records then executing live"),
+        stderr.contains("replaying 2 records then executing live"),
         "expected the replay/live split in the stripped line, got:\n{stderr}"
     );
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
