@@ -38,10 +38,13 @@ use crate::tools::ToolRegistry;
 struct CliRunLeaseGuard {
     store: Arc<dyn crate::runtime::store::RunStore>,
     grant: crate::runtime::store::FencedLease,
+    chat_heartbeat: Option<ChatLeaseHeartbeat>,
 }
 
 impl Drop for CliRunLeaseGuard {
     fn drop(&mut self) {
+        // Stop and join the renewal worker before releasing its exact tenure.
+        drop(self.chat_heartbeat.take());
         if let Err(err) = crate::runtime::store::release_lease_with_token(
             self.store.as_ref(),
             self.grant.lease(),
@@ -53,6 +56,27 @@ impl Drop for CliRunLeaseGuard {
 }
 
 impl CliRunLeaseGuard {
+    fn start_chat_heartbeat(&mut self, ttl: chrono::Duration) -> Result<()> {
+        if crate::runtime::store::RunStore::supports_lease_fencing(self.store.as_ref()) {
+            self.chat_heartbeat = Some(ChatLeaseHeartbeat::start(
+                self.store.clone(),
+                self.grant.clone(),
+                ttl,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn check_chat_tenure(&self) -> Result<()> {
+        let Some(heartbeat) = &self.chat_heartbeat else {
+            return Ok(());
+        };
+        heartbeat.check_health()?;
+        self.store
+            .check_lease_with_token(self.grant.lease(), self.grant.token())
+            .context("resumed chat no longer owns its SQLite run lease")
+    }
+
     fn bind_store(
         &self,
         store: Arc<dyn crate::runtime::store::RunStore>,
@@ -70,18 +94,130 @@ impl CliRunLeaseGuard {
     }
 }
 
+/// Renews a resumed chat's fenced lease while its command thread may be
+/// blocked on stdin or an agent/provider call.
+struct ChatLeaseHeartbeat {
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChatLeaseHeartbeat {
+    fn start(
+        store: Arc<dyn crate::runtime::store::RunStore>,
+        grant: crate::runtime::store::FencedLease,
+        ttl: chrono::Duration,
+    ) -> Result<Self> {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let worker_failure = failure.clone();
+        let interval =
+            std::time::Duration::from_millis((ttl.num_milliseconds() / 3).max(10) as u64);
+        let thread = std::thread::Builder::new()
+            .name("chidori-chat-lease-heartbeat".into())
+            .spawn(move || {
+                let mut lease = grant.lease().clone();
+                let mut wait = interval;
+                loop {
+                    match stopped.recv_timeout(wait) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    match store.renew_lease_with_token(&lease, grant.token(), ttl) {
+                        Ok(Some(renewed)) => {
+                            lease = renewed;
+                            wait = interval;
+                        }
+                        Ok(None) => {
+                            *worker_failure.lock().unwrap() = Some(format!(
+                                "resumed chat lost SQLite lease tenure (owner `{}`)",
+                                grant.lease().owner
+                            ));
+                            break;
+                        }
+                        Err(err) => {
+                            let remaining_ms = lease
+                                .expires_at
+                                .signed_duration_since(chrono::Utc::now())
+                                .num_milliseconds();
+                            if remaining_ms <= 0 {
+                                *worker_failure.lock().unwrap() = Some(format!(
+                                    "could not renew resumed chat SQLite lease before expiry: {err:#}"
+                                ));
+                                break;
+                            }
+                            // Retry transient store errors before the current
+                            // tenure expires; never extend the lease locally.
+                            wait = std::time::Duration::from_millis(
+                                ((ttl.num_milliseconds() / 10).max(10) as u64)
+                                    .min(remaining_ms as u64),
+                            );
+                        }
+                    }
+                }
+            })
+            .context("failed to start resumed-chat SQLite lease heartbeat")?;
+        Ok(Self {
+            failure,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+
+    fn check_health(&self) -> Result<()> {
+        if let Some(failure) = self.failure.lock().unwrap().clone() {
+            anyhow::bail!("{failure}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChatLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                eprintln!("warning: resumed-chat SQLite lease heartbeat panicked");
+            }
+        }
+    }
+}
+
+fn resumed_chat_lease_ttl() -> chrono::Duration {
+    // A debug-build-only seam keeps the CLI integration regression short
+    // without adding a production lease-duration setting.
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("CHIDORI_TEST_CHAT_LEASE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+    {
+        return chrono::Duration::milliseconds(milliseconds);
+    }
+    chrono::Duration::minutes(10)
+}
+
 fn acquire_cli_run_lease(
     store: Arc<dyn crate::runtime::store::RunStore>,
     owner: &str,
     run_id: &str,
 ) -> Result<Option<CliRunLeaseGuard>> {
+    acquire_cli_run_lease_with_ttl(store, owner, run_id, chrono::Duration::minutes(10))
+}
+
+fn acquire_cli_run_lease_with_ttl(
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    owner: &str,
+    run_id: &str,
+    ttl: chrono::Duration,
+) -> Result<Option<CliRunLeaseGuard>> {
     let fencing = crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref());
-    match crate::runtime::store::acquire_lease_with_token(
-        store.as_ref(),
-        owner,
-        chrono::Duration::minutes(10),
-    ) {
-        Ok(Ok(grant)) => Ok(Some(CliRunLeaseGuard { store, grant })),
+    match crate::runtime::store::acquire_lease_with_token(store.as_ref(), owner, ttl) {
+        Ok(Ok(grant)) => Ok(Some(CliRunLeaseGuard {
+            store,
+            grant,
+            chat_heartbeat: None,
+        })),
         Ok(Err(holder)) => anyhow::bail!(
             "run {run_id} is already being driven by another process (lease holder \
              `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
@@ -2453,6 +2589,25 @@ fn cmd_chat(
     let lease_owner = format!("chidori-chat-{}", std::process::id());
     let mut messages: Vec<String> = Vec::new();
     let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
+    let (chat_lease_guard, resumed_run_store) = if let Some(session_id) = resume.as_deref() {
+        // Refuse a competing resume before hydration or any transcript and
+        // journal reads. Keep this exact tenure alive through replay and every
+        // interactive turn below.
+        let store = factory.store_for(session_id);
+        let ttl = resumed_chat_lease_ttl();
+        let mut guard =
+            acquire_cli_run_lease_with_ttl(store.clone(), &lease_owner, session_id, ttl)?;
+        if let Some(guard) = guard.as_mut() {
+            guard.start_chat_heartbeat(ttl)?;
+        }
+        let store = match &guard {
+            Some(guard) => guard.bind_store(store)?,
+            None => store,
+        };
+        (guard, Some(store))
+    } else {
+        (None, None)
+    };
     let session_id = match &resume {
         Some(session_id) => {
             let run_dir = run_base.join(session_id);
@@ -2460,35 +2615,13 @@ fn cmd_chat(
             // configured, and unions the last checkpoint with any
             // crash-stranded `records.jsonl` tail — same path as `resume`.
             factory.hydrate(session_id)?;
-            call_log = factory
-                .store_for(session_id)
+            call_log = resumed_run_store
+                .as_ref()
+                .expect("resumed chat has a run store")
                 .load_call_log()?
                 .ok_or_else(|| {
                     anyhow::anyhow!("no chat session found under {}", run_dir.display())
                 })?;
-            // One driver per session journal, same guard (and same
-            // unrenewed-lease limitation) as `chidori resume`.
-            match crate::runtime::store::acquire_lease(
-                factory.store_for(session_id).as_ref(),
-                &lease_owner,
-                chrono::Duration::minutes(10),
-            ) {
-                Ok(Ok(_)) => {}
-                // As in `resume`: a dead holder's lease lapses on its own, and
-                // with a mirror configured it isn't a local file to delete.
-                Ok(Err(holder)) => anyhow::bail!(
-                    "chat session {session_id} is already being driven by another process \
-                     (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
-                     the journal — close the other chat, or retry after {} if the holder \
-                     is dead.",
-                    holder.owner,
-                    holder.expires_at,
-                    holder.expires_at
-                ),
-                Err(err) => {
-                    eprintln!("warning: could not take the session lease: {err}");
-                }
-            }
             // Each turn rewrites the run's `input.json` with the full driven
             // input, so it is the durable record of the dialogue state:
             // restore the message list, and (unless overridden by flags) the
@@ -2546,11 +2679,14 @@ fn cmd_chat(
     let tools = Arc::new(ToolRegistry::new());
     let tool_names: Vec<String> = tools.list().iter().map(|t| t.name.clone()).collect();
 
-    let engine = Engine::new(providers, template_engine, tokio_rt)
+    let mut engine = Engine::new(providers, template_engine, tokio_rt)
         .with_tools(tools)
         .with_policy(cli_policy(untrusted, trusted))
         .with_persist_base(run_base.clone())
         .with_workspace_root(abs_dir(&base_dir));
+    if let Some(store) = resumed_run_store {
+        engine = engine.with_run_store_for_run(session_id.clone(), store);
+    }
 
     eprintln!("chidori chat — type a message and press enter. Type 'exit' or Ctrl-D to quit.");
     eprintln!(
@@ -2586,6 +2722,9 @@ fn cmd_chat(
     // was interrupted mid-generation completes live, and the transcript prints
     // once, in order, so the human sees the conversation they are rejoining.
     if resume.is_some() && !messages.is_empty() {
+        if let Some(guard) = &chat_lease_guard {
+            guard.check_chat_tenure()?;
+        }
         let input_value = build_input(&messages);
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
         // Discard deltas: the transcript dump below shows the whole dialogue,
@@ -2602,6 +2741,9 @@ fn cmd_chat(
             event_tx,
         );
         drain.join().ok();
+        if let Some(guard) = &chat_lease_guard {
+            guard.check_chat_tenure()?;
+        }
         match result {
             Ok(result) => {
                 if let Some(turns) = result
@@ -2636,6 +2778,9 @@ fn cmd_chat(
         if stdin.read_line(&mut line)? == 0 {
             eprintln!("\nbye");
             break;
+        }
+        if let Some(guard) = &chat_lease_guard {
+            guard.check_chat_tenure()?;
         }
         let message = line.trim_end_matches(&['\r', '\n'][..]).trim().to_string();
         if message.is_empty() {
@@ -2684,6 +2829,12 @@ fn cmd_chat(
         // returns, ending the drain loop; join flushes every queued delta
         // before we print anything else.
         let streamed = drain.join().unwrap_or(false);
+        // A request already dispatched while this tenure was live cannot be
+        // recalled; fenced completion rejects a stale result, and this check
+        // stops the chat before it can accept or dispatch another turn.
+        if let Some(guard) = &chat_lease_guard {
+            guard.check_chat_tenure()?;
+        }
 
         match result {
             Ok(result) => {
@@ -2719,12 +2870,6 @@ fn cmd_chat(
         }
     }
 
-    if resume.is_some() {
-        let _ = crate::runtime::store::release_lease(
-            factory.store_for(&session_id).as_ref(),
-            &lease_owner,
-        );
-    }
     if !call_log.is_empty() {
         print_chat_session_summary(&run_base, &session_id, messages.len());
         let agent_arg = agent
