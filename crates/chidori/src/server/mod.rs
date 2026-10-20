@@ -851,6 +851,61 @@ fn complete_persisted_host_promise_record(
     Ok(())
 }
 
+/// Retry startup intent recovery after another process releases its run
+/// lease. A held lease defers both reconciliation and timeout mutation; once
+/// acquired, keep the token-backed guard through replay or timeout re-arming.
+fn retry_startup_signal_recovery(state: AppState, session: StoredSession, run_id: String) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            match acquire_signal_resume_lease(&state, Some(&run_id)) {
+                Ok(Some(_lease)) => {
+                    match reconcile_signal_consumption_intent(&state, &run_id) {
+                        Ok(Some(record)) => {
+                            let mut call_log = session.call_log.clone();
+                            call_log.push(record);
+                            let response = sessions::resume::complete_pending_and_resume(
+                                &state,
+                                session.clone(),
+                                call_log,
+                            )
+                            .await;
+                            if !response.status().is_success() {
+                                tracing::error!(
+                                    session_id = %session.id,
+                                    run_id,
+                                    status = %response.status(),
+                                    "startup signal intent replay failed; leaving timeout unarmed"
+                                );
+                            }
+                        }
+                        Ok(None) => arm_signal_timeout(&state, &session),
+                        Err(error) => tracing::error!(
+                            run_id,
+                            %error,
+                            "startup signal intent reconciliation failed after lease acquisition"
+                        ),
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    arm_signal_timeout(&state, &session);
+                    return;
+                }
+                Err(RunLeaseAcquisitionError::Held(_)) => continue,
+                Err(RunLeaseAcquisitionError::Failed(error)) => {
+                    tracing::error!(
+                        run_id,
+                        %error,
+                        "startup signal recovery could not acquire run lease; leaving session untouched"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn load_persisted_host_promises(
     run_base: &FsPath,
     run_id: Option<&str>,
@@ -1231,7 +1286,19 @@ pub async fn serve(
                             ));
                         }
                     },
-                    Ok(None) | Err(RunLeaseAcquisitionError::Held(_)) => false,
+                    Ok(None) => false,
+                    Err(RunLeaseAcquisitionError::Held(_)) => {
+                        // Do not arm the persisted timeout while an accepted
+                        // signal intent is waiting for the current lease
+                        // holder. Its timeout write could replace the
+                        // pending promise value before intent reconciliation.
+                        retry_startup_signal_recovery(
+                            state.clone(),
+                            session.clone(),
+                            run_id.to_string(),
+                        );
+                        true
+                    }
                     Err(RunLeaseAcquisitionError::Failed(error)) => {
                         return Err(error).context(format!(
                             "acquiring run lease for signal recovery on run {run_id}"

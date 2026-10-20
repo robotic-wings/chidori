@@ -4197,9 +4197,11 @@ fn signal_consumption_intent_reconciles_with_sqlite_mirror() {
 #[tokio::test]
 async fn sqlite_server_startup_recovers_signal_consumption_intent() {
     const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const CHILD_HOLD_LEASE: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_HOLD_LEASE";
     const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let root = PathBuf::from(root);
+        let hold_external_lease = std::env::var_os(CHILD_HOLD_LEASE).is_some();
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("CHIDORI_RUN_STORE", "sqlite");
         std::env::set_var("CHIDORI_RUN_DB", root.join("runs.sqlite3"));
@@ -4263,6 +4265,23 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
         super::persist_signal_consumption_intent(&run_base, run_id, operation.seq, &queued)
             .unwrap();
 
+        // Give the persisted deadline an expired value in the held-lease
+        // variant. Arming it before recovery would overwrite the accepted
+        // signal's Pending promise with the timeout sentinel.
+        let external_lease = if hold_external_lease {
+            Some(
+                crate::runtime::store::acquire_lease_with_token(
+                    store.as_ref(),
+                    "startup-signal-recovery-test-holder",
+                    chrono::Duration::seconds(30),
+                )
+                .unwrap()
+                .expect("test holder acquired the SQLite lease"),
+            )
+        } else {
+            None
+        };
+
         let session_store = crate::storage::build_session_store(&root).unwrap();
         session_store
             .put(&StoredSession {
@@ -4278,7 +4297,11 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
                 pending_details: None,
                 pending_signal_name: Some("review".to_string()),
                 pending_signal_names: vec!["review".to_string()],
-                pending_signal_deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+                pending_signal_deadline: Some(if hold_external_lease {
+                    chrono::Utc::now() - chrono::Duration::milliseconds(100)
+                } else {
+                    chrono::Utc::now() + chrono::Duration::seconds(60)
+                }),
                 pending_approval: None,
                 approvals: Vec::new(),
                 policy_profile: None,
@@ -4296,6 +4319,55 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
             "test".to_string(),
             None,
         ));
+        if let Some(grant) = external_lease {
+            // `serve` returns from startup only after installing its retry
+            // task and binding the listener. Keep the real holder in place
+            // past the deadline, then verify all durable pieces remain intact.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert!(
+                !server.is_finished(),
+                "serve exited while the external lease was held"
+            );
+            let still_paused = session_store
+                .get("sqlite-startup-signal-session")
+                .unwrap()
+                .expect("held startup session remains stored");
+            assert_eq!(still_paused.status, SessionStatus::Paused);
+            let promises =
+                crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap();
+            assert!(
+                matches!(
+                    promises
+                        .iter()
+                        .find(|promise| promise.operation.id == operation.id)
+                        .map(|promise| &promise.state),
+                    Some(HostPromiseState::Pending)
+                ),
+                "held startup timeout replaced the accepted signal promise: {promises:?}"
+            );
+            assert!(store
+                .load_call_log()
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty());
+            assert!(store
+                .get_blob("signals/consumption-intent.json")
+                .unwrap()
+                .is_some());
+            let held_inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            assert_eq!(held_inbox, vec![queued.clone()]);
+            crate::runtime::store::release_lease_with_token(
+                store.as_ref(),
+                grant.lease(),
+                grant.token(),
+            )
+            .unwrap();
+        }
+
         let recovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Some(session) = session_store.get("sqlite-startup-signal-session").unwrap() {
@@ -4354,6 +4426,26 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
     assert!(
         child.status.success(),
         "SQLite-configured serve startup recovery failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sqlite_server_startup_held_lease_defers_intent_timeout() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const CHILD_HOLD_LEASE: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_HOLD_LEASE";
+    const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ROOT, temp.path())
+        .env(CHILD_HOLD_LEASE, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "SQLite startup held-lease recovery failed:\n{}{}",
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr)
     );
