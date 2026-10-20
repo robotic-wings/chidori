@@ -500,9 +500,9 @@ fn acquire_signal_resume_lease(
     }
 }
 
-/// Token-aware ownership guard for HTTP requests that resume a run. Kept
-/// separate from `acquire_run_lease`, which also serves the live signal
-/// stream and retains its retry contract.
+/// Token-aware ownership guard for HTTP requests that resume a run. The
+/// in-process signal-resume path uses `acquire_signal_resume_lease`, whose
+/// held/failed distinction preserves queued signals for retry.
 struct RouteRunLeaseGuard {
     store: Arc<dyn crate::runtime::store::RunStore>,
     lease: crate::runtime::store::FencedLease,
