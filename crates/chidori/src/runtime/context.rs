@@ -1770,6 +1770,31 @@ impl RuntimeContext {
         self.inner.lock().unwrap().signal_inbox.clone()
     }
 
+    /// Clone one queued signal without consuming it. Live resume uses this to
+    /// identify a candidate before lease acquisition while keeping its durable
+    /// and in-memory copies available if another owner holds the run.
+    pub fn queued_signal_by_delivery_seq(&self, delivery_seq: u64) -> Option<QueuedSignal> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signal_inbox
+            .iter()
+            .find(|signal| signal.delivery_seq == delivery_seq)
+            .cloned()
+    }
+
+    /// Clone the earliest matching signal without consuming it.
+    pub fn peek_queued_signal_any(&self, names: &[String]) -> Option<QueuedSignal> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signal_inbox
+            .iter()
+            .filter(|signal| names.iter().any(|name| name == &signal.name))
+            .min_by_key(|signal| signal.delivery_seq)
+            .cloned()
+    }
+
     /// Drain the lowest-`delivery_seq` queued signal whose name matches `name`,
     /// removing it from the in-memory mailbox and — if persistence is enabled —
     /// atomically removing that exact `delivery_seq` from `SIGNAL_INBOX_FILE`

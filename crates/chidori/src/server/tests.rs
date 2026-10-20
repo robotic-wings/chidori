@@ -2663,6 +2663,10 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
     assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durably queued");
 
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
         .await
@@ -2675,6 +2679,10 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
     let journal_at_dispatch =
         serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
     let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    let inbox_at_dispatch = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("held signal remains durably queued");
     if let Some(lease) = external_lease.take() {
         crate::runtime::store::release_lease_with_token(
             store.as_ref(),
@@ -2772,17 +2780,14 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
             paused.pending_seq, snapshot.pending_seq
         ));
     }
-    if attempt_durable_matches != 0 {
+    if attempt_durable_matches != 1 {
         violations.push(format!(
-            "durable matching delivery count at lease attempt was {attempt_durable_matches}, expected the dequeued state 0"
+            "durable matching delivery count at lease attempt was {attempt_durable_matches}, expected 1 until lease acquisition"
         ));
     }
-    // The stream removes this exact delivery from the in-memory mailbox just
-    // before attempting the lease. A rejected attempt must put it back; that
-    // recoverability assertion is made against the post-dispatch snapshot.
-    if attempt_memory_matches != 0 {
+    if attempt_memory_matches != 1 {
         violations.push(format!(
-            "in-memory delivery count at lease attempt was {attempt_memory_matches}, expected the dequeued state 0"
+            "in-memory delivery count at lease attempt was {attempt_memory_matches}, expected 1 until lease acquisition"
         ));
     }
     if dispatch.handled {
@@ -2821,6 +2826,9 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
             "held signal changed the pending host operation before lease recovery".to_string(),
         );
     }
+    if inbox_at_dispatch != inbox_after_ack {
+        violations.push("held lease changed the acknowledged durable inbox bytes".to_string());
+    }
     if let Some(result) = &result {
         if result.session_status != SessionStatus::Paused || !result.supervision_active {
             violations.push(format!(
@@ -2843,8 +2851,8 @@ async fn stream_signal_held_lease_keeps_delivery_recoverable() {
 
 /// A real SQLite write failure during lease acquisition is distinct from an
 /// occupied lease. The trigger injects the store failure; the normal stream
-/// acquisition and lease-result path must keep the dequeued delivery and
-/// paused session recoverable instead of terminalizing or resuming it.
+/// path must leave the acknowledged delivery in both inboxes, byte-for-byte
+/// durable, and keep the paused session recoverable.
 #[tokio::test]
 async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     const CHILD: &str = "CHIDORI_TEST_SIGNAL_LEASE_FAILED_CHILD";
@@ -2949,6 +2957,10 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
     assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durably queued");
 
     let attempt = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)
         .await
@@ -2975,6 +2987,10 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
     let journal_at_dispatch =
         serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap();
     let pending_at_dispatch = store.get_blob(super::PENDING_HOST_OPERATION_FILE).unwrap();
+    let inbox_at_dispatch = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("signal remains durably queued after failed lease acquisition");
     let durable_at_dispatch = super::load_persisted_signal_inbox(&state.run_base, Some(&run_id));
 
     // Remove the failpoint before cancellation/cleanup. No synthetic result is
@@ -3081,10 +3097,15 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
             attempt.acquisition
         ));
     }
-    if attempt_durable_matches != 0 || attempt_memory_matches != 0 {
+    if attempt_durable_matches != 1 || attempt_memory_matches != 1 {
         violations.push(format!(
-            "signal was not at the expected dequeued lease-attempt cut: durable={attempt_durable_matches}, memory={attempt_memory_matches}"
+            "signal was not retained in both inboxes through failed lease acquisition: durable={attempt_durable_matches}, memory={attempt_memory_matches}"
         ));
+    }
+    if inbox_at_dispatch != inbox_after_ack {
+        violations.push(
+            "failed lease acquisition changed the acknowledged durable inbox bytes".to_string(),
+        );
     }
     if dispatch.handled {
         violations.push("failed lease acquisition was handled as a resumed run".to_string());
@@ -3172,6 +3193,172 @@ async fn stream_signal_failed_lease_keeps_delivery_recoverable() {
         "{}; {state_report}",
         violations.join("; ")
     );
+}
+
+/// Missing or mismatched pending metadata must leave an acknowledged live
+/// signal queued until the exact pending operation becomes available again.
+#[tokio::test]
+async fn stream_signal_missing_or_mismatched_pending_keeps_delivery_recoverable() {
+    const CHILD: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_CHILD";
+    const ROOT: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_ROOT";
+    const CASE: &str = "CHIDORI_TEST_SIGNAL_PENDING_RECOVERY_CASE";
+    const TEST: &str =
+        "server::tests::stream_signal_missing_or_mismatched_pending_keeps_delivery_recoverable";
+    if std::env::var_os(CHILD).is_none() {
+        for case in ["missing", "mismatched-seq", "mismatched-kind"] {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("runs.sqlite3");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROOT, temp.path())
+                .env(CASE, case)
+                .env("CHIDORI_RUN_STORE", "sqlite")
+                .env("CHIDORI_RUN_DB", &db_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case} pending metadata lost or failed to recover the acknowledged signal:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os(ROOT).expect("child root"));
+    let case = std::env::var(CASE).expect("pending recovery case");
+    let agent_path = write_agent(
+        &root,
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return { nonce: review.payload.nonce, by: review.from.id };
+            }
+        "#,
+    );
+    let state = signal_test_state(&root, agent_path);
+    let session_id = format!("pending-recovery-{case}");
+    let mut sse = start_stream(&state, &session_id, json!({})).await;
+    let paused = wait_for_status(&state, &session_id, SessionStatus::Paused).await;
+    let run_id = paused.run_id.clone().expect("paused stream has a run id");
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
+    let pending_before = store
+        .get_blob(super::PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("paused signal has durable pending metadata");
+    let mut altered_pending: crate::runtime::snapshot::PendingHostOperation =
+        serde_json::from_slice(&pending_before).unwrap();
+    match case.as_str() {
+        "missing" => store
+            .delete_blob(super::PENDING_HOST_OPERATION_FILE)
+            .unwrap(),
+        "mismatched-seq" => {
+            altered_pending.seq += 1;
+            store
+                .put_blob(
+                    super::PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(&altered_pending).unwrap(),
+                )
+                .unwrap();
+        }
+        "mismatched-kind" => {
+            altered_pending.kind = crate::runtime::snapshot::PendingHostOperationKind::Http;
+            store
+                .put_blob(
+                    super::PENDING_HOST_OPERATION_FILE,
+                    &serde_json::to_vec_pretty(&altered_pending).unwrap(),
+                )
+                .unwrap();
+        }
+        other => panic!("unexpected pending recovery case {other}"),
+    }
+
+    let (dispatch_tx, dispatch_rx) = tokio::sync::oneshot::channel();
+    let (dispatch_release_tx, dispatch_release_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_dispatch(&run_id, dispatch_tx, dispatch_release_rx);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    super::observe_signal_resume_result(&run_id, result_tx);
+    let (status, body) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "review".to_string(),
+                payload: json!({"nonce": format!("recover-{case}")}),
+                from: json!({"kind": "test", "id": "pending-recovery"}),
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["status"], json!("delivered_live"));
+    let inbox_after_ack = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("acknowledged signal is durable");
+
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx)
+        .await
+        .expect("missing/mismatched pending op reached the resume result")
+        .expect("resume observer was notified");
+    let inbox_after_refusal = store
+        .get_blob(crate::runtime::snapshot::SIGNAL_INBOX_FILE)
+        .unwrap()
+        .expect("signal remains durably queued");
+    let matching_durable = dispatch
+        .durable_inbox
+        .iter()
+        .filter(|signal| signal.payload["nonce"] == format!("recover-{case}"))
+        .count();
+    let matching_memory = dispatch
+        .memory_inbox
+        .iter()
+        .filter(|signal| signal.payload["nonce"] == format!("recover-{case}"))
+        .count();
+
+    // Repair the exact pending bytes while the stream is held at the dispatch
+    // observer; its scheduled retry then exercises recovery through production.
+    store
+        .put_blob(super::PENDING_HOST_OPERATION_FILE, &pending_before)
+        .unwrap();
+    let _ = dispatch_release_tx.send(());
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
+        .await
+        .expect("retained signal was not retried after pending metadata recovery")
+        .expect("resume result observer was notified");
+    let resumed = state
+        .session_store
+        .get(&session_id)
+        .unwrap()
+        .expect("resumed session persisted");
+    let sse_text = tokio::time::timeout(std::time::Duration::from_secs(5), &mut sse)
+        .await
+        .expect("recovered stream completed")
+        .unwrap();
+
+    assert!(!dispatch.handled, "invalid pending operation was resumed");
+    assert!(
+        dispatch.remains_supervised,
+        "paused stream lost supervision"
+    );
+    assert_eq!(dispatch.session_status, SessionStatus::Paused);
+    assert_eq!(matching_durable, 1, "durable delivery missing at retry cut");
+    assert_eq!(matching_memory, 1, "memory delivery missing at retry cut");
+    assert_eq!(
+        inbox_after_refusal, inbox_after_ack,
+        "pending validation changed durable inbox bytes"
+    );
+    assert_eq!(result.session_status, SessionStatus::Completed);
+    assert_eq!(resumed.status, SessionStatus::Completed);
+    assert_eq!(
+        resumed.output.as_ref().unwrap()["nonce"],
+        json!(format!("recover-{case}"))
+    );
+    assert!(sse_text.contains("\"status\":\"completed\""));
 }
 
 /// A timeout that expires while another process owns the run tenure remains
