@@ -34,6 +34,56 @@ static GLOBAL: mem_guard::CountingAllocator = mem_guard::CountingAllocator;
 use crate::runtime::template::TemplateEngine;
 use crate::tools::ToolRegistry;
 
+/// Holds the exact tenure returned by acquisition for the whole CLI resume
+/// lifecycle. Drop releases only that tenure on fencing-capable stores.
+struct CliRunLeaseGuard {
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    grant: crate::runtime::store::FencedLease,
+}
+
+impl Drop for CliRunLeaseGuard {
+    fn drop(&mut self) {
+        if let Err(err) = crate::runtime::store::release_lease_with_token(
+            self.store.as_ref(),
+            self.grant.lease(),
+            self.grant.token(),
+        ) {
+            eprintln!("warning: releasing run lease: {err}");
+        }
+    }
+}
+
+fn acquire_cli_run_lease(
+    store: Arc<dyn crate::runtime::store::RunStore>,
+    owner: &str,
+    run_id: &str,
+    subject: &str,
+) -> Result<Option<CliRunLeaseGuard>> {
+    let fencing = crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref());
+    match crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        owner,
+        chrono::Duration::minutes(10),
+    ) {
+        Ok(Ok(grant)) => Ok(Some(CliRunLeaseGuard { store, grant })),
+        Ok(Err(holder)) => anyhow::bail!(
+            "{subject} {run_id} is already being driven by another process (lease holder \
+             `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
+             wait for it to finish, or retry after {} if the holder is dead.",
+            holder.owner,
+            holder.expires_at,
+            holder.expires_at
+        ),
+        Err(err) if fencing => Err(err).with_context(|| {
+            format!("refusing {subject} {run_id}: could not acquire its SQLite lease")
+        }),
+        Err(err) => {
+            eprintln!("warning: could not take the {subject} lease: {err}");
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "chidori",
@@ -2384,6 +2434,7 @@ fn cmd_chat(
     let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
     factory.ensure_initialized()?;
     let lease_owner = format!("chidori-chat-{}", std::process::id());
+    let mut resume_lease = None;
     let mut messages: Vec<String> = Vec::new();
     let mut call_log: Vec<crate::runtime::call_log::CallRecord> = Vec::new();
     let session_id = match &resume {
@@ -2399,29 +2450,14 @@ fn cmd_chat(
                 .ok_or_else(|| {
                     anyhow::anyhow!("no chat session found under {}", run_dir.display())
                 })?;
-            // One driver per session journal, same guard (and same
-            // unrenewed-lease limitation) as `chidori resume`.
-            match crate::runtime::store::acquire_lease(
-                factory.store_for(session_id).as_ref(),
+            // Hold the exact tenure before restoring or mutating the resumed
+            // chat session; SQLite lease failures must stop this path.
+            resume_lease = acquire_cli_run_lease(
+                factory.store_for(session_id),
                 &lease_owner,
-                chrono::Duration::minutes(10),
-            ) {
-                Ok(Ok(_)) => {}
-                // As in `resume`: a dead holder's lease lapses on its own, and
-                // with a mirror configured it isn't a local file to delete.
-                Ok(Err(holder)) => anyhow::bail!(
-                    "chat session {session_id} is already being driven by another process \
-                     (lease holder `{}`, expires {}). Two concurrent drivers would corrupt \
-                     the journal — close the other chat, or retry after {} if the holder \
-                     is dead.",
-                    holder.owner,
-                    holder.expires_at,
-                    holder.expires_at
-                ),
-                Err(err) => {
-                    eprintln!("warning: could not take the session lease: {err}");
-                }
-            }
+                session_id,
+                "chat session",
+            )?;
             // Each turn rewrites the run's `input.json` with the full driven
             // input, so it is the durable record of the dialogue state:
             // restore the message list, and (unless overridden by flags) the
@@ -2652,12 +2688,7 @@ fn cmd_chat(
         }
     }
 
-    if resume.is_some() {
-        let _ = crate::runtime::store::release_lease(
-            factory.store_for(&session_id).as_ref(),
-            &lease_owner,
-        );
-    }
+    drop(resume_lease);
     if !call_log.is_empty() {
         print_chat_session_summary(&run_base, &session_id, messages.len());
         let agent_arg = agent
@@ -2897,31 +2928,11 @@ fn cmd_resume(
     .context("resume refused: the agent source no longer matches this run's checkpoint")?;
 
     // One driver per run dir: two concurrent resumes of the same run would
-    // interleave writes into one journal. The same lease file detached agents
-    // use guards the CLI; a dead holder's lease expires on its own.
+    // interleave writes into one journal. Retain the exact tenure token until
+    // this resume leg has completed, including every early-return path.
     let cli_lease_owner = format!("chidori-cli-{}", std::process::id());
-    match crate::runtime::store::acquire_lease(
-        factory.store_for(run_id).as_ref(),
-        &cli_lease_owner,
-        chrono::Duration::minutes(10),
-    ) {
-        Ok(Ok(_)) => {}
-        // A dead holder stops renewing, so the lease lapses at `expires` and
-        // the next attempt takes it over — hence "wait", not "delete a file":
-        // with a durable mirror configured the lease is fleet state living in
-        // the mirror, not `<run_dir>/lease.json`.
-        Ok(Err(holder)) => anyhow::bail!(
-            "run {run_id} is already being driven by another process (lease holder \
-             `{}`, expires {}). Two concurrent drivers would corrupt the journal — \
-             wait for it to finish, or retry after {} if the holder is dead.",
-            holder.owner,
-            holder.expires_at,
-            holder.expires_at
-        ),
-        Err(err) => {
-            eprintln!("warning: could not take the run lease: {err}");
-        }
-    }
+    let _lease_guard =
+        acquire_cli_run_lease(factory.store_for(run_id), &cli_lease_owner, run_id, "run")?;
 
     // The run's model travels with it: an explicit `--model` (or a
     // pre-existing CHIDORI_MODEL) wins, then the model recorded in the run's
@@ -2990,8 +3001,6 @@ fn cmd_resume(
             engine.resume_run_with_host_promises(file, &input_value, records, host_promises, run_id)
         }
     };
-    let _ =
-        crate::runtime::store::release_lease(factory.store_for(run_id).as_ref(), &cli_lease_owner);
     let result = result?;
 
     // A resume that lands back on a `chidori.signal(...)` listen point has no

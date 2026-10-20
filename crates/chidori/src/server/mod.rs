@@ -410,15 +410,25 @@ fn run_lease_ttl() -> chrono::Duration {
 /// (see [`crate::runtime::store::release_lease`]).
 struct RunLeaseGuard {
     store: Arc<dyn crate::runtime::store::RunStore>,
-    owner: String,
+    grant: crate::runtime::store::FencedLease,
 }
 
 impl Drop for RunLeaseGuard {
     fn drop(&mut self) {
-        if let Err(err) = crate::runtime::store::release_lease(self.store.as_ref(), &self.owner) {
+        if let Err(err) = crate::runtime::store::release_lease_with_token(
+            self.store.as_ref(),
+            self.grant.lease(),
+            self.grant.token(),
+        ) {
             tracing::warn!("releasing run lease: {err}");
         }
     }
+}
+
+#[derive(Debug)]
+enum RunLeaseAcquisitionError {
+    Held(crate::runtime::store::RunLease),
+    Failed(anyhow::Error),
 }
 
 /// Take the run's single-writer lease before a resume/signal/approve mutates
@@ -432,28 +442,42 @@ impl Drop for RunLeaseGuard {
 ///     to the same warn-and-continue posture the CLI resume uses, because
 ///     refusing every resume over a lease-less backend would turn a
 ///     single-server deployment into a dead one.
-///   * `Err(holder)` — another live process holds the run; the caller turns
-///     this into 409 Conflict naming the holder.
+///   * `Err(Held(holder))` — another live process holds the run; the caller
+///     turns this into 409 Conflict naming the holder.
+///   * `Err(Failed(error))` — a fencing-capable store failed acquisition; the
+///     caller fails before mutating the session or run.
 fn acquire_run_lease(
     state: &AppState,
     run_id: Option<&str>,
-) -> Result<Option<RunLeaseGuard>, crate::runtime::store::RunLease> {
+) -> std::result::Result<Option<RunLeaseGuard>, RunLeaseAcquisitionError> {
     let Some(run_id) = run_id else {
         return Ok(None);
     };
     let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
-    match crate::runtime::store::acquire_lease(store.as_ref(), &state.lease_owner, run_lease_ttl())
-    {
-        Ok(Ok(_)) => Ok(Some(RunLeaseGuard {
-            store,
-            owner: state.lease_owner.as_str().to_string(),
-        })),
-        Ok(Err(holder)) => Err(holder),
+    let fencing = crate::runtime::store::RunStore::supports_lease_fencing(store.as_ref());
+    match crate::runtime::store::acquire_lease_with_token(
+        store.as_ref(),
+        &state.lease_owner,
+        run_lease_ttl(),
+    ) {
+        Ok(Ok(grant)) => Ok(Some(RunLeaseGuard { store, grant })),
+        Ok(Err(holder)) => Err(RunLeaseAcquisitionError::Held(holder)),
+        Err(err) if fencing => Err(RunLeaseAcquisitionError::Failed(err.context(format!(
+            "could not acquire the SQLite run lease for {run_id}"
+        )))),
         Err(err) => {
             tracing::warn!("could not take the run lease for {run_id}: {err}");
             Ok(None)
         }
     }
+}
+
+fn lease_acquisition_failure_response(error: &anyhow::Error) -> Response {
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("could not safely acquire run lease: {error:#}")})),
+    )
+        .into_response()
 }
 
 enum HostPromiseCompletion {

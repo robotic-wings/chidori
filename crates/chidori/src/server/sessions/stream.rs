@@ -19,9 +19,9 @@ use crate::storage::{SessionStatus, StoredSession};
 use super::super::engine::build_engine;
 use super::super::hardening::acquire_run_slot;
 use super::super::{
-    complete_persisted_pending_host_operation, load_persisted_host_promises,
+    acquire_run_lease, complete_persisted_pending_host_operation, load_persisted_host_promises,
     load_persisted_replay_journal, load_persisted_vfs, ActiveSession, AppState,
-    HostPromiseCompletion, LiveSignalSession,
+    HostPromiseCompletion, LiveSignalSession, RunLeaseAcquisitionError,
 };
 use super::resume::signal_resolution_record;
 use super::{agent_error_string, apply_run_outcome, validate_policy_profile, CreateSessionRequest};
@@ -383,15 +383,22 @@ fn resume_signal_pause_in_process(
     // in-process resume mutates the run's durable state and re-drives the
     // run. A lease held elsewhere (a second server, a CLI resume) means we
     // stand down — the pause stays supervised and the holder drives it.
-    let lease = match super::super::acquire_run_lease(state, session.run_id.as_deref()) {
+    let lease = match acquire_run_lease(state, session.run_id.as_deref()) {
         Ok(lease) => lease,
-        Err(holder) => {
+        Err(RunLeaseAcquisitionError::Held(holder)) => {
             tracing::warn!(
                 run_id = %run_id,
                 holder = %holder.owner,
                 "in-process signal resume stood down: run lease held elsewhere"
             );
             return false;
+        }
+        Err(RunLeaseAcquisitionError::Failed(error)) => {
+            let _ = result_tx.send(Err(anyhow::anyhow!(
+                "in-process signal resume refused before mutation because the SQLite lease \
+                 could not be acquired: {error:#}"
+            )));
+            return true;
         }
     };
     let mut call_log = match load_persisted_replay_journal(

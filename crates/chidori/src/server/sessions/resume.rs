@@ -16,10 +16,10 @@ use super::super::engine::build_engine;
 use super::super::hardening::acquire_run_slot;
 use super::super::{
     acquire_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
-    install_warm_run, load_persisted_host_promises, load_persisted_replay_journal,
-    load_persisted_signal_inbox, load_persisted_vfs, release_warm_run_if_settled, session_view,
-    store_or_500, validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState,
-    HostPromiseCompletion,
+    install_warm_run, lease_acquisition_failure_response, load_persisted_host_promises,
+    load_persisted_replay_journal, load_persisted_signal_inbox, load_persisted_vfs,
+    release_warm_run_if_settled, session_view, store_or_500, validate_snapshot_manifest_for_resume,
+    warm_resume_enabled, AppState, HostPromiseCompletion,
 };
 use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_listen_names};
 
@@ -305,7 +305,12 @@ pub(in crate::server) async fn resume_session(
     // appends to the same journal the replay path would.
     let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
         Ok(guard) => guard,
-        Err(holder) => return lease_conflict_response(&holder),
+        Err(super::super::RunLeaseAcquisitionError::Held(holder)) => {
+            return lease_conflict_response(&holder)
+        }
+        Err(super::super::RunLeaseAcquisitionError::Failed(error)) => {
+            return lease_acquisition_failure_response(&error)
+        }
     };
 
     // Warm fast path: this session's VM is parked on its thread awaiting
@@ -551,7 +556,12 @@ pub(in crate::server) async fn signal_session(
         // append is not a resume).
         let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
             Ok(guard) => guard,
-            Err(holder) => return lease_conflict_response(&holder),
+            Err(super::super::RunLeaseAcquisitionError::Held(holder)) => {
+                return lease_conflict_response(&holder)
+            }
+            Err(super::super::RunLeaseAcquisitionError::Failed(error)) => {
+                return lease_acquisition_failure_response(&error)
+            }
         };
 
         if let Err(err) = validate_snapshot_manifest_for_resume(
@@ -736,7 +746,12 @@ pub(in crate::server) async fn approve_session(
     // run — same lease as /resume, deny path included.
     let _lease = match acquire_run_lease(&state, original.run_id.as_deref()) {
         Ok(guard) => guard,
-        Err(holder) => return lease_conflict_response(&holder),
+        Err(super::super::RunLeaseAcquisitionError::Held(holder)) => {
+            return lease_conflict_response(&holder)
+        }
+        Err(super::super::RunLeaseAcquisitionError::Failed(error)) => {
+            return lease_acquisition_failure_response(&error)
+        }
     };
 
     if let Err(err) = validate_snapshot_manifest_for_resume(
