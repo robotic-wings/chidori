@@ -624,7 +624,7 @@ fn spawn_streaming_run(
 /// in both inboxes until acquisition succeeds and the expected pending
 /// operation is validated; only then is that delivery consumed.
 #[allow(clippy::too_many_arguments)]
-fn resume_signal_pause_in_process(
+async fn resume_signal_pause_in_process(
     state: &AppState,
     session: &mut StoredSession,
     ctx_slot: &Arc<StdMutex<RuntimeContext>>,
@@ -673,46 +673,46 @@ fn resume_signal_pause_in_process(
             return SignalResumeOutcome::Retry;
         }
     };
-    let value = signal_to_consume
-        .as_ref()
-        .map(|candidate| {
-            json!({
-                "name": candidate.name,
-                "payload": candidate.payload,
-                "from": candidate.from,
-            })
-        })
-        .unwrap_or(value);
-    let mut call_log = match load_persisted_replay_journal(
-        &state.run_base,
-        session.run_id.as_deref(),
-        &session.call_log,
-    ) {
-        Ok(records) => records,
-        Err(error) => {
-            let _ = result_tx.send(Err(error.context("loading replay journal")));
-            return SignalResumeOutcome::Started;
-        }
-    };
-    let completed = {
-        let lock = state.signal_inbox_lock(&run_id);
-        let _guard = lock.lock().unwrap();
-        complete_persisted_pending_host_operation(
+    let resolution = if let Some(candidate) = signal_to_consume.as_ref() {
+        if let Err(error) = super::super::persist_signal_consumption_intent(
             &state.run_base,
-            session.run_id.as_deref(),
-            Some((seq, PendingHostOperationKind::Signal)),
-            HostPromiseCompletion::Resolved(value.clone()),
-        )
-    };
-    let pending = match completed {
-        Ok(Some(pending)) => pending,
-        Ok(None) => {
+            &run_id,
+            seq,
+            candidate,
+        ) {
+            tracing::error!(run_id = %run_id, delivery_seq = candidate.delivery_seq, %error, "could not persist signal consumption intent");
             return SignalResumeOutcome::Retry;
         }
-        Err(error) => {
-            let _ = result_tx.send(Err(error.context("completing persisted signal operation")));
-            return SignalResumeOutcome::Started;
+        #[cfg(test)]
+        wait_at_signal_consumption_cut().await;
+        match super::super::reconcile_signal_consumption_intent(state, &run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => return SignalResumeOutcome::Retry,
+            Err(error) => {
+                tracing::error!(run_id = %run_id, delivery_seq = candidate.delivery_seq, %error, "could not reconcile signal consumption intent");
+                return SignalResumeOutcome::Retry;
+            }
         }
+    } else {
+        let completed = {
+            let lock = state.signal_inbox_lock(&run_id);
+            let _guard = lock.lock().unwrap();
+            complete_persisted_pending_host_operation(
+                &state.run_base,
+                session.run_id.as_deref(),
+                Some((seq, PendingHostOperationKind::Signal)),
+                HostPromiseCompletion::Resolved(value.clone()),
+            )
+        };
+        let pending = match completed {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return SignalResumeOutcome::Retry,
+            Err(error) => {
+                let _ = result_tx.send(Err(error.context("completing persisted signal operation")));
+                return SignalResumeOutcome::Started;
+            }
+        };
+        signal_resolution_record(&pending, seq, value)
     };
     if let Some(candidate) = signal_to_consume {
         let consumed = ctx_slot
@@ -728,13 +728,36 @@ fn resume_signal_pause_in_process(
             return SignalResumeOutcome::Retry;
         }
     }
-    let resolution = signal_resolution_record(&pending, seq, value);
+    let mut call_log = match load_persisted_replay_journal(
+        &state.run_base,
+        session.run_id.as_deref(),
+        &session.call_log,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = result_tx.send(Err(error.context("loading replay journal")));
+            return SignalResumeOutcome::Started;
+        }
+    };
     // Emit the consumed signal on the live stream. The resumed run replays
     // the log (replayed records deliberately re-emit nothing), so without
     // this the one record that carries `{name, payload, from}` — who steered
     // the run — would never reach a dashboard watching the SSE stream.
     let _ = event_tx.send(RuntimeEvent::Call(resolution.clone()));
-    call_log.push(resolution);
+    if let Some(existing) = call_log.iter().find(|record| record.seq == resolution.seq) {
+        if existing.function != resolution.function
+            || existing.args != resolution.args
+            || existing.result != resolution.result
+        {
+            let _ = result_tx.send(Err(anyhow::anyhow!(
+                "signal resolution conflicts with durable journal seq {}",
+                resolution.seq
+            )));
+            return SignalResumeOutcome::Started;
+        }
+    } else {
+        call_log.push(resolution);
+    }
     session.call_log = call_log.clone();
 
     let host_promises =
@@ -978,8 +1001,6 @@ pub(in crate::server) async fn stream_session(
                     // Otherwise it stays durably queued for a future drain.
                     if let Some((seq, names)) = supervising.clone() {
                         if names.iter().any(|n| n == &name) {
-                            #[cfg(test)]
-                            wait_at_signal_consumption_cut().await;
                             let entry = ctx_slot.lock().unwrap()
                                 .queued_signal_by_delivery_seq(delivery_seq);
                             if let Some(entry) = entry {
@@ -992,7 +1013,7 @@ pub(in crate::server) async fn stream_session(
                                     &state_for_stream, &mut session, &ctx_slot,
                                     &event_tx, &result_tx, &permit,
                                     policy_profile.clone(), seq, value, Some(entry.clone()),
-                                );
+                                ).await;
                                 #[cfg(test)]
                                 {
                                     let resumed = outcome == SignalResumeOutcome::Started;
@@ -1048,7 +1069,7 @@ pub(in crate::server) async fn stream_session(
                             &state_for_stream, &mut session, &ctx_slot,
                             &event_tx, &result_tx, &permit,
                             policy_profile.clone(), seq, sentinel, None,
-                        ) == SignalResumeOutcome::Started
+                        ).await == SignalResumeOutcome::Started
                         {
                             SignalResumeOutcome::Started
                         } else {
@@ -1164,7 +1185,7 @@ pub(in crate::server) async fn stream_session(
                                 &state_for_stream, &mut session, &ctx_slot,
                                 &event_tx, &result_tx, &permit,
                                 policy_profile.clone(), seq, value, Some(entry),
-                            );
+                            ).await;
                         }
                         if outcome == SignalResumeOutcome::Started {
                             supervising = None;

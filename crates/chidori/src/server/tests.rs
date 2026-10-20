@@ -3972,6 +3972,497 @@ async fn signal_consumption_completion_before_inbox_removal_recovers_atomically(
     );
 }
 
+/// The protocol's store-level recovery is idempotent: a restart may repeat
+/// reconciliation after any earlier write has succeeded.
+#[test]
+fn signal_consumption_intent_reconciles_idempotently() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = format!("signal-intent-{}", uuid::Uuid::new_v4());
+    let agent_path = temp.path().join("agent.ts");
+    std::fs::write(&agent_path, "export function agent() { return {}; }").unwrap();
+    let state = signal_test_state(temp.path(), agent_path);
+    let factory = crate::runtime::store::RunStoreFactory::shared(&state.run_base);
+    factory.hydrate(&run_id).unwrap();
+    let store = factory.store_for(&run_id);
+    let operation = crate::runtime::snapshot::PendingHostOperation::new(
+        crate::runtime::snapshot::HostOperationId(73),
+        9,
+        PendingHostOperationKind::Signal,
+        json!({"name": "review"}),
+    )
+    .with_function("signal");
+    let queued = crate::runtime::snapshot::QueuedSignal {
+        name: "review".to_string(),
+        payload: json!({"id": "intent-cut"}),
+        from: json!({"kind": "test", "id": "intent"}),
+        delivery_seq: 41,
+        enqueued_at: chrono::Utc::now(),
+    };
+    store
+        .put_blob(
+            PENDING_HOST_OPERATION_FILE,
+            &serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+    store
+        .put_blob(
+            SIGNAL_INBOX_FILE,
+            &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+        )
+        .unwrap();
+    crate::runtime::snapshot::SnapshotStore::with_store(
+        state.run_base.join(&run_id),
+        store.clone(),
+    )
+    .compact_host_promises(
+        &[crate::runtime::snapshot::HostPromiseRecord {
+            operation: operation.clone(),
+            state: HostPromiseState::Pending,
+        }],
+        &[],
+    )
+    .unwrap();
+
+    super::persist_signal_consumption_intent(&state.run_base, &run_id, operation.seq, &queued)
+        .unwrap();
+    let recovered = super::reconcile_signal_consumption_intent(&state, &run_id)
+        .unwrap()
+        .expect("intent was reconciled");
+    assert_eq!(recovered.seq, operation.seq);
+    assert!(super::reconcile_signal_consumption_intent(&state, &run_id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_blob(PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_blob("signals/consumption-intent.json")
+        .unwrap()
+        .is_none());
+    let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+        .get_blob(SIGNAL_INBOX_FILE)
+        .unwrap()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or_default();
+    assert!(inbox.is_empty(), "exact delivery remains queued: {inbox:?}");
+    let journal = store.load_call_log().unwrap().unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].seq, operation.seq);
+    assert_eq!(journal[0].result["payload"], queued.payload);
+    let promises = crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap();
+    assert!(matches!(
+        &promises[0].state,
+        HostPromiseState::Resolved { value, .. } if value == &journal[0].result
+    ));
+}
+
+#[test]
+fn signal_consumption_intent_retry_repairs_tee_secondary_before_progress() {
+    use crate::runtime::store::{FailOneBlobPutStore, FsRunStore, RunStore, TeeRunStore};
+
+    let temp = tempfile::tempdir().unwrap();
+    let run_id = format!("signal-intent-tee-retry-{}", uuid::Uuid::new_v4());
+    let agent_path = temp.path().join("agent.ts");
+    std::fs::write(&agent_path, "export function agent() { return {}; }").unwrap();
+    let state = signal_test_state(temp.path(), agent_path);
+    let run_dir = state.run_base.join(&run_id);
+    let mirror_dir = temp.path().join("mirror").join(&run_id);
+    let secondary = Arc::new(FailOneBlobPutStore::new(
+        &mirror_dir,
+        "signals/consumption-intent.json",
+    ));
+    let store: Arc<dyn RunStore> = Arc::new(TeeRunStore::new(
+        FsRunStore::new(&run_dir),
+        secondary.clone(),
+    ));
+    let operation = crate::runtime::snapshot::PendingHostOperation::new(
+        crate::runtime::snapshot::HostOperationId(74),
+        10,
+        PendingHostOperationKind::Signal,
+        json!({"name": "review"}),
+    )
+    .with_function("signal");
+    let queued = crate::runtime::snapshot::QueuedSignal {
+        name: "review".to_string(),
+        payload: json!({"id": "tee-retry"}),
+        from: json!({"kind": "test", "id": "tee-retry"}),
+        delivery_seq: 42,
+        enqueued_at: chrono::Utc::now(),
+    };
+    store
+        .put_blob(
+            PENDING_HOST_OPERATION_FILE,
+            &serde_json::to_vec(&operation).unwrap(),
+        )
+        .unwrap();
+    store
+        .put_blob(
+            SIGNAL_INBOX_FILE,
+            &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+        )
+        .unwrap();
+    crate::runtime::snapshot::SnapshotStore::with_store(run_dir, store.clone())
+        .compact_host_promises(
+            &[crate::runtime::snapshot::HostPromiseRecord {
+                operation: operation.clone(),
+                state: HostPromiseState::Pending,
+            }],
+            &[],
+        )
+        .unwrap();
+    let flushes_before_intent = secondary.flush_count();
+    let assert_unmutated = || {
+        let current_stores: [&dyn RunStore; 2] = [store.as_ref(), secondary.as_ref()];
+        for current in current_stores {
+            assert!(current
+                .get_blob(PENDING_HOST_OPERATION_FILE)
+                .unwrap()
+                .is_some());
+            let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = current
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            assert_eq!(inbox, vec![queued.clone()]);
+            let promises = crate::runtime::snapshot::load_host_promise_records(current).unwrap();
+            assert!(matches!(&promises[0].state, HostPromiseState::Pending));
+            assert!(current.load_call_log().unwrap().is_none());
+        }
+    };
+
+    let first_attempt =
+        super::persist_signal_consumption_intent_in_store(store.as_ref(), operation.seq, &queued);
+    assert!(
+        first_attempt.is_err(),
+        "secondary failure must stop before consumption proceeds"
+    );
+    assert_eq!(secondary.failure_count(), 1);
+    assert!(
+        store
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_some(),
+        "the FS primary has the intent from the partial Tee write"
+    );
+    assert!(
+        secondary
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_none(),
+        "the injected secondary write failed"
+    );
+    assert_eq!(secondary.flush_count(), flushes_before_intent);
+    assert_unmutated();
+
+    // The retry sees the matching primary copy. It must repair and flush the
+    // secondary before returning permission for promise/inbox/journal work.
+    let retried =
+        super::persist_signal_consumption_intent_in_store(store.as_ref(), operation.seq, &queued)
+            .unwrap();
+    assert_eq!(retried.delivery_seq, queued.delivery_seq);
+    assert!(secondary
+        .get_blob("signals/consumption-intent.json")
+        .unwrap()
+        .is_some());
+    assert_eq!(secondary.flush_count(), flushes_before_intent + 1);
+    assert_unmutated();
+}
+
+/// The same durable intent protocol runs over the configured FS-primary,
+/// SQLite-secondary mirror when selected in a child process.
+#[test]
+fn signal_consumption_intent_reconciles_with_sqlite_mirror() {
+    const TEST: &str = "server::tests::signal_consumption_intent_reconciles_idempotently";
+    let temp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env("CHIDORI_RUN_STORE", "sqlite")
+        .env("CHIDORI_RUN_DB", temp.path().join("runs.sqlite3"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "SQLite mirror intent reconciliation failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Server boot must use a token-aware lease while recovering a durable signal
+/// intent. This subprocess configures the SQLite mirror before the run-store
+/// factory is initialized, seeds a paused session plus an intent, and starts
+/// the real `serve` entry point. Boot recovery must complete the session
+/// before the listener begins serving requests.
+#[tokio::test]
+async fn sqlite_server_startup_recovers_signal_consumption_intent() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const CHILD_HOLD_LEASE: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_HOLD_LEASE";
+    const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let hold_external_lease = std::env::var_os(CHILD_HOLD_LEASE).is_some();
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("CHIDORI_RUN_STORE", "sqlite");
+        std::env::set_var("CHIDORI_RUN_DB", root.join("runs.sqlite3"));
+        std::env::set_var("CHIDORI_DB_PATH", root.join("sessions.sqlite3"));
+
+        let agent_path = write_agent(
+            &root,
+            r#"
+                export async function agent(input, chidori) {
+                    const first = await chidori.signal("review", { timeoutMs: 60000 });
+                    const second = await chidori.signal("review", { timeoutMs: 5 });
+                    return {
+                        first: first.payload,
+                        secondTimedOut: second.timedOut === true,
+                        second: second.payload ?? null,
+                    };
+                }
+            "#,
+        );
+        let run_base = root.join(".chidori").join("runs");
+        let run_id = "sqlite-startup-signal-recovery";
+        let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+        factory.ensure_initialized().unwrap();
+        factory.hydrate(run_id).unwrap();
+        let store = factory.store_for(run_id);
+        let operation = crate::runtime::snapshot::PendingHostOperation::new(
+            crate::runtime::snapshot::HostOperationId(301),
+            1,
+            PendingHostOperationKind::Signal,
+            json!({"name": "review"}),
+        )
+        .with_function("signal");
+        let queued = crate::runtime::snapshot::QueuedSignal {
+            name: "review".to_string(),
+            payload: json!({"id": "startup-cut"}),
+            from: json!({"kind": "test", "id": "startup"}),
+            delivery_seq: 1,
+            enqueued_at: chrono::Utc::now(),
+        };
+        store
+            .put_blob(
+                PENDING_HOST_OPERATION_FILE,
+                &serde_json::to_vec(&operation).unwrap(),
+            )
+            .unwrap();
+        store
+            .put_blob(
+                SIGNAL_INBOX_FILE,
+                &serde_json::to_vec(std::slice::from_ref(&queued)).unwrap(),
+            )
+            .unwrap();
+        crate::runtime::snapshot::SnapshotStore::with_store(run_base.join(run_id), store.clone())
+            .compact_host_promises(
+                &[crate::runtime::snapshot::HostPromiseRecord {
+                    operation: operation.clone(),
+                    state: HostPromiseState::Pending,
+                }],
+                &[],
+            )
+            .unwrap();
+        super::persist_signal_consumption_intent(&run_base, run_id, operation.seq, &queued)
+            .unwrap();
+
+        // Give the persisted deadline an expired value in the held-lease
+        // variant. Arming it before recovery would overwrite the accepted
+        // signal's Pending promise with the timeout sentinel.
+        let external_lease = if hold_external_lease {
+            Some(
+                crate::runtime::store::acquire_lease_with_token(
+                    store.as_ref(),
+                    "startup-signal-recovery-test-holder",
+                    chrono::Duration::seconds(30),
+                )
+                .unwrap()
+                .expect("test holder acquired the SQLite lease"),
+            )
+        } else {
+            None
+        };
+
+        let session_store = crate::storage::build_session_store(&root).unwrap();
+        session_store
+            .put(&StoredSession {
+                id: "sqlite-startup-signal-session".to_string(),
+                run_id: Some(run_id.to_string()),
+                status: SessionStatus::Paused,
+                input: json!({}),
+                output: None,
+                call_log: Vec::new(),
+                error: None,
+                pending_seq: Some(operation.seq),
+                pending_prompt: None,
+                pending_details: None,
+                pending_signal_name: Some("review".to_string()),
+                pending_signal_names: vec!["review".to_string()],
+                pending_signal_deadline: Some(if hold_external_lease {
+                    chrono::Utc::now() - chrono::Duration::milliseconds(100)
+                } else {
+                    chrono::Utc::now() + chrono::Duration::seconds(60)
+                }),
+                pending_approval: None,
+                approvals: Vec::new(),
+                policy_profile: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let held_observed = if hold_external_lease {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            *super::STARTUP_LEASE_HELD_TEST_OBSERVER.lock().unwrap() = Some(sender);
+            Some(receiver)
+        } else {
+            None
+        };
+
+        let server = tokio::spawn(serve(
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(TemplateEngine::new(root.to_string_lossy().into_owned())),
+            Some(agent_path),
+            "127.0.0.1".to_string(),
+            0,
+            PolicyConfig::from_env(),
+            "test".to_string(),
+            None,
+        ));
+        if let (Some(grant), Some(held_observed)) = (external_lease, held_observed) {
+            // Wait for the actual startup Held branch, then keep the lease
+            // past the expired deadline so an incorrectly armed timer has
+            // time to run before checking durable state.
+            tokio::time::timeout(std::time::Duration::from_secs(10), held_observed)
+                .await
+                .expect("startup reached held-lease branch")
+                .expect("startup held-lease notification delivered");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert!(
+                !server.is_finished(),
+                "serve exited while the external lease was held"
+            );
+            let still_paused = session_store
+                .get("sqlite-startup-signal-session")
+                .unwrap()
+                .expect("held startup session remains stored");
+            assert_eq!(still_paused.status, SessionStatus::Paused);
+            let promises =
+                crate::runtime::snapshot::load_host_promise_records(store.as_ref()).unwrap();
+            assert!(
+                matches!(
+                    promises
+                        .iter()
+                        .find(|promise| promise.operation.id == operation.id)
+                        .map(|promise| &promise.state),
+                    Some(HostPromiseState::Pending)
+                ),
+                "held startup timeout replaced the accepted signal promise: {promises:?}"
+            );
+            assert!(store
+                .load_call_log()
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty());
+            assert!(store
+                .get_blob("signals/consumption-intent.json")
+                .unwrap()
+                .is_some());
+            let held_inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            assert_eq!(held_inbox, vec![queued.clone()]);
+            crate::runtime::store::release_lease_with_token(
+                store.as_ref(),
+                grant.lease(),
+                grant.token(),
+            )
+            .unwrap();
+        }
+
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(session) = session_store.get("sqlite-startup-signal-session").unwrap() {
+                    if session.status == SessionStatus::Completed {
+                        break session;
+                    }
+                }
+                assert!(
+                    !server.is_finished(),
+                    "serve exited before startup recovery"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server startup recovery completed");
+        assert_eq!(
+            recovered.output,
+            Some(json!({
+                "first": {"id": "startup-cut"},
+                "secondTimedOut": true,
+                "second": null,
+            }))
+        );
+        let journal = store.load_call_log().unwrap().unwrap_or_default();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|record| record.function == "signal"
+                    && record.result["payload"]["id"] == "startup-cut")
+                .count(),
+            1,
+            "startup recovery records the completed signal exactly once"
+        );
+        let inbox: Vec<crate::runtime::snapshot::QueuedSignal> = store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_default();
+        assert!(inbox.is_empty(), "startup left a consumed signal queued");
+        assert!(store
+            .get_blob("signals/consumption-intent.json")
+            .unwrap()
+            .is_none());
+        server.abort();
+        let _ = server.await;
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ROOT, temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "SQLite-configured serve startup recovery failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sqlite_server_startup_held_lease_defers_intent_timeout() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const CHILD_HOLD_LEASE: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_HOLD_LEASE";
+    const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ROOT, temp.path())
+        .env(CHILD_HOLD_LEASE, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "SQLite startup held-lease recovery failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 #[tokio::test]
 async fn live_signal_route_does_not_accept_when_inbox_persistence_fails() {
     const CHILD: &str = "CHIDORI_TEST_LIVE_SERVER_FAILURE_CHILD";
