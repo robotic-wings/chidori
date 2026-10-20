@@ -457,41 +457,6 @@ enum RunLeaseAcquisitionError {
     Failed(anyhow::Error),
 }
 
-/// Take the run's single-writer lease before a resume/signal/approve mutates
-/// its durable state. Two servers pointed at the same run store (a shared
-/// directory, one SQLite file, or one relay) could otherwise BOTH accept a
-/// resume of the same paused run and interleave opposite continuations into
-/// one journal — the second writer must lose, visibly. Returns:
-///   * `Ok(Some(guard))` — lease held for this leg; dropping releases it.
-///   * `Ok(None)` — nothing durable to contend for (the session has no run
-///     id), or the backend could not serve the lease at all — that degrades
-///     to the same warn-and-continue posture the CLI resume uses, because
-///     refusing every resume over a lease-less backend would turn a
-///     single-server deployment into a dead one.
-///   * `Err(holder)` — another live process holds the run; the caller turns
-///     this into 409 Conflict naming the holder.
-fn acquire_run_lease(
-    state: &AppState,
-    run_id: Option<&str>,
-) -> Result<Option<RunLeaseGuard>, crate::runtime::store::RunLease> {
-    let Some(run_id) = run_id else {
-        return Ok(None);
-    };
-    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
-    match crate::runtime::store::acquire_lease(store.as_ref(), &state.lease_owner, run_lease_ttl())
-    {
-        Ok(Ok(_)) => Ok(Some(RunLeaseGuard {
-            store,
-            release: RunLeaseRelease::Owner(state.lease_owner.as_str().to_string()),
-        })),
-        Ok(Err(holder)) => Err(holder),
-        Err(err) => {
-            tracing::warn!("could not take the run lease for {run_id}: {err}");
-            Ok(None)
-        }
-    }
-}
-
 /// Acquire a lease for an in-process signal resume. Unlike legacy route
 /// callers, this path must distinguish a held SQLite tenure from an SQLite
 /// acquisition failure so neither case consumes the queued signal or ends
