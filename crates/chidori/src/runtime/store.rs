@@ -3077,6 +3077,44 @@ impl RunStoreFactory {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        #[cfg(test)]
+        if std::env::var("CHIDORI_TEST_REGISTRY_PREFIX_NAME").as_deref() == Ok(name)
+            && descriptor.get("status").and_then(serde_json::Value::as_str) == Some("running")
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| {
+                    format!(
+                        "opening {} for injected registry prefix write",
+                        path.display()
+                    )
+                })?;
+            let prefix_len = bytes.len().min(19);
+            file.write_all(&bytes[..prefix_len])
+                .with_context(|| format!("writing registry prefix to {}", path.display()))?;
+            file.flush()?;
+            drop(file);
+            let mut stdout = std::io::stdout().lock();
+            serde_json::to_writer(
+                &mut stdout,
+                &serde_json::json!({
+                    "name": name,
+                    "run_id": run_id,
+                    "registry_path": path.display().to_string(),
+                    "prefix_len": prefix_len,
+                    "serialized_len": bytes.len(),
+                }),
+            )?;
+            stdout.write_all(b"\n")?;
+            stdout.flush()?;
+            loop {
+                std::thread::park();
+            }
+        }
         std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
         match &self.backend {
             RunStoreBackend::Fs => {}
