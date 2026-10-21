@@ -4390,7 +4390,7 @@ impl DetachedStopGate {
                 .set_nonblocking(true)
                 .expect("set detached stop gate listener nonblocking");
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let mut hold_seen = false;
+            let mut hold_count = 0usize;
             let mut sentinel_seen_once = false;
             while std::time::Instant::now() < deadline
                 && !sentinel_seen_once
@@ -4440,8 +4440,7 @@ impl DetachedStopGate {
                         let request = String::from_utf8_lossy(&request);
                         let first_line = request.lines().next().unwrap_or_default();
                         let response = if first_line.starts_with("POST /hold ") {
-                            assert!(!hold_seen, "detached stop gate received duplicate hold");
-                            hold_seen = true;
+                            hold_count += 1;
                             hold_tx.send(()).expect("report held host call");
                             release_rx
                                 .recv_timeout(Duration::from_secs(30))
@@ -4479,7 +4478,7 @@ impl DetachedStopGate {
                 }
             }
             assert!(
-                hold_seen,
+                hold_count > 0,
                 "detached worker never reached the held host call"
             );
         });
@@ -4672,6 +4671,8 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         let worker_y = project.join("replacement-worker.ts");
         let idle_worker = project.join("idle-worker.ts");
         let rearm_worker = project.join("hibernating-rearm-worker.ts");
+        let name_rearm_worker = project.join("hibernating-name-hold-worker.ts");
+        let handle_rearm_worker = project.join("hibernating-handle-worker.ts");
         fs::write(
             &worker_x,
             r#"import { chidori, run } from "chidori:agent";
@@ -4721,6 +4722,34 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
                      return {{afterStop:true}};
                    }});"#,
                 gate.address
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &name_rearm_worker,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     await chidori.signal("wake");
+                     await fetch("http://{}/hold", {{method:"POST", body:JSON.stringify({{id:"hibernating-name-hold"}})}});
+                     await fetch("http://{}/sentinel", {{method:"POST", body:JSON.stringify({{id:"hibernating-name"}})}});
+                     return {{afterStop:true}};
+                   }});"#,
+                gate.address, gate.address
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &handle_rearm_worker,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     await chidori.signal("wake");
+                     await fetch("http://{}/hold", {{method:"POST", body:JSON.stringify({{id:"hibernating-handle-hold"}})}});
+                     await fetch("http://{}/sentinel", {{method:"POST", body:JSON.stringify({{id:"hibernating-handle"}})}});
+                     return {{afterStop:true}};
+                   }});"#,
+                gate.address, gate.address
             ),
         )
         .unwrap();
@@ -4783,10 +4812,13 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         fs::write(
             project.join("chidori.app.yml"),
             format!(
-                "name: stop-name-fixture\nagents:\n  - name: {NAME}\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: current-hub-control\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: hibernating-rearm-control\n    agent: {}\n    keep_alive: true\n    restart: never\n",
+                "name: stop-name-fixture\nagents:\n  - name: {}\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: current-hub-control\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: hibernating-rearm-control\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: hibernating-name-control\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: hibernating-handle-control\n    agent: {}\n    keep_alive: true\n    restart: never\n",
+                NAME,
                 worker_y.file_name().unwrap().to_string_lossy(),
                 idle_worker.file_name().unwrap().to_string_lossy(),
-                rearm_worker.file_name().unwrap().to_string_lossy()
+                rearm_worker.file_name().unwrap().to_string_lossy(),
+                name_rearm_worker.file_name().unwrap().to_string_lossy(),
+                handle_rearm_worker.file_name().unwrap().to_string_lossy()
             ),
         )
         .unwrap();
@@ -4952,6 +4984,106 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
                 "{backend}: hibernating run did not observe durable stop before its matching-wake effect: final={rearm_final}, sentinel_rows={rearm_sentinel_rows}, signal_rows={rearm_signal_rows}, inbox={rearm_inbox:?}, count={}",
                 gate.sentinel_count.load(Ordering::SeqCst)
             ));
+        }
+
+        // A caches each same-run hibernating incarnation before B wakes it.
+        // Once B owns execution and is blocked in /hold, A must persist a
+        // run-scoped request through either name routing or its runId handle,
+        // without locally settling the stale cached descriptor.
+        for (name, stop_via_handle) in [
+            ("hibernating-name-control", false),
+            ("hibernating-handle-control", true),
+        ] {
+            let hibernating_deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut hibernating_entry = detached_registry_entry(&project, name);
+            while detached_registry_status(&hibernating_entry) == "running"
+                && std::time::Instant::now() < hibernating_deadline
+            {
+                std::thread::yield_now();
+                hibernating_entry = detached_registry_entry(&project, name);
+            }
+            assert_eq!(detached_registry_status(&hibernating_entry), "hibernating");
+            let held_run_id = detached_registry_run_id(&hibernating_entry).to_string();
+
+            let cached =
+                serve_http_request(port_a, "GET", &format!("/agents/detached/{name}"), None);
+            assert_eq!(cached.status, 200, "A caches {name}: {:?}", cached.body);
+            assert_eq!(cached.body["runId"].as_str(), Some(held_run_id.as_str()));
+
+            let wake = serde_json::json!({"name":"wake","payload":{}}).to_string();
+            let wake_response = serve_http_request(
+                port_b,
+                "POST",
+                &format!("/agents/detached/{name}/send"),
+                Some(&wake),
+            );
+            assert_eq!(
+                wake_response.status, 200,
+                "wake {name}: {:?}",
+                wake_response.body
+            );
+            gate.wait_until_held();
+
+            let stop_response = if stop_via_handle {
+                let handle_script = project.join("stop-cached-handle.ts");
+                fs::write(
+                    &handle_script,
+                    format!(
+                        r#"import {{ chidori, run }} from "chidori:agent";
+                           run(async () => {{
+                             const handle = await chidori.agents.lookup("{name}");
+                             if (!handle) throw new Error("missing cached handle");
+                             const result = await handle.stop();
+                             return {{runId: handle.runId, status: result.status, stopRequested: result.stopRequested}};
+                           }});"#
+                    ),
+                )
+                .unwrap();
+                let request =
+                    serde_json::json!({"agent":"stop-cached-handle.ts","input":{}}).to_string();
+                serve_http_request(port_a, "POST", "/sessions", Some(&request))
+            } else {
+                serve_http_request(
+                    port_a,
+                    "POST",
+                    &format!("/agents/detached/{name}/stop"),
+                    None,
+                )
+            };
+            assert!(
+                [200, 201].contains(&stop_response.status),
+                "stop {name}: {:?}",
+                stop_response.body
+            );
+            assert!(
+                stop_response.body.to_string().contains(&held_run_id),
+                "stop must identify cached current run {held_run_id}: {:?}",
+                stop_response.body
+            );
+            assert!(
+                stop_response.body.to_string().contains("stopRequested")
+                    && stop_response.body.to_string().contains("true"),
+                "remote cached stop must report stopRequested: {:?}",
+                stop_response.body
+            );
+            gate.release();
+
+            let stop_deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut stopped = detached_registry_entry(&project, name);
+            while detached_registry_status(&stopped) != "stopped"
+                && std::time::Instant::now() < stop_deadline
+            {
+                std::thread::yield_now();
+                stopped = detached_registry_entry(&project, name);
+            }
+            let records = detached_run_records(&project, &held_run_id);
+            let sentinel_rows = records
+                .iter()
+                .filter(|record| record.to_string().contains("/sentinel"))
+                .count();
+            assert_eq!(detached_registry_status(&stopped), "stopped");
+            assert_eq!(sentinel_rows, 0, "{name} must not reach sentinel");
+            assert_eq!(gate.sentinel_count.load(Ordering::SeqCst), 0);
         }
 
         // Current-hub route control: B's hub owns this hibernating incarnation;

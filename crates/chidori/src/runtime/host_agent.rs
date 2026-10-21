@@ -220,6 +220,34 @@ fn stop_request_matches_run(
     Ok(true)
 }
 
+fn another_process_holds_live_run_lease(store: &dyn RunStore) -> Result<bool, String> {
+    let Some(bytes) = store
+        .get_blob(crate::runtime::store::LEASE_FILE)
+        .map_err(|err| format!("reading detached-agent lease: {err:#}"))?
+    else {
+        return Ok(false);
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("parsing detached-agent lease: {err}"))?;
+    let owner = value["owner"]
+        .as_str()
+        .ok_or_else(|| "detached-agent lease has no owner".to_string())?;
+    let expires_at = value["expires_at"]
+        .as_str()
+        .or_else(|| value["expiresAt"].as_str())
+        .ok_or_else(|| "detached-agent lease has no expiry".to_string())?
+        .parse::<chrono::DateTime<Utc>>()
+        .map_err(|err| format!("parsing detached-agent lease expiry: {err}"))?;
+    Ok(owner != process_lease_owner() && expires_at > Utc::now())
+}
+
+fn stop_agent_call_args(to: &str, run_id: Option<&str>) -> Value {
+    match run_id {
+        Some(run_id) => json!({ "to": to, "runId": run_id }),
+        None => json!({ "to": to }),
+    }
+}
+
 struct AgentState {
     descriptor: AgentDescriptor,
     /// The live iteration's context while a supervision thread is running —
@@ -972,26 +1000,30 @@ impl DetachedAgentHub {
         // that address agents by name. The captured entry preserves Y's
         // identity if the name is later reused.
         if let Some(entry) = wait_for_entry {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let mut state = entry.state.lock().unwrap();
-            loop {
-                if AgentEntry::is_settled(&state) {
-                    return Ok(state.descriptor.status_json());
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    let mut response = state.descriptor.status_json();
-                    response["stopRequested"] = json!(true);
-                    return Ok(response);
-                }
-                state = entry
-                    .signal
-                    .wait_timeout(state, deadline.saturating_duration_since(now))
-                    .unwrap()
-                    .0;
-            }
+            return Ok(Self::wait_for_entry_stop(&entry, Duration::from_secs(60)));
         }
         Ok(response)
+    }
+
+    fn wait_for_entry_stop(entry: &Arc<AgentEntry>, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if AgentEntry::is_settled(&state) {
+                return state.descriptor.status_json();
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let mut response = state.descriptor.status_json();
+                response["stopRequested"] = json!(true);
+                return response;
+            }
+            state = entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap()
+                .0;
+        }
     }
 
     fn stop_entry(
@@ -1030,7 +1062,33 @@ impl DetachedAgentHub {
             if matches_run {
                 let store = entry.factory().store_for(run_id);
                 persist_stop_request(store.as_ref(), run_id)?;
-                return self.stop_entry(parts, name, entry);
+                let mut state = entry.state.lock().unwrap();
+                if AgentEntry::is_settled(&state) {
+                    return Ok(state.descriptor.status_json());
+                }
+                let local_execution = state.execution_active;
+                let remote_execution =
+                    !local_execution && another_process_holds_live_run_lease(store.as_ref())?;
+                if !local_execution && !remote_execution {
+                    drop(state);
+                    // Preserve same-hub behavior when this run is truly
+                    // hibernating with no other process holding its lease.
+                    return self.stop_entry(parts, name, entry);
+                }
+                state.stop_requested = true;
+                entry.signal.notify_all();
+                let mut response = state.descriptor.status_json();
+                if remote_execution {
+                    // A cached handle can outlive this process's supervisor.
+                    // Persist the request, but do not make its stale local
+                    // descriptor claim that another process has settled it.
+                    response["stopRequested"] = json!(true);
+                }
+                drop(state);
+                if local_execution {
+                    return Ok(Self::wait_for_entry_stop(&entry, Duration::from_secs(60)));
+                }
+                return Ok(response);
             }
         }
 
@@ -2575,7 +2633,7 @@ pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
         .and_then(Value::as_str)
         .filter(|run_id| !run_id.is_empty())
         .map(str::to_string);
-    let call_args = json!({ "to": to });
+    let call_args = stop_agent_call_args(&to, run_id.as_deref());
     host_core::execute_durable_json_call(ctx, "stop_agent", call_args, || {
         let result = match run_id.as_deref() {
             Some(run_id) => hub().stop_incarnation(&parts, &to, run_id),
@@ -4360,6 +4418,49 @@ mod tests {
             .get_blob(AGENT_STOP_REQUEST_FILE)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn detached_stop_replay_identity_includes_handle_run_id_and_keeps_legacy_args() {
+        let record = |args| crate::runtime::call_log::CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "stop_agent".to_string(),
+            args,
+            result: json!({ "status": "stopped", "runId": "run-x" }),
+            duration_ms: 0,
+            token_usage: None,
+            timestamp: Utc::now(),
+            error: None,
+        };
+
+        let run_x_ctx = RuntimeContext::with_replay(vec![record(stop_agent_call_args(
+            "same-name",
+            Some("run-x"),
+        ))]);
+        let mismatch = host_core::execute_durable_json_call_at_seq(
+            &run_x_ctx,
+            1,
+            "stop_agent",
+            stop_agent_call_args("same-name", Some("run-y")),
+            || anyhow::bail!("a different handle incarnation must not replay run-x stop"),
+        )
+        .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("Replay divergence"),
+            "same-name stop for another run ID must diverge: {mismatch:#}"
+        );
+
+        let legacy_ctx = RuntimeContext::with_replay(vec![record(json!({ "to": "same-name" }))]);
+        let replayed = host_core::execute_durable_json_call_at_seq(
+            &legacy_ctx,
+            1,
+            "stop_agent",
+            stop_agent_call_args("same-name", None),
+            || anyhow::bail!("legacy name-only stop should remain replay-compatible"),
+        )
+        .unwrap();
+        assert_eq!(replayed["runId"], "run-x");
     }
 
     #[derive(Debug)]
