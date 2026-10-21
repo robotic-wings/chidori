@@ -987,6 +987,8 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let mut state = entry.state.lock().unwrap();
         state.execution_active = true;
     }
+    #[cfg(test)]
+    tests::pause_after_alarm_wake_lease_before_inbox_read(&entry.name);
     let _heartbeat = active_lease
         .as_ref()
         .filter(|_| lease_store.supports_lease_fencing())
@@ -3060,6 +3062,64 @@ mod tests {
     static INBOX_SNAPSHOT_GAP_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxSnapshotGapBarriers>>>> =
         OnceLock::new();
 
+    struct AlarmInboxReadBarrier {
+        agent_name: String,
+        reached: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        claimed: AtomicBool,
+    }
+
+    static ALARM_INBOX_READ_BARRIER: OnceLock<StdMutex<Option<Arc<AlarmInboxReadBarrier>>>> =
+        OnceLock::new();
+
+    fn install_alarm_inbox_read_barrier(
+        agent_name: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, wait_until_reached) = std::sync::mpsc::channel();
+        let (release, wait_until_released) = std::sync::mpsc::channel();
+        *ALARM_INBOX_READ_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = Some(Arc::new(AlarmInboxReadBarrier {
+            agent_name: agent_name.to_string(),
+            reached,
+            release: StdMutex::new(wait_until_released),
+            claimed: AtomicBool::new(false),
+        }));
+        (wait_until_reached, release)
+    }
+
+    pub(super) fn pause_after_alarm_wake_lease_before_inbox_read(agent_name: &str) {
+        let barrier = ALARM_INBOX_READ_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barrier) = barrier.filter(|barrier| barrier.agent_name == agent_name) else {
+            return;
+        };
+        if barrier.claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        barrier
+            .reached
+            .send(())
+            .expect("alarm inbox test must observe the post-lease barrier");
+        barrier
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .expect("alarm inbox test must release the post-lease barrier");
+    }
+
+    fn clear_alarm_inbox_read_barrier() {
+        *ALARM_INBOX_READ_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = None;
+    }
+
     pub(super) fn pause_before_cross_process_inbox_update(agent_name: &str) {
         let Some(target) = std::env::var_os("CHIDORI_TEST_CROSS_PROCESS_INBOX_GATE") else {
             return;
@@ -4931,6 +4991,540 @@ mod tests {
                 .unwrap();
             state = next;
         }
+    }
+
+    struct AlarmInboxFixture {
+        parts: AgentRuntimeParts,
+        name: String,
+        run_id: String,
+        entry: Arc<AgentEntry>,
+        store: Arc<dyn RunStore>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn new_alarm_inbox_fixture(base: &Path, case: &str) -> AlarmInboxFixture {
+        let project = base.join(case);
+        std::fs::create_dir_all(project.join("services")).unwrap();
+        let source = project.join("services/alarm-worker.ts");
+        std::fs::write(
+            &source,
+            r#"export async function agent() {
+                const fired = await chidori.alarm(3600000);
+                await chidori.tool("effectMarker", { timedOut: fired.timedOut === true });
+                return fired;
+            }"#,
+        )
+        .unwrap();
+        let run_base = project.join(".chidori/runs");
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        let observed_effects = effects.clone();
+        tools.register_native(
+            "effectMarker",
+            "count alarm continuation",
+            Vec::new(),
+            move |_| {
+                observed_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "executed": true }))
+            },
+        );
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let name = unique(&format!("{case}-alarm"));
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &SpawnOptions {
+                    name: Some(name.clone()),
+                    restart: "resume".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                },
+                format!("{case}-owner"),
+            )
+            .unwrap();
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let descriptor = wait_for_agent_descriptor(&parts, &name, |descriptor| {
+            descriptor.status == "hibernating"
+                && descriptor.listen.as_ref().is_some_and(|listen| {
+                    listen.names == [ALARM_SIGNAL_NAME]
+                        && listen.function == "signal"
+                        && listen.deadline.is_some()
+                })
+        });
+        assert_eq!(descriptor.run_id, run_id);
+        let entry = hub().ensure_entry(&parts, &name).unwrap();
+        let store = RunStoreFactory::shared(&run_base).store_for(&run_id);
+        AlarmInboxFixture {
+            parts,
+            name,
+            run_id,
+            entry,
+            store,
+            effects,
+        }
+    }
+
+    fn expire_alarm_listen(fixture: &AlarmInboxFixture) -> (ListenState, DateTime<Utc>) {
+        let mut state = fixture.entry.state.lock().unwrap();
+        let listen = state
+            .descriptor
+            .listen
+            .as_mut()
+            .expect("alarm fixture must retain its listen while hibernating");
+        listen.deadline = Some(Utc::now() - chrono::Duration::seconds(1));
+        let expected_listen = listen.clone();
+        state.descriptor.updated_at = Utc::now();
+        let updated_at = state.descriptor.updated_at;
+        let descriptor = state.descriptor.clone();
+        drop(state);
+        persist_descriptor(&fixture.entry.factory(), &descriptor);
+        (expected_listen, updated_at)
+    }
+
+    fn wait_for_alarm_worker_exit(fixture: &AlarmInboxFixture) -> (AgentDescriptor, bool, bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut state = fixture.entry.state.lock().unwrap();
+        loop {
+            if !state.thread_live && !state.execution_active {
+                return (
+                    state.descriptor.clone(),
+                    state.thread_live,
+                    state.execution_active,
+                );
+            }
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for {} supervisor exit: descriptor={:?}, execution_active={}, thread_live={}",
+                fixture.name,
+                state.descriptor,
+                state.execution_active,
+                state.thread_live,
+            );
+            let (next, _) = fixture
+                .entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+        }
+    }
+
+    fn journal_value(store: &dyn RunStore) -> Value {
+        serde_json::to_value(store.load_call_log().unwrap().unwrap_or_default()).unwrap()
+    }
+
+    fn run_corrupt_alarm_wake_case(base: &Path, read_error: bool) -> Vec<String> {
+        let case = if read_error {
+            "read-error"
+        } else {
+            "malformed"
+        };
+        let fixture = new_alarm_inbox_fixture(base, case);
+        let (barrier_reached, release_barrier) = install_alarm_inbox_read_barrier(&fixture.name);
+        let (listen, before_updated_at) = expire_alarm_listen(&fixture);
+        let expected_listen = serde_json::to_value(&listen).unwrap();
+        let journal_before = journal_value(fixture.store.as_ref());
+        let promises_before = load_host_promise_records(fixture.store.as_ref()).unwrap();
+        let pending_before = fixture
+            .store
+            .get_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE)
+            .unwrap();
+        let pending_alarm = promises_before.iter().any(|promise| {
+            promise.operation.seq == listen.seq
+                && matches!(promise.state, HostPromiseState::Pending)
+        });
+        hub()
+            .start_thread(fixture.entry.clone())
+            .expect("start explicit expired-alarm wake");
+        let reached = barrier_reached
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok();
+        let wake_started_at = Utc::now();
+        let lease_before = fixture
+            .store
+            .get_blob(crate::runtime::store::LEASE_FILE)
+            .unwrap();
+        let lease_before_value = lease_before
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+        let lease_acquired_by_supervisor = lease_before_value.as_ref().is_some_and(|lease| {
+            lease["owner"] == json!(process_lease_owner())
+                && lease["expires_at"]
+                    .as_str()
+                    .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+                    .is_some_and(|expires_at| expires_at > Utc::now())
+        });
+        let inbox_path = fixture
+            .parts
+            .run_base
+            .join(&fixture.run_id)
+            .join(SIGNAL_INBOX_FILE);
+        let corrupt_bytes = b"{malformed detached alarm inbox";
+        if read_error {
+            if inbox_path.exists() {
+                std::fs::remove_file(&inbox_path).unwrap();
+            }
+            std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+            std::fs::create_dir(&inbox_path).unwrap();
+        } else {
+            fixture
+                .store
+                .put_blob(SIGNAL_INBOX_FILE, corrupt_bytes)
+                .unwrap();
+        }
+        release_barrier
+            .send(())
+            .expect("release alarm supervisor after corrupt inbox is persisted");
+        clear_alarm_inbox_read_barrier();
+        let (descriptor_after, thread_live_after, execution_active_after) =
+            wait_for_alarm_worker_exit(&fixture);
+        let descriptor_value = serde_json::to_value(&descriptor_after).unwrap();
+        let run_descriptor_after = fixture
+            .store
+            .get_blob(AGENT_DESCRIPTOR_FILE)
+            .unwrap()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let registry_descriptor_after = fixture
+            .entry
+            .factory()
+            .registry_get(&fixture.name)
+            .unwrap()
+            .and_then(|record| record.get("descriptor").cloned());
+        let journal_after = journal_value(fixture.store.as_ref());
+        let promises_after = load_host_promise_records(fixture.store.as_ref()).unwrap();
+        let promises_after_value = serde_json::to_value(&promises_after).unwrap();
+        let pending_after = fixture
+            .store
+            .get_blob(crate::runtime::snapshot::PENDING_HOST_OPERATION_FILE)
+            .unwrap();
+        let inbox_after = if read_error {
+            None
+        } else {
+            fixture.store.get_blob(SIGNAL_INBOX_FILE).unwrap()
+        };
+        let read_error_still_present =
+            read_error && inbox_path.is_dir() && fixture.store.get_blob(SIGNAL_INBOX_FILE).is_err();
+        let lease_after = fixture
+            .store
+            .get_blob(crate::runtime::store::LEASE_FILE)
+            .unwrap();
+        let lease_released = match (lease_before_value.as_ref(), lease_after.as_deref()) {
+            (Some(before), Some(after_bytes)) => {
+                let after: Value = serde_json::from_slice(after_bytes).unwrap();
+                after["owner"] == before["owner"]
+                    && after["generation"] == before["generation"]
+                    && after["expires_at"]
+                        .as_str()
+                        .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+                        .is_some_and(|expires_at| expires_at <= Utc::now())
+            }
+            (_, None) => true,
+            _ => false,
+        };
+        let mut failures = Vec::new();
+        if !reached {
+            failures.push("supervisor did not reach the post-lease/pre-inbox barrier".to_string());
+        }
+        if !lease_acquired_by_supervisor {
+            failures.push(format!(
+                "barrier did not observe this supervisor's live lease: {lease_before_value:?}"
+            ));
+        }
+        if !pending_alarm {
+            failures.push(format!(
+                "alarm promise at seq {} was not Pending before wake: {promises_before:?}",
+                listen.seq
+            ));
+        }
+        if fixture.effects.load(Ordering::SeqCst) != 0 {
+            failures.push(format!(
+                "corrupt inbox allowed an agent effect before repair: effects={}",
+                fixture.effects.load(Ordering::SeqCst)
+            ));
+        }
+        if descriptor_after.status != "running"
+            || descriptor_after
+                .listen
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .unwrap()
+                .as_ref()
+                != Some(&expected_listen)
+        {
+            failures.push(format!("expected nonterminal driverless running descriptor with exact listen; got {descriptor_value}"));
+        }
+        if descriptor_after.updated_at <= wake_started_at
+            || descriptor_after.updated_at <= before_updated_at
+        {
+            failures.push(format!("deferred descriptor did not refresh updated_at: before={before_updated_at}, wake={wake_started_at}, after={}", descriptor_after.updated_at));
+        }
+        if thread_live_after || execution_active_after {
+            failures.push(format!("supervisor did not stand down after inbox error: thread_live={thread_live_after}, execution_active={execution_active_after}"));
+        }
+        if journal_after != journal_before {
+            failures.push(format!("corrupt inbox changed journal or synthesized timeout: before={journal_before}, after={journal_after}"));
+        }
+        if promises_after_value != serde_json::to_value(&promises_before).unwrap() {
+            failures.push(format!("corrupt inbox resolved or changed Pending promise: before={promises_before:?}, after={promises_after:?}"));
+        }
+        if pending_after != pending_before {
+            failures.push(format!("corrupt inbox changed pending host operation: before={pending_before:?}, after={pending_after:?}"));
+        }
+        if read_error && !read_error_still_present {
+            failures.push(format!(
+                "read-error inbox was not preserved as an unreadable directory: path={}, read_result={:?}",
+                inbox_path.display(),
+                fixture.store.get_blob(SIGNAL_INBOX_FILE)
+            ));
+        } else if !read_error && inbox_after.as_deref() != Some(corrupt_bytes.as_slice()) {
+            failures.push(format!(
+                "corrupt inbox bytes were rewritten: {inbox_after:?}"
+            ));
+        }
+        if !lease_released {
+            failures.push(format!("the supervisor's exact lease was not released: before={lease_before_value:?}, after={lease_after:?}"));
+        }
+        for (label, descriptor) in [
+            ("run descriptor", run_descriptor_after),
+            ("registry descriptor", registry_descriptor_after),
+        ] {
+            let valid = descriptor.as_ref().is_some_and(|value| {
+                value["status"] == json!("running")
+                    && value["listen"] == expected_listen
+                    && value["updated_at"].as_str().is_some_and(|updated_at| {
+                        updated_at
+                            .parse::<DateTime<Utc>>()
+                            .is_ok_and(|updated_at| updated_at > wake_started_at)
+                    })
+            });
+            if !valid {
+                failures.push(format!(
+                    "{label} did not persist retryable driverless state: {descriptor:?}"
+                ));
+            }
+        }
+
+        if read_error {
+            std::fs::remove_dir(&inbox_path).unwrap();
+        }
+        fixture.store.put_blob(SIGNAL_INBOX_FILE, b"[]").unwrap();
+        if descriptor_after.status == "running" && !thread_live_after {
+            let rearmed = hub().rearm_from_registry(fixture.parts.clone());
+            if rearmed.is_err() {
+                failures.push(format!(
+                    "explicit re-drive after inbox repair failed: {rearmed:?}"
+                ));
+            } else {
+                let completed =
+                    wait_for_agent_descriptor(&fixture.parts, &fixture.name, |descriptor| {
+                        matches!(
+                            descriptor.status.as_str(),
+                            "completed" | "failed" | "stopped"
+                        )
+                    });
+                if completed.status != "completed" || fixture.effects.load(Ordering::SeqCst) != 1 {
+                    failures.push(format!("repaired explicit re-drive did not execute exactly once: descriptor={completed:?}, effects={}", fixture.effects.load(Ordering::SeqCst)));
+                }
+            }
+        } else {
+            failures.push(format!(
+                "corrupt inbox wake was not retryable after repair; state was {}",
+                descriptor_after.status
+            ));
+        }
+        hub().entries.lock().unwrap().remove(&fixture.name);
+        failures
+    }
+
+    fn run_valid_alarm_control(base: &Path, case: &str, matching: bool) -> Vec<String> {
+        let fixture = new_alarm_inbox_fixture(base, case);
+        let (barrier_reached, release_barrier) = install_alarm_inbox_read_barrier(&fixture.name);
+        let (listen, _) = expire_alarm_listen(&fixture);
+        hub()
+            .start_thread(fixture.entry.clone())
+            .expect("start valid alarm control");
+        let reached = barrier_reached
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok();
+        if matching {
+            let queued = QueuedSignal {
+                name: ALARM_SIGNAL_NAME.to_string(),
+                payload: json!({ "control": case }),
+                from: json!({ "kind": "test", "id": case }),
+                delivery_seq: 1,
+                enqueued_at: Utc::now(),
+            };
+            fixture
+                .store
+                .put_blob(
+                    SIGNAL_INBOX_FILE,
+                    &serde_json::to_vec(&vec![queued]).unwrap(),
+                )
+                .unwrap();
+        } else {
+            fixture.store.put_blob(SIGNAL_INBOX_FILE, b"[]").unwrap();
+        }
+        release_barrier
+            .send(())
+            .expect("release valid alarm control after inbox setup");
+        clear_alarm_inbox_read_barrier();
+        let completed = wait_for_agent_descriptor(&fixture.parts, &fixture.name, |descriptor| {
+            matches!(
+                descriptor.status.as_str(),
+                "completed" | "failed" | "stopped"
+            )
+        });
+        let records = fixture.store.load_call_log().unwrap().unwrap_or_default();
+        let alarm_rows: Vec<_> = records
+            .iter()
+            .filter(|record| record.seq == listen.seq && record.function == "signal")
+            .collect();
+        let inbox_after = fixture.store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+        let mut failures = Vec::new();
+        if !reached {
+            failures.push(format!(
+                "{case} control did not reach post-lease/pre-inbox barrier"
+            ));
+        }
+        if completed.status != "completed" {
+            failures.push(format!("{case} control did not complete: {completed:?}"));
+        }
+        if fixture.effects.load(Ordering::SeqCst) != 1 {
+            failures.push(format!(
+                "{case} control expected one effect, observed {}",
+                fixture.effects.load(Ordering::SeqCst)
+            ));
+        }
+        if alarm_rows.len() != 1 {
+            failures.push(format!(
+                "{case} control expected exactly one alarm journal record, got {alarm_rows:?}"
+            ));
+        } else if matching {
+            if alarm_rows[0].result["timedOut"] == json!(true) {
+                failures.push(format!(
+                    "matching inbox control synthesized timeout: {:?}",
+                    alarm_rows[0]
+                ));
+            }
+            if inbox_after.as_deref() != Some(b"[]".as_slice()) {
+                failures.push(format!(
+                    "matching alarm inbox was not consumed: {inbox_after:?}"
+                ));
+            }
+        } else if alarm_rows[0].result["timedOut"] != json!(true) {
+            failures.push(format!(
+                "valid-empty expired control did not journal timeout: {:?}",
+                alarm_rows[0]
+            ));
+        }
+        hub().entries.lock().unwrap().remove(&fixture.name);
+        failures
+    }
+
+    #[test]
+    fn detached_alarm_wake_fails_closed_on_corrupt_inbox() {
+        const CHILD: &str = "CHIDORI_TEST_DETACHED_CORRUPT_ALARM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut failures = Vec::new();
+            for (backend, fault) in [
+                ("fs", "malformed"),
+                ("sqlite", "malformed"),
+                ("fs", "read-error"),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("runtime::host_agent::tests::detached_alarm_wake_fails_closed_on_corrupt_inbox")
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_BASE", temp.path())
+                    .env("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_FAULT", fault)
+                    .env("CHIDORI_RUN_STORE", backend)
+                    .env("CHIDORI_RUN_DB", temp.path().join("runs.sqlite3"))
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "backend={backend}, fault={fault}, exit={:?}\nstdout:\n{}\nstderr:\n{}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "detached corrupt alarm Red failed on base:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let base = PathBuf::from(
+            std::env::var_os("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_BASE")
+                .expect("child fixture base is required"),
+        );
+        let read_error = std::env::var("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_FAULT").as_deref()
+            == Ok("read-error");
+        let failures = run_corrupt_alarm_wake_case(&base, read_error);
+        assert!(
+            failures.is_empty(),
+            "detached corrupt alarm contract failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn detached_alarm_valid_expired_and_matching_inbox_controls() {
+        const CHILD: &str = "CHIDORI_TEST_DETACHED_ALARM_CONTROLS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut failures = Vec::new();
+            for backend in ["fs", "sqlite"] {
+                let temp = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("runtime::host_agent::tests::detached_alarm_valid_expired_and_matching_inbox_controls")
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_BASE", temp.path())
+                    .env("CHIDORI_RUN_STORE", backend)
+                    .env("CHIDORI_RUN_DB", temp.path().join("runs.sqlite3"))
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "backend={backend}, exit={:?}\nstdout:\n{}\nstderr:\n{}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "detached alarm controls failed:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let base = PathBuf::from(
+            std::env::var_os("CHIDORI_TEST_DETACHED_CORRUPT_ALARM_BASE")
+                .expect("child fixture base is required"),
+        );
+        let mut failures = run_valid_alarm_control(&base, "valid-empty", false);
+        failures.extend(run_valid_alarm_control(&base, "valid-matching", true));
+        assert!(
+            failures.is_empty(),
+            "detached alarm controls failed:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
