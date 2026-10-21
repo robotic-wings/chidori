@@ -2233,6 +2233,7 @@ async fn corrupt_inbox_execution_path_child_fixture() {
             | "approve_deny_bad"
             | "approve_allow_absent"
             | "warm_bad"
+            | "warm_gap"
             | "warm_absent"
             | "timeout_bad"
             | "timeout_absent"
@@ -2279,7 +2280,7 @@ async fn corrupt_inbox_execution_path_child_fixture() {
                 return {{ sent: true }};
             }}"#
         ),
-        "warm_bad" | "warm_absent" => format!(
+        "warm_bad" | "warm_gap" | "warm_absent" => format!(
             r#"export async function agent(input, chidori) {{
                 await chidori.input("continue?");
                 await fetch("{sentinel_url}", {{ method: "POST" }});
@@ -2309,8 +2310,10 @@ async fn corrupt_inbox_execution_path_child_fixture() {
         response_json(create_session(State(state.clone()), Json(request)).await).await;
     assert_eq!(created_status, StatusCode::CREATED, "{created}");
     match mode.as_str() {
-        "signal_bad" | "signal_absent" | "warm_bad" | "warm_absent" | "timeout_bad"
-        | "timeout_absent" => assert_eq!(created["status"], json!("paused"), "{created}"),
+        "signal_bad" | "signal_absent" | "warm_bad" | "warm_gap" | "warm_absent"
+        | "timeout_bad" | "timeout_absent" => {
+            assert_eq!(created["status"], json!("paused"), "{created}")
+        }
         _ => assert_eq!(created["status"], json!("awaitingapproval"), "{created}"),
     }
     let mut session_before = state.session_store.get(id).unwrap().unwrap();
@@ -2328,7 +2331,7 @@ async fn corrupt_inbox_execution_path_child_fixture() {
     } else {
         false
     };
-    let inbox_before = std::fs::read(&inbox_path).ok();
+    let mut inbox_before = std::fs::read(&inbox_path).ok();
     let journal_before = snapshot_journal_files(&run_dir);
     let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
     let pending_before = std::fs::read(&pending_path).unwrap_or_default();
@@ -2383,6 +2386,45 @@ async fn corrupt_inbox_execution_path_child_fixture() {
                 .await,
             )
             .await
+        }
+        "warm_gap" => {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *super::WARM_POST_RESPONSE_INBOX_TEST_GATE.lock().unwrap() =
+                Some((run_id.clone(), reached_tx, release_rx));
+            let resume_state = state.clone();
+            let resume_id = id.to_string();
+            let resume = tokio::spawn(async move {
+                response_json(
+                    resume_session(
+                        State(resume_state),
+                        Path(resume_id),
+                        Json(ResumeRequest {
+                            response: "continue".to_string(),
+                            allow_source_change: false,
+                        }),
+                    )
+                    .await,
+                )
+                .await
+            });
+            tokio::task::spawn_blocking(move || {
+                reached_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("warm VM reached post-response inbox reload barrier");
+            })
+            .await
+            .unwrap();
+            std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+            std::fs::write(&inbox_path, b"{broken after warm preflight").unwrap();
+            inbox_before = Some(std::fs::read(&inbox_path).unwrap());
+            release_tx
+                .send(())
+                .expect("warm inbox reload barrier remains connected");
+            tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+                .await
+                .expect("warm resume returned after inbox reload")
+                .expect("warm resume task completed")
         }
         "timeout_bad" | "timeout_absent" => {
             let mut expired = state.session_store.get(id).unwrap().unwrap();
@@ -2527,6 +2569,17 @@ fn approval_deny_control_does_not_dispatch_effect_with_malformed_inbox() {
 #[test]
 fn warm_resume_rejects_malformed_inbox_before_delivering_to_parked_vm() {
     let observed = run_corrupt_inbox_execution_child("warm_bad");
+    assert_corrupt_inbox_rejected_before_execution(&observed);
+    assert!(
+        observed.warm_parked_after,
+        "parked VM must remain undelivered: {observed:#?}"
+    );
+    assert_eq!(observed.final_status, "Paused", "{observed:#?}");
+}
+
+#[test]
+fn warm_resume_rejects_inbox_corrupted_after_preflight_before_reload() {
+    let observed = run_corrupt_inbox_execution_child("warm_gap");
     assert_corrupt_inbox_rejected_before_execution(&observed);
     assert!(
         observed.warm_parked_after,
@@ -4921,17 +4974,55 @@ fn signal_consumption_intent_reconciles_with_sqlite_mirror() {
 async fn sqlite_server_startup_recovers_signal_consumption_intent() {
     const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
     const CHILD_HOLD_LEASE: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_HOLD_LEASE";
+    const CHILD_CORRUPT_INBOX: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_CORRUPT_INBOX";
     const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let root = PathBuf::from(root);
         let hold_external_lease = std::env::var_os(CHILD_HOLD_LEASE).is_some();
+        let corrupt_inbox = std::env::var_os(CHILD_CORRUPT_INBOX).is_some();
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("CHIDORI_RUN_STORE", "sqlite");
         std::env::set_var("CHIDORI_RUN_DB", root.join("runs.sqlite3"));
         std::env::set_var("CHIDORI_DB_PATH", root.join("sessions.sqlite3"));
 
-        let agent_path = write_agent(
-            &root,
+        let startup_effect_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let startup_effect_server = if corrupt_inbox {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let effect_url = format!("http://{}/startup-effect", listener.local_addr().unwrap());
+            let count = startup_effect_count.clone();
+            let app = Router::new().route(
+                "/startup-effect",
+                axum::routing::post(move || {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            Some((effect_url, shutdown_tx, server))
+        } else {
+            None
+        };
+
+        let agent_source = if let Some((effect_url, _, _)) = startup_effect_server.as_ref() {
+            format!(
+                "export async function agent(input, chidori) {{\n\
+                const first = await chidori.signal(\"review\", {{ timeoutMs: 60000 }});\n\
+                await fetch(\"{effect_url}\", {{ method: \"POST\" }});\n\
+                return first.payload;\n\
+            }}"
+            )
+        } else {
             r#"
                 export async function agent(input, chidori) {
                     const first = await chidori.signal("review", { timeoutMs: 60000 });
@@ -4942,8 +5033,10 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
                         second: second.payload ?? null,
                     };
                 }
-            "#,
-        );
+            "#
+            .to_string()
+        };
+        let agent_path = write_agent(&root, &agent_source);
         let run_base = root.join(".chidori").join("runs");
         let run_id = "sqlite-startup-signal-recovery";
         let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
@@ -4988,6 +5081,16 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
         super::persist_signal_consumption_intent(&run_base, run_id, operation.seq, &queued)
             .unwrap();
 
+        if corrupt_inbox {
+            // The intent is valid, but the durable mailbox needed to finish
+            // reconciliation is damaged. Startup must skip this run without
+            // resolving its promise or aborting the whole server.
+            store
+                .put_blob(SIGNAL_INBOX_FILE, b"{truncated startup inbox")
+                .unwrap();
+            std::env::set_var("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+        }
+
         // Give the persisted deadline an expired value in the held-lease
         // variant. Arming it before recovery would overwrite the accepted
         // signal's Pending promise with the timeout sentinel.
@@ -5020,7 +5123,7 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
                 pending_details: None,
                 pending_signal_name: Some("review".to_string()),
                 pending_signal_names: vec!["review".to_string()],
-                pending_signal_deadline: Some(if hold_external_lease {
+                pending_signal_deadline: Some(if hold_external_lease || corrupt_inbox {
                     chrono::Utc::now() - chrono::Duration::milliseconds(100)
                 } else {
                     chrono::Utc::now() + chrono::Duration::seconds(60)
@@ -5039,6 +5142,136 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
         } else {
             None
         };
+
+        if corrupt_inbox {
+            let run_dir = run_base.join(run_id);
+            let intent_path = run_dir.join("signals/consumption-intent.json");
+            let inbox_path = run_dir.join(SIGNAL_INBOX_FILE);
+            let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
+            let promise_path = run_dir.join(HOST_PROMISE_TABLE_FILE);
+            let before_session = session_store
+                .get("sqlite-startup-signal-session")
+                .unwrap()
+                .expect("paused startup session persisted");
+            assert!(
+                before_session
+                    .pending_signal_deadline
+                    .is_some_and(|deadline| deadline < chrono::Utc::now()),
+                "fixture must start with an expired timeout"
+            );
+            let before_intent = std::fs::read(&intent_path).unwrap();
+            let before_inbox = std::fs::read(&inbox_path).unwrap();
+            let before_pending = std::fs::read(&pending_path).unwrap();
+            let before_promises = std::fs::read(&promise_path).unwrap();
+            let before_journal =
+                serde_json::to_vec(&store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+
+            // Bind on a dynamically selected local port. Dropping this
+            // reservation immediately before serve avoids fixed-port
+            // collisions while keeping the public /health surface in play.
+            let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let server = tokio::spawn(serve(
+                Arc::new(ProviderRegistry::new()),
+                Arc::new(TemplateEngine::new(root.to_string_lossy().into_owned())),
+                Some(agent_path),
+                "127.0.0.1".to_string(),
+                port,
+                PolicyConfig::from_env(),
+                "test".to_string(),
+                None,
+            ));
+            let health_ok = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if server.is_finished() {
+                        return false;
+                    }
+                    if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        if stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.is_ok() {
+                            let mut response = Vec::new();
+                            if stream.read_to_end(&mut response).await.is_ok()
+                                && response.starts_with(b"HTTP/1.1 200")
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or(false);
+
+            let after_session = session_store
+                .get("sqlite-startup-signal-session")
+                .unwrap()
+                .expect("startup session remains present");
+            let after_intent = std::fs::read(&intent_path).unwrap_or_default();
+            let after_inbox = std::fs::read(&inbox_path).unwrap_or_default();
+            let after_pending = std::fs::read(&pending_path).unwrap_or_default();
+            let after_promises = std::fs::read(&promise_path).unwrap_or_default();
+            let after_journal =
+                serde_json::to_vec(&store.load_call_log().unwrap().unwrap_or_default()).unwrap();
+            let effect_count = startup_effect_count.load(Ordering::SeqCst);
+            let before_session_bytes = serde_json::to_vec(&before_session).unwrap();
+            let after_session_bytes = serde_json::to_vec(&after_session).unwrap();
+            let server_outcome = if server.is_finished() {
+                match server.await {
+                    Ok(Ok(())) => "serve returned successfully before health".to_string(),
+                    Ok(Err(error)) => format!("serve returned error: {error:#}"),
+                    Err(error) => format!("serve task failed: {error}"),
+                }
+            } else {
+                server.abort();
+                let _ = server.await;
+                "serve remained available until cleanup".to_string()
+            };
+            let failure = format!(
+                "startup corrupt-inbox contract failed: health_ok={health_ok}, {server_outcome}, session={:?}, session_same={}, intent_same={}, inbox_same={}, pending_same={}, promises_same={}, journal_same={}, effects={effect_count}",
+                after_session.status,
+                before_session_bytes == after_session_bytes,
+                before_intent == after_intent,
+                before_inbox == after_inbox,
+                before_pending == after_pending,
+                before_promises == after_promises,
+                before_journal == after_journal,
+            );
+            if let Some((_, shutdown_tx, sentinel_server)) = startup_effect_server {
+                let _ = shutdown_tx.send(());
+                sentinel_server.await.unwrap();
+            }
+            let mut failures = Vec::new();
+            if !health_ok {
+                failures.push("/health was not served".to_string());
+            }
+            if after_session.status != SessionStatus::Paused
+                || before_session_bytes != after_session_bytes
+            {
+                failures.push("paused session changed".to_string());
+            }
+            if before_intent != after_intent {
+                failures.push("consumption intent changed".to_string());
+            }
+            if before_inbox != after_inbox {
+                failures.push("malformed inbox bytes changed".to_string());
+            }
+            if before_pending != after_pending {
+                failures.push("pending host operation changed".to_string());
+            }
+            if before_promises != after_promises {
+                failures.push("Pending host promise changed".to_string());
+            }
+            if before_journal != after_journal {
+                failures.push("journal changed".to_string());
+            }
+            if effect_count != 0 {
+                failures.push(format!("continuation effect ran {effect_count} times"));
+            }
+            assert!(failures.is_empty(), "{}; {failure}", failures.join("; "));
+            return;
+        }
 
         let server = tokio::spawn(serve(
             Arc::new(ProviderRegistry::new()),
@@ -5161,6 +5394,26 @@ async fn sqlite_server_startup_recovers_signal_consumption_intent() {
     assert!(
         child.status.success(),
         "SQLite-configured serve startup recovery failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sqlite_server_startup_skips_only_corrupt_signal_intent_run() {
+    const CHILD_ROOT: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_ROOT";
+    const CHILD_CORRUPT_INBOX: &str = "CHIDORI_TEST_SQLITE_STARTUP_SIGNAL_RECOVERY_CORRUPT_INBOX";
+    const TEST: &str = "server::tests::sqlite_server_startup_recovers_signal_consumption_intent";
+    let temp = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ROOT, temp.path())
+        .env(CHILD_CORRUPT_INBOX, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "SQLite startup must serve health and skip only the corrupt run while preserving its state:\n{}{}",
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr)
     );
