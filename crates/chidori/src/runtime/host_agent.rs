@@ -4141,7 +4141,7 @@ mod tests {
         let mut red_failures = Vec::new();
         for backend in ["fs", "sqlite"] {
             let temporary = tempfile::tempdir().unwrap();
-            let root = temporary.keep();
+            let root = temporary.path().to_path_buf();
             let name = format!("registry-truncation-{backend}");
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
@@ -4243,7 +4243,7 @@ mod tests {
             }
 
             let control_temp = tempfile::tempdir().unwrap();
-            let control_root = control_temp.keep();
+            let control_root = control_temp.path().to_path_buf();
             let control_spawn =
                 registry_truncation_child(TEST, "control-spawn", &control_root, backend);
             assert!(
