@@ -1254,6 +1254,35 @@ pub async fn serve(
     policy_posture: String,
     app_manifest: Option<crate::app_manifest::AppManifest>,
 ) -> anyhow::Result<()> {
+    serve_with_rearm_failure_reporter(
+        providers,
+        template_engine,
+        agent_path,
+        host,
+        port,
+        policy,
+        policy_posture,
+        app_manifest,
+        None,
+    )
+    .await
+}
+
+/// Serve with an optional caller-owned reporter for detached rearm failures.
+/// The server always emits a structured tracing warning; this callback lets
+/// the CLI present the same startup failure to users without writing directly
+/// to an embedding application's stderr.
+pub(crate) async fn serve_with_rearm_failure_reporter(
+    providers: Arc<ProviderRegistry>,
+    template_engine: Arc<TemplateEngine>,
+    agent_path: Option<PathBuf>,
+    host: String,
+    port: u16,
+    policy: Arc<PolicyConfig>,
+    policy_posture: String,
+    app_manifest: Option<crate::app_manifest::AppManifest>,
+    rearm_failure_reporter: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+) -> anyhow::Result<()> {
     // No agent file → a fleet-only server: it re-arms and drives the
     // detached-agent fleet under the current directory, and every session
     // request must name its agent explicitly. The sentinel path keeps the
@@ -1496,7 +1525,12 @@ pub async fn serve(
                 eprintln!("  Re-armed {count} detached agent(s) from the registry");
             }
             Ok(_) => {}
-            Err(err) => tracing::warn!("re-arming detached agents: {err}"),
+            Err(err) => {
+                tracing::warn!(error = %err, "re-arming detached agents failed");
+                if let Some(report) = &rearm_failure_reporter {
+                    report(&err);
+                }
+            }
         }
     }
 

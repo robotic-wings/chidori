@@ -4813,7 +4813,14 @@ fn cmd_serve(
 
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = scheduler::new_tokio_runtime().context("Failed to create server runtime")?;
-    tokio_rt.block_on(server::serve(
+    let rearm_failure_reporter: Option<Arc<dyn Fn(&str) + Send + Sync>> = if verbose {
+        None
+    } else {
+        Some(Arc::new(|err| {
+            eprintln!("Warning: re-arming detached agents: {err}");
+        }))
+    };
+    tokio_rt.block_on(server::serve_with_rearm_failure_reporter(
         providers,
         template_engine,
         file.map(|f| f.to_path_buf()),
@@ -4822,6 +4829,7 @@ fn cmd_serve(
         policy,
         policy_posture,
         app_manifest,
+        rearm_failure_reporter,
     ))?;
 
     Ok(())
