@@ -3872,6 +3872,12 @@ mod tests {
                 let inbox_before =
                     seed_settled_predecessor(&factory, &name, &predecessor_id, "must-survive");
                 std::fs::write(root.join("predecessor-inbox-before.json"), &inbox_before).unwrap();
+                let registry_path = run_base.join("agents").join(format!("{name}.json"));
+                std::fs::write(
+                    root.join("predecessor-registry-before.json"),
+                    std::fs::read(&registry_path).unwrap(),
+                )
+                .unwrap();
                 std::fs::write(
                     root.join("seed.json"),
                     serde_json::to_vec_pretty(&json!({
@@ -4023,6 +4029,46 @@ mod tests {
                 );
                 assert!(replacement_inbox.is_empty() || replacement_inbox == b"[]");
                 return;
+            }
+            Ok("post-rename") => {
+                let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
+                let project = root.join("project");
+                std::fs::create_dir_all(&project).unwrap();
+                let source = migration_source(&project);
+                let run_base = project.join(".chidori/runs");
+                let name = "registry-post-rename-sqlite";
+                let factory = RunStoreFactory::shared(&run_base);
+                let predecessor_id = format!("old-{}", uuid::Uuid::new_v4());
+                seed_settled_predecessor(&factory, name, &predecessor_id, "must-survive");
+                std::fs::write(
+                    root.join("post-rename-seed.json"),
+                    serde_json::to_vec_pretty(&json!({
+                        "name": name,
+                        "predecessor_run_id": predecessor_id
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let parts = sqlite_test_parts(
+                    &project,
+                    run_base,
+                    migration_counting_tools(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                );
+                let options = SpawnOptions {
+                    name: Some(name.to_string()),
+                    restart: "never".into(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                };
+                let result = hub().spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &options,
+                    "registry-post-rename-parent".into(),
+                );
+                panic!("spawn returned before post-rename process kill: {result:?}");
             }
             Ok("control-spawn") => {
                 let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
@@ -4200,12 +4246,26 @@ mod tests {
                 }
             };
             let gate_info: Value = serde_json::from_str(&gate_line).unwrap();
-            child.kill().expect(
-                "terminate child after target truncation/prefix write and before mirror commit",
-            );
+            assert_eq!(gate_info["phase"], "before_rename");
+            child
+                .kill()
+                .expect("terminate child after staging prefix flush and before registry rename");
             let child_output = child.wait_with_output().unwrap();
             assert!(!child_output.status.success());
-            let prefix_bytes = std::fs::read(gate_info["registry_path"].as_str().unwrap()).unwrap();
+            let canonical_path = PathBuf::from(gate_info["registry_path"].as_str().unwrap());
+            let canonical_bytes = std::fs::read(&canonical_path).unwrap();
+            let previous_bytes =
+                std::fs::read(root.join("predecessor-registry-before.json")).unwrap();
+            assert_eq!(canonical_bytes, previous_bytes);
+            let previous_entry: Value = serde_json::from_slice(&canonical_bytes).unwrap();
+            let seed: Value =
+                serde_json::from_slice(&std::fs::read(root.join("seed.json")).unwrap()).unwrap();
+            assert_eq!(
+                previous_entry["run_id"], seed["predecessor_run_id"],
+                "canonical registry remains the complete predecessor entry before commit"
+            );
+            let staged_path = PathBuf::from(gate_info["staged_path"].as_str().unwrap());
+            let prefix_bytes = std::fs::read(staged_path).unwrap();
             assert_eq!(
                 prefix_bytes.len(),
                 gate_info["prefix_len"].as_u64().unwrap() as usize
@@ -4274,6 +4334,88 @@ mod tests {
                 serde_json::to_string(&control_rearm_report).unwrap()
             );
         }
+
+        let post_rename_temp = tempfile::tempdir().unwrap();
+        let post_rename_root = post_rename_temp.path().to_path_buf();
+        let post_rename_name = "registry-post-rename-sqlite";
+        let mut post_rename_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(REGISTRY_TRUNCATION_MODE_ENV, "post-rename")
+            .env(REGISTRY_TRUNCATION_ROOT_ENV, &post_rename_root)
+            .env("CHIDORI_TEST_REGISTRY_POST_RENAME_NAME", post_rename_name)
+            .env("CHIDORI_RUN_STORE", "sqlite")
+            .env("CHIDORI_RUN_DB", post_rename_root.join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut post_rename_stdout = post_rename_child.stdout.take().unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(&mut post_rename_stdout);
+            loop {
+                let mut line = String::new();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) => {
+                        let _ = gate_tx.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "child exited before post-rename gate line",
+                        )));
+                        return;
+                    }
+                    Ok(_) => {
+                        if serde_json::from_str::<Value>(&line)
+                            .ok()
+                            .is_some_and(|value| value["phase"] == "after_rename_before_mirror")
+                        {
+                            let _ = gate_tx.send(Ok(line));
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = gate_tx.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        });
+        let post_rename_gate = gate_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("post-rename gate arrives before timeout")
+            .expect("post-rename child reports its gate");
+        let post_rename_info: Value = serde_json::from_str(&post_rename_gate).unwrap();
+        post_rename_child
+            .kill()
+            .expect("terminate after local rename and before SQLite registry write");
+        let post_rename_output = post_rename_child.wait_with_output().unwrap();
+        assert!(!post_rename_output.status.success());
+        let local_registry: Value = serde_json::from_slice(
+            &std::fs::read(post_rename_info["registry_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let seed: Value = serde_json::from_slice(
+            &std::fs::read(post_rename_root.join("post-rename-seed.json")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(local_registry["run_id"], seed["predecessor_run_id"]);
+        assert_eq!(local_registry["descriptor"]["status"], "running");
+        let connection = rusqlite::Connection::open(post_rename_root.join("runs.sqlite3")).unwrap();
+        let mirrored_json: String = connection
+            .query_row(
+                "SELECT data FROM run_registry WHERE name = ?1",
+                rusqlite::params![post_rename_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mirrored_registry: Value = serde_json::from_str(&mirrored_json).unwrap();
+        assert_eq!(mirrored_registry["run_id"], seed["predecessor_run_id"]);
+        eprintln!(
+            "REGISTRY_POST_RENAME_SQLITE_BOUNDARY={} local_run_id={} mirror_run_id={}",
+            post_rename_root.display(),
+            local_registry["run_id"],
+            mirrored_registry["run_id"]
+        );
         assert!(
             red_failures.is_empty(),
             "registry truncation recovery Red failures (expected on vulnerable main): {red_failures:#?}"

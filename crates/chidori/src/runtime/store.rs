@@ -2843,6 +2843,103 @@ pub struct RunStoreFactory {
     initialization_error: Option<String>,
 }
 
+fn write_registry_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    name: &str,
+    run_id: &str,
+    pause_before_rename: bool,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = (name, run_id, pause_before_rename);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("registry path {} has no file name", path.display()))?;
+    let staged = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .with_context(|| format!("creating staged registry file {}", staged.display()))?;
+
+        #[cfg(test)]
+        if pause_before_rename {
+            let prefix_len = bytes.len().min(19);
+            file.write_all(&bytes[..prefix_len]).with_context(|| {
+                format!("writing staged registry prefix to {}", staged.display())
+            })?;
+            file.flush()
+                .with_context(|| format!("flushing staged registry prefix {}", staged.display()))?;
+            pause_registry_publication_for_test(
+                name,
+                run_id,
+                path,
+                Some(&staged),
+                "before_rename",
+                prefix_len,
+                bytes.len(),
+            )?;
+        }
+
+        file.write_all(bytes)
+            .with_context(|| format!("writing staged registry file {}", staged.display()))?;
+        file.flush()
+            .with_context(|| format!("flushing staged registry file {}", staged.display()))?;
+        drop(file);
+        std::fs::rename(&staged, path)
+            .with_context(|| format!("renaming staged registry {} into place", staged.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
+#[cfg(test)]
+fn pause_registry_publication_for_test(
+    name: &str,
+    run_id: &str,
+    path: &Path,
+    staged: Option<&Path>,
+    phase: &str,
+    prefix_len: usize,
+    serialized_len: usize,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(
+        &mut stdout,
+        &serde_json::json!({
+            "name": name,
+            "run_id": run_id,
+            "registry_path": path.display().to_string(),
+            "staged_path": staged.map(|path| path.display().to_string()),
+            "phase": phase,
+            "prefix_len": prefix_len,
+            "serialized_len": serialized_len,
+        }),
+    )?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    loop {
+        std::thread::park();
+    }
+}
+
 impl RunStoreFactory {
     #[allow(dead_code)] // Not yet wired into a call path; staged API.
     pub fn fs(run_base: impl Into<PathBuf>) -> Self {
@@ -3074,48 +3171,28 @@ impl RunStoreFactory {
         });
         let bytes = serde_json::to_vec_pretty(&entry)?;
         let path = self.registry_path(name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         #[cfg(test)]
-        if std::env::var("CHIDORI_TEST_REGISTRY_PREFIX_NAME").as_deref() == Ok(name)
+        let pause_before_rename = {
+            std::env::var("CHIDORI_TEST_REGISTRY_PREFIX_NAME").as_deref() == Ok(name)
+                && descriptor.get("status").and_then(serde_json::Value::as_str) == Some("running")
+        };
+        #[cfg(not(test))]
+        let pause_before_rename = false;
+        write_registry_file_atomic(&path, &bytes, name, run_id, pause_before_rename)?;
+        #[cfg(test)]
+        if std::env::var("CHIDORI_TEST_REGISTRY_POST_RENAME_NAME").as_deref() == Ok(name)
             && descriptor.get("status").and_then(serde_json::Value::as_str) == Some("running")
         {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&path)
-                .with_context(|| {
-                    format!(
-                        "opening {} for injected registry prefix write",
-                        path.display()
-                    )
-                })?;
-            let prefix_len = bytes.len().min(19);
-            file.write_all(&bytes[..prefix_len])
-                .with_context(|| format!("writing registry prefix to {}", path.display()))?;
-            file.flush()?;
-            drop(file);
-            let mut stdout = std::io::stdout().lock();
-            serde_json::to_writer(
-                &mut stdout,
-                &serde_json::json!({
-                    "name": name,
-                    "run_id": run_id,
-                    "registry_path": path.display().to_string(),
-                    "prefix_len": prefix_len,
-                    "serialized_len": bytes.len(),
-                }),
+            pause_registry_publication_for_test(
+                name,
+                run_id,
+                &path,
+                None,
+                "after_rename_before_mirror",
+                bytes.len(),
+                bytes.len(),
             )?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-            loop {
-                std::thread::park();
-            }
         }
-        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
         match &self.backend {
             RunStoreBackend::Fs => {}
             RunStoreBackend::Sqlite(shared) => {
