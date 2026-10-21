@@ -3377,6 +3377,29 @@ impl RunStoreFactory {
         }
         Ok(self.run_base.join("agents").join(format!("{name}.json")))
     }
+
+    /// Stable local sidecar used to serialize detached-agent name admission.
+    /// The lock file is intentionally persistent and is not a `.json` registry
+    /// entry. Lowercasing the validated ASCII filename also makes case aliases
+    /// contend on case-insensitive local filesystems.
+    pub(crate) fn registry_name_lock_path(&self, name: &str) -> Result<PathBuf> {
+        let registry = self.registry_path(name)?;
+        let parent = registry
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("registry path {} has no parent", registry.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating registry directory {}", parent.display()))?;
+        let parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("resolving registry directory {}", parent.display()))?;
+        let file_name = registry
+            .file_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!("registry path {} has no file name", registry.display())
+            })?
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        Ok(parent.join(format!(".{file_name}.spawn.lock")))
+    }
 }
 
 // ---------------------------------------------------------------------------
