@@ -178,6 +178,339 @@ async fn response_json(response: Response) -> (StatusCode, Value) {
     (status, value)
 }
 
+const SERVE_BIND_REARM_CASE: &str = "CHIDORI_TEST_SERVE_BIND_REARM_CASE";
+const SERVE_BIND_REARM_ROOT: &str = "CHIDORI_TEST_SERVE_BIND_REARM_ROOT";
+
+struct BindRearmCounter {
+    addr: std::net::SocketAddr,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl BindRearmCounter {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = count.clone();
+        let app = Router::new().route(
+            "/effect",
+            axum::routing::post(move || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            addr,
+            count,
+            server,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for BindRearmCounter {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+fn seed_running_detached_for_bind_test(
+    root: &FsPath,
+    receiver: std::net::SocketAddr,
+) -> (PathBuf, String) {
+    use crate::runtime::store::RunStoreFactory;
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let source_path = project.join("agent.ts");
+    std::fs::write(
+        &source_path,
+        format!(
+            "export async function agent() {{ await fetch('http://{receiver}/effect', {{ method: 'POST' }}); return {{ok:true}}; }}\n"
+        ),
+    )
+    .unwrap();
+    let run_base = project.join(".chidori/runs");
+    let run_id = format!("bind-rearm-{}", uuid::Uuid::new_v4());
+    let factory = RunStoreFactory::shared(&run_base);
+    let store = factory.store_for(&run_id);
+    store.write_call_log(&[]).unwrap();
+    store.put_blob(SIGNAL_INBOX_FILE, b"[]").unwrap();
+    let now = chrono::Utc::now();
+    let descriptor = json!({
+        "name": "bind-sentinel-agent",
+        "run_id": run_id,
+        "source": source_path,
+        "input": {},
+        "restart": "never",
+        "max_restarts": 0,
+        "backoff_ms": 0,
+        "owner_run_id": "bind-before-rearm-test",
+        "model": null,
+        "status": "running",
+        "listen": null,
+        "restarts": 0,
+        "output": null,
+        "error": null,
+        "created_at": now,
+        "updated_at": now
+    });
+    factory
+        .registry_put("bind-sentinel-agent", &run_id, &descriptor)
+        .unwrap();
+    (run_base, run_id)
+}
+
+async fn serve_bind_rearm_child(case: &str) {
+    let root = PathBuf::from(std::env::var_os(SERVE_BIND_REARM_ROOT).expect("fixture root"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::env::set_var("CHIDORI_RUN_STORE", "fs");
+    std::env::remove_var("CHIDORI_RUN_DB");
+    std::env::set_var("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+    std::env::remove_var("CHIDORI_API_KEY");
+    std::env::remove_var("CHIDORI_ALLOW_UNAUTHENTICATED");
+
+    let receiver = BindRearmCounter::start().await;
+    let (run_base, run_id) = seed_running_detached_for_bind_test(&root, receiver.addr);
+    let run_dir = run_base.join(&run_id);
+    let registry_path = run_base.join("agents/bind-sentinel-agent.json");
+    let before_registry = std::fs::read(&registry_path).unwrap();
+    let before_descriptor = std::fs::read(run_dir.join("agent.json")).ok();
+    let before_journal = snapshot_journal_files(&run_dir);
+    let before_inbox = std::fs::read(run_dir.join(SIGNAL_INBOX_FILE)).unwrap();
+
+    let (host, port, reservation) = match case {
+        "bind-failure" => {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            (
+                "127.0.0.1".to_string(),
+                listener.local_addr().unwrap().port(),
+                Some(listener),
+            )
+        }
+        "free-port" => ("127.0.0.1".to_string(), 0, None),
+        "unsafe-bind" => ("0.0.0.0".to_string(), 0, None),
+        _ => panic!("unknown bind/rearm case {case}"),
+    };
+
+    let gate = if case == "bind-failure" {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *super::PRE_BIND_TEST_GATE.lock().unwrap() = Some((port, reached_tx, release_rx));
+        Some((reached_rx, release_tx))
+    } else {
+        None
+    };
+    let mut server = tokio::spawn(serve(
+        Arc::new(ProviderRegistry::new()),
+        Arc::new(TemplateEngine::new(&root)),
+        Some(root.join("project/agent.ts")),
+        host,
+        port,
+        PolicyConfig::from_env(),
+        "default".to_string(),
+        None,
+    ));
+
+    match case {
+        "bind-failure" => {
+            let (reached, release) = gate.unwrap();
+            tokio::select! {
+                _ = reached => {},
+                result = &mut server => {
+                    let error = result.expect("serve task").expect_err("held port must fail");
+                    assert!(error_chain_has_addr_in_use(&error), "expected AddrInUse, got {error:#}");
+                    super::PRE_BIND_TEST_GATE.lock().unwrap().take();
+                    drop(reservation);
+                    assert_eq!(receiver.count(), 0, "bind failure must precede detached HTTP effect");
+                    assert_eq!(before_registry, std::fs::read(&registry_path).unwrap());
+                    assert_eq!(before_descriptor, std::fs::read(run_dir.join("agent.json")).ok());
+                    assert_eq!(before_journal, snapshot_journal_files(&run_dir));
+                    assert_eq!(before_inbox, std::fs::read(run_dir.join(SIGNAL_INBOX_FILE)).unwrap());
+                    return;
+                }
+            }
+            let effect_seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while receiver.count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                effect_seen,
+                "current-order Red must observe the detached POST before releasing bind"
+            );
+            let _ = release.send(());
+            let result = server.await.unwrap();
+            drop(reservation);
+            let error = result.expect_err("reserved listener must fail");
+            assert!(
+                error_chain_has_addr_in_use(&error),
+                "expected AddrInUse, got {error:#}"
+            );
+            let after_registry = std::fs::read(&registry_path).unwrap();
+            let after_descriptor = std::fs::read(run_dir.join("agent.json")).ok();
+            let after_journal = snapshot_journal_files(&run_dir);
+            let after_inbox = std::fs::read(run_dir.join(SIGNAL_INBOX_FILE)).unwrap();
+            assert_eq!(
+                receiver.count(),
+                0,
+                "detached HTTP effect ran before bind failure; reached barrier={effect_seen}"
+            );
+            assert_eq!(
+                before_registry, after_registry,
+                "registry changed before bind failure"
+            );
+            assert_eq!(
+                before_descriptor, after_descriptor,
+                "descriptor changed before bind failure"
+            );
+            assert_eq!(
+                before_journal, after_journal,
+                "journal changed before bind failure"
+            );
+            assert_eq!(
+                before_inbox, after_inbox,
+                "inbox changed before bind failure"
+            );
+        }
+        "free-port" => {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while receiver.count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if result.is_err() {
+                let registry = crate::runtime::store::RunStoreFactory::shared(&run_base)
+                    .registry_get("bind-sentinel-agent")
+                    .unwrap();
+                let store =
+                    crate::runtime::store::RunStoreFactory::shared(&run_base).store_for(&run_id);
+                panic!(
+                    "free-port serve did not rearm the detached effect: receiver={}, registry={registry:?}, journal={:?}",
+                    receiver.count(),
+                    store.load_call_log().unwrap()
+                );
+            }
+            assert_eq!(receiver.count(), 1);
+            let factory = crate::runtime::store::RunStoreFactory::shared(&run_base);
+            let store = factory.store_for(&run_id);
+            let (records, registry) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let records = store.load_call_log().unwrap().unwrap_or_default();
+                        let registry = factory.registry_get("bind-sentinel-agent").unwrap();
+                        if records.iter().any(|r| r.function == "http")
+                            && registry
+                                .as_ref()
+                                .and_then(|row| row["descriptor"]["status"].as_str())
+                                == Some("completed")
+                        {
+                            break (records, registry);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("free-port rearm must journal the effect and settle the descriptor");
+            assert_eq!(registry.unwrap()["descriptor"]["status"], "completed");
+            assert_eq!(records.iter().filter(|r| r.function == "http").count(), 1);
+            server.abort();
+        }
+        "unsafe-bind" => {
+            let error = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+                .await
+                .expect("unsafe bind refusal should be immediate")
+                .unwrap()
+                .expect_err("unauthenticated network bind must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing to bind"),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(receiver.count(), 0);
+            assert_eq!(before_registry, std::fs::read(&registry_path).unwrap());
+            assert_eq!(
+                before_descriptor,
+                std::fs::read(run_dir.join("agent.json")).ok()
+            );
+            assert_eq!(before_journal, snapshot_journal_files(&run_dir));
+            assert_eq!(
+                before_inbox,
+                std::fs::read(run_dir.join(SIGNAL_INBOX_FILE)).unwrap()
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn error_chain_has_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+async fn run_bind_rearm_child(case: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let test = "server::tests::serve_bind_failure_precedes_detached_rearm";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(SERVE_BIND_REARM_CASE, case)
+        .env(SERVE_BIND_REARM_ROOT, root.path())
+        .env("CHIDORI_RUN_STORE", "fs")
+        .env_remove("CHIDORI_RUN_DB")
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "serve bind/rearm child `{case}` failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn serve_bind_failure_precedes_detached_rearm() {
+    if let Ok(case) = std::env::var(SERVE_BIND_REARM_CASE) {
+        serve_bind_rearm_child(&case).await;
+        return;
+    }
+    run_bind_rearm_child("bind-failure").await;
+}
+
+#[tokio::test]
+async fn serve_free_port_rearms_detached_agent_once() {
+    run_bind_rearm_child("free-port").await;
+}
+
+#[tokio::test]
+async fn serve_unsafe_bind_refusal_precedes_detached_rearm() {
+    run_bind_rearm_child("unsafe-bind").await;
+}
+
 #[test]
 fn stamp_attempt_adds_attempt_number_to_object_events() {
     let stamped = stamp_attempt(json!({"stream_id": "s1"}), Some(42));
