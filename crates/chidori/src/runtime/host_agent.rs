@@ -351,11 +351,7 @@ impl DetachedAgentHub {
             created_at: now,
             updated_at: now,
         };
-        persist_descriptor(&factory, &descriptor);
         let run_id = descriptor.run_id.clone();
-
-        #[cfg(test)]
-        tests::pause_after_predecessor_descriptor_persisted(&name, &run_id);
 
         // Mail follows the NAME, not the incarnation: whatever the settled
         // predecessor never consumed is re-queued for the replacement instead
@@ -363,7 +359,6 @@ impl DetachedAgentHub {
         if let (Some(old_run_id), Some(leftover)) =
             (predecessor_run_id.as_deref(), predecessor_mailbox)
         {
-            let old_store = factory.store_for(old_run_id);
             if !leftover.is_empty() {
                 let migrated: Vec<QueuedSignal> = leftover
                     .into_iter()
@@ -379,13 +374,48 @@ impl DetachedAgentHub {
                     messages = migrated.len(),
                     "migrating unconsumed mailbox from the settled predecessor"
                 );
-                if let Ok(bytes) = serde_json::to_vec_pretty(&migrated) {
-                    let _ = factory
-                        .store_for(&run_id)
-                        .put_blob(SIGNAL_INBOX_FILE, &bytes);
+                let bytes = serde_json::to_vec_pretty(&migrated)
+                    .map_err(|err| format!("serializing predecessor inbox migration: {err}"))?;
+
+                #[cfg(test)]
+                tests::pause_before_predecessor_destination_write(&name, &run_id);
+
+                factory
+                    .store_for(&run_id)
+                    .put_blob(SIGNAL_INBOX_FILE, &bytes)
+                    .map_err(|err| {
+                        format!(
+                            "migrating predecessor inbox `{SIGNAL_INBOX_FILE}` to replacement run `{run_id}`: {err:#}"
+                        )
+                    })?;
+
+                // Publish the replacement only after its mailbox is durable.
+                // A failed/partial mirror write may leave an unreachable
+                // destination copy, but the predecessor remains authoritative.
+                persist_spawn_descriptor(&factory, &descriptor)?;
+
+                // Clearing the old mailbox is cleanup after publication: a
+                // crash or clear error can leave a stale duplicate in the
+                // settled run, while the registered replacement owns the copy.
+                if let Err(err) = factory
+                    .store_for(old_run_id)
+                    .put_blob(SIGNAL_INBOX_FILE, b"[]")
+                {
+                    tracing::warn!(
+                        agent = %name,
+                        from_run = %old_run_id,
+                        to_run = %run_id,
+                        error = %err,
+                        "replacement mailbox is durable but predecessor inbox cleanup failed"
+                    );
                 }
-                let _ = old_store.put_blob(SIGNAL_INBOX_FILE, b"[]");
+            } else {
+                persist_spawn_descriptor(&factory, &descriptor)?;
             }
+        } else if predecessor_run_id.is_some() {
+            persist_spawn_descriptor(&factory, &descriptor)?;
+        } else {
+            persist_descriptor(&factory, &descriptor);
         }
 
         let entry = Arc::new(AgentEntry {
@@ -1496,6 +1526,27 @@ fn persist_descriptor(factory: &RunStoreFactory, descriptor: &AgentDescriptor) {
     }
 }
 
+/// Persist a new spawn's run descriptor before publishing its name in the
+/// registry. Unlike lifecycle updates, spawn must observe persistence errors
+/// so it does not discard a predecessor's mailbox after a partial setup.
+fn persist_spawn_descriptor(
+    factory: &RunStoreFactory,
+    descriptor: &AgentDescriptor,
+) -> Result<(), String> {
+    let value = serde_json::to_value(descriptor)
+        .map_err(|err| format!("serializing replacement descriptor: {err}"))?;
+    let bytes = serde_json::to_vec_pretty(descriptor)
+        .map_err(|err| format!("serializing replacement agent descriptor: {err}"))?;
+    factory
+        .store_for(&descriptor.run_id)
+        .put_blob(AGENT_DESCRIPTOR_FILE, &bytes)
+        .map_err(|err| format!("persisting replacement agent descriptor: {err:#}"))?;
+    factory
+        .registry_put(&descriptor.name, &descriptor.run_id, &value)
+        .map_err(|err| format!("publishing replacement registry descriptor: {err:#}"))?;
+    Ok(())
+}
+
 fn persist_descriptor_for_lease(
     factory: &RunStoreFactory,
     descriptor: &AgentDescriptor,
@@ -2230,7 +2281,7 @@ mod tests {
         (wait_until_reached, release)
     }
 
-    pub(super) fn pause_after_predecessor_descriptor_persisted(agent_name: &str, run_id: &str) {
+    pub(super) fn pause_before_predecessor_destination_write(agent_name: &str, run_id: &str) {
         let barrier = PREDECESSOR_MIGRATION_BARRIER
             .get_or_init(|| StdMutex::new(None))
             .lock()
@@ -2251,7 +2302,7 @@ mod tests {
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(20))
-            .expect("predecessor migration test releases descriptor/write barrier");
+            .expect("predecessor migration test releases destination-write barrier");
     }
 
     fn sqlite_stale_control_wait(event: &str) -> u8 {
@@ -3451,6 +3502,8 @@ mod tests {
     struct PredecessorMigrationFailureObservation {
         spawn_result: Result<Value, String>,
         destination_run_id: String,
+        predecessor_run_id: String,
+        registry_run_id_after: Result<Option<String>, String>,
         predecessor_before: Vec<u8>,
         predecessor_after: Result<Option<Vec<u8>>, String>,
         destination_inbox_after: Result<Option<Vec<u8>>, String>,
@@ -3578,7 +3631,7 @@ mod tests {
 
         let destination_run_id = arrived
             .recv_timeout(Duration::from_secs(10))
-            .expect("spawn reaches the barrier after replacement descriptor persistence");
+            .expect("spawn reaches the barrier before destination inbox persistence");
         let destination_inbox_path = run_base.join(&destination_run_id).join(SIGNAL_INBOX_FILE);
         std::fs::create_dir_all(&destination_inbox_path)
             .expect("make destination inbox path a directory to force real FS put failure");
@@ -3629,10 +3682,23 @@ mod tests {
         let entry = hub().entries.lock().unwrap().get(&name).cloned();
         let thread_live = entry.map(|entry| entry.state.lock().unwrap().thread_live);
         let entry_present = hub().entries.lock().unwrap().contains_key(&name);
+        let registry_run_id_after = factory
+            .registry_get(&name)
+            .map(|entry| {
+                entry.and_then(|entry| {
+                    entry
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+            .map_err(|err| format!("{err:#}"));
         let effect_count = effects.load(Ordering::SeqCst);
         PredecessorMigrationFailureObservation {
             spawn_result,
             destination_run_id,
+            predecessor_run_id,
+            registry_run_id_after,
             predecessor_before,
             predecessor_after,
             destination_inbox_after,
@@ -3811,6 +3877,14 @@ mod tests {
                 violations.push(format!(
                     "failed migration registered/started a worker: entry_present={}, thread_live={:?}",
                     observed.entry_present, observed.thread_live
+                ));
+            }
+            if observed.registry_run_id_after.as_ref()
+                != Ok(&Some(observed.predecessor_run_id.clone()))
+            {
+                violations.push(format!(
+                    "replacement registry was published before destination write succeeded: {:?}",
+                    observed.registry_run_id_after
                 ));
             }
             if observed.effect_count != 0 {
