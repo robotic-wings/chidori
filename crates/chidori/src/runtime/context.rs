@@ -63,6 +63,9 @@ pub struct HostOperationCompletionSafepoint(
     Arc<dyn Fn(&HostPromiseRecord) -> anyhow::Result<()> + Send + Sync>,
 );
 
+#[derive(Clone)]
+pub struct HostCallPreflight(Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>);
+
 impl std::fmt::Debug for HostOperationSafepoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostOperationSafepoint")
@@ -74,6 +77,22 @@ impl std::fmt::Debug for HostOperationCompletionSafepoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostOperationCompletionSafepoint")
             .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for HostCallPreflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostCallPreflight").finish_non_exhaustive()
+    }
+}
+
+impl HostCallPreflight {
+    pub fn new(callback: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn call(&self) -> anyhow::Result<()> {
+        (self.0)()
     }
 }
 
@@ -312,6 +331,9 @@ struct RuntimeContextInner {
     /// Optional durable safepoint invoked after a pending host operation is
     /// persisted and before the corresponding live side effect executes.
     pub host_operation_safepoint: Option<HostOperationSafepoint>,
+    /// Optional check before a new host call begins. Detached supervisors use
+    /// this to observe stop requests made by another process.
+    pub host_call_preflight: Option<HostCallPreflight>,
     /// Optional durable safepoint invoked after a host operation result is
     /// persisted and recorded, before control returns to JavaScript.
     pub host_operation_completion_safepoint: Option<HostOperationCompletionSafepoint>,
@@ -616,6 +638,7 @@ impl RuntimeContext {
                 emit_call_events: true,
                 otel_run: None,
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -695,6 +718,7 @@ impl RuntimeContext {
                 emit_call_events: true,
                 otel_run: None,
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -746,6 +770,7 @@ impl RuntimeContext {
                 emit_call_events: true,
                 otel_run: None,
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -805,6 +830,7 @@ impl RuntimeContext {
                 emit_call_events: parent_inner.emit_call_events,
                 otel_run: parent_inner.otel_run.clone(),
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -865,6 +891,7 @@ impl RuntimeContext {
                 emit_call_events: true,
                 otel_run: None,
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -936,6 +963,7 @@ impl RuntimeContext {
                 emit_call_events: parent_inner.emit_call_events,
                 otel_run: parent_inner.otel_run.clone(),
                 host_operation_safepoint: None,
+                host_call_preflight: None,
                 host_operation_completion_safepoint: None,
                 actor_signal_waiter: None,
                 warm_input_bridge: None,
@@ -1631,6 +1659,18 @@ impl RuntimeContext {
     #[allow(dead_code)]
     pub fn set_host_operation_safepoint(&self, safepoint: HostOperationSafepoint) {
         self.inner.lock().unwrap().host_operation_safepoint = Some(safepoint);
+    }
+
+    pub fn set_host_call_preflight(&self, preflight: HostCallPreflight) {
+        self.inner.lock().unwrap().host_call_preflight = Some(preflight);
+    }
+
+    pub fn run_host_call_preflight(&self) -> anyhow::Result<()> {
+        let preflight = self.inner.lock().unwrap().host_call_preflight.clone();
+        if let Some(preflight) = preflight {
+            preflight.call()?;
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

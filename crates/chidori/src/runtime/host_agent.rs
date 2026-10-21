@@ -38,7 +38,7 @@ use crate::mcp::McpManager;
 use crate::policy::{PolicyCache, PolicyConfig};
 use crate::providers::ProviderRegistry;
 use crate::runtime::call_log::CallRecord;
-use crate::runtime::context::{PendingSignal, RuntimeContext};
+use crate::runtime::context::{HostCallPreflight, PendingSignal, RuntimeContext};
 use crate::runtime::errors::RunInterrupt;
 use crate::runtime::host_actor::strip_crash_frontier;
 use crate::runtime::host_core;
@@ -56,6 +56,7 @@ pub const ALARM_SIGNAL_NAME: &str = "__chidori.alarm__";
 
 const AGENT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 const AGENT_DESCRIPTOR_FILE: &str = "agent.json";
+const AGENT_STOP_REQUEST_FILE: &str = "agent.stop-request.json";
 
 /// The engine parts a detached-agent supervisor needs to run agent modules
 /// outside any spawning run's lifetime. Installed from the first spawning
@@ -885,6 +886,63 @@ impl DetachedAgentHub {
     /// stops at the next boundary; a hibernating agent settles immediately.
     pub fn stop(&self, parts: &AgentRuntimeParts, to: &str) -> Result<Value, String> {
         let entry = self.ensure_entry(parts, to)?;
+        self.stop_entry(parts, to, entry)
+    }
+
+    /// Stop the incarnation currently registered under `name`. The name lock
+    /// keeps spawn/replacement from changing the target while the request is
+    /// applied and its result is collected.
+    pub fn stop_current_name(
+        &self,
+        parts: &AgentRuntimeParts,
+        name: &str,
+    ) -> Result<Value, String> {
+        with_agent_name_lock(parts, name, |factory| {
+            let entry = self
+                .resolve_entry_locked(parts, name, factory)?
+                .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))?;
+            let mut state = entry.state.lock().unwrap();
+            if AgentEntry::is_settled(&state) {
+                return Ok(state.descriptor.status_json());
+            }
+            if state.descriptor.status == "hibernating" && !state.thread_live {
+                drop(state);
+                return self.stop_entry(parts, name, entry);
+            }
+
+            let run_id = state.descriptor.run_id.clone();
+            let store = factory.store_for(&run_id);
+            let request = serde_json::to_vec(&json!({
+                "run_id": run_id,
+                "requested_at": Utc::now(),
+            }))
+            .map_err(|err| format!("serializing detached-agent stop request: {err}"))?;
+            store
+                .put_blob(AGENT_STOP_REQUEST_FILE, &request)
+                .map_err(|err| format!("persisting detached-agent stop request: {err:#}"))?;
+
+            state.stop_requested = true;
+            let local_worker = state.thread_live;
+            entry.signal.notify_all();
+            let mut response = state.descriptor.status_json();
+            if !local_worker {
+                response["stopRequested"] = json!(true);
+            }
+            drop(state);
+            if local_worker {
+                self.join(parts, name, Some(60_000))
+            } else {
+                Ok(response)
+            }
+        })
+    }
+
+    fn stop_entry(
+        &self,
+        parts: &AgentRuntimeParts,
+        to: &str,
+        entry: Arc<AgentEntry>,
+    ) -> Result<Value, String> {
         let mut state = entry.state.lock().unwrap();
         state.stop_requested = true;
         if !state.thread_live && !AgentEntry::is_settled(&state) {
@@ -900,6 +958,56 @@ impl DetachedAgentHub {
         entry.signal.notify_all();
         drop(state);
         self.join(parts, to, Some(60_000))
+    }
+
+    /// Stop the incarnation captured by a detached-agent handle. A stale
+    /// handle must not stop a newer registration that reused the same name.
+    pub fn stop_incarnation(
+        &self,
+        parts: &AgentRuntimeParts,
+        name: &str,
+        run_id: &str,
+    ) -> Result<Value, String> {
+        if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
+            if entry.state.lock().unwrap().descriptor.run_id == run_id {
+                return self.stop_entry(parts, name, entry);
+            }
+        }
+
+        let factory = RunStoreFactory::shared(&parts.run_base);
+        factory
+            .ensure_initialized()
+            .map_err(|err| format!("chidori.agents.stop: initializing run store: {err:#}"))?;
+        let store = factory.store_for(run_id);
+        let bytes = store
+            .get_blob(AGENT_DESCRIPTOR_FILE)
+            .map_err(|err| format!("reading detached-agent run {run_id} descriptor: {err:#}"))?
+            .ok_or_else(|| format!("detached-agent handle run {run_id} has no descriptor"))?;
+        let descriptor: AgentDescriptor = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("parsing detached-agent run {run_id} descriptor: {err}"))?;
+        if descriptor.name != name || descriptor.run_id != run_id {
+            return Err(format!(
+                "detached-agent handle identity mismatch for `{name}` run {run_id}"
+            ));
+        }
+        if matches!(
+            descriptor.status.as_str(),
+            "completed" | "failed" | "stopped" | "paused"
+        ) {
+            return Ok(descriptor.status_json());
+        }
+
+        let request = serde_json::to_vec(&json!({
+            "run_id": run_id,
+            "requested_at": Utc::now(),
+        }))
+        .map_err(|err| format!("serializing detached-agent stop request: {err}"))?;
+        store
+            .put_blob(AGENT_STOP_REQUEST_FILE, &request)
+            .map_err(|err| format!("persisting detached-agent stop request: {err:#}"))?;
+        let mut response = descriptor.status_json();
+        response["stopRequested"] = json!(true);
+        Ok(response)
     }
 
     /// Registry snapshot for the server's `/agents` listing.
@@ -1468,6 +1576,24 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 ctx.set_run_id(run_id.clone());
                 ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
                 ctx.enable_persistence_with_store(run_dir.clone(), write_store.clone());
+                let stop_store = store.clone();
+                let stop_entry = entry.clone();
+                let stop_run_id = run_id.clone();
+                ctx.set_host_call_preflight(HostCallPreflight::new(move || {
+                    match stop_store.get_blob(AGENT_STOP_REQUEST_FILE) {
+                        Ok(Some(_)) => {
+                            stop_entry.state.lock().unwrap().stop_requested = true;
+                            anyhow::bail!("detached agent stop requested")
+                        }
+                        Ok(None) => Ok(()),
+                        Err(err) => {
+                            anyhow::bail!(
+                                "checking detached-agent stop request for run {}: {err:#}",
+                                stop_run_id
+                            )
+                        }
+                    }
+                }));
                 if let Some(ref model) = descriptor.model {
                     ctx.set_default_model(model.clone());
                 }
@@ -1541,6 +1667,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             &policy,
             &ctx,
         );
+
+        if entry.state.lock().unwrap().stop_requested {
+            settle_run("stopped", None, None);
+            return;
+        }
 
         match settle_iteration(result, &ctx) {
             IterationEnd::Completed(output) => {
@@ -2368,9 +2499,20 @@ pub(crate) fn stop_agent(backend: &HostBindingBackend, a: &Value) -> Result<Valu
         .filter(|s| !s.is_empty())
         .ok_or("chidori.agents.stop requires a target agent name")?
         .to_string();
+    let run_id = a
+        .get("opts")
+        .and_then(|opts| opts.get("runId"))
+        .or_else(|| a.get("runId"))
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.is_empty())
+        .map(str::to_string);
     let call_args = json!({ "to": to });
     host_core::execute_durable_json_call(ctx, "stop_agent", call_args, || {
-        hub().stop(&parts, &to).map_err(|err| anyhow::anyhow!(err))
+        let result = match run_id.as_deref() {
+            Some(run_id) => hub().stop_incarnation(&parts, &to, run_id),
+            None => hub().stop(&parts, &to),
+        };
+        result.map_err(|err| anyhow::anyhow!(err))
     })
     .map_err(|err| err.to_string())
 }
@@ -4078,6 +4220,77 @@ mod tests {
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].payload["id"], "same-incarnation");
         assert!(same_entry.state.lock().unwrap().thread_live);
+    }
+
+    #[test]
+    fn detached_run_id_bound_handle_stop_does_not_stop_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_base = temp.path().join(".chidori/runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let parts = sqlite_test_parts(temp.path(), run_base.clone(), Arc::new(ToolRegistry::new()));
+        let hub = DetachedAgentHub {
+            parts: Mutex::new(None),
+            entries: Mutex::new(HashMap::new()),
+            timer_started: Mutex::new(false),
+        };
+        let factory = RunStoreFactory::shared(&run_base);
+        let name = "run-id-bound-stop";
+        let old_run_id = "old-stopped-incarnation";
+        let old_descriptor = AgentDescriptor {
+            name: name.to_string(),
+            run_id: old_run_id.to_string(),
+            source: "agent.ts".to_string(),
+            input: Value::Null,
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            owner_run_id: "stop-test".to_string(),
+            model: None,
+            status: "stopped".to_string(),
+            listen: None,
+            restarts: 0,
+            output: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        factory
+            .store_for(old_run_id)
+            .put_blob(
+                AGENT_DESCRIPTOR_FILE,
+                &serde_json::to_vec(&old_descriptor).unwrap(),
+            )
+            .unwrap();
+
+        let replacement = AgentDescriptor {
+            run_id: "current-replacement-incarnation".to_string(),
+            status: "hibernating".to_string(),
+            ..old_descriptor.clone()
+        };
+        factory
+            .registry_put(
+                name,
+                &replacement.run_id,
+                &serde_json::to_value(&replacement).unwrap(),
+            )
+            .unwrap();
+        let replacement_entry = hub.ensure_entry(&parts, name).unwrap();
+
+        let old_handle_result = hub.stop_incarnation(&parts, name, old_run_id).unwrap();
+        assert_eq!(old_handle_result["runId"], old_run_id);
+        assert_eq!(old_handle_result["status"], "stopped");
+        assert_eq!(
+            factory.registry_get(name).unwrap().unwrap()["run_id"],
+            replacement.run_id
+        );
+        let replacement_state = replacement_entry.state.lock().unwrap();
+        assert!(!replacement_state.stop_requested);
+        assert_eq!(replacement_state.descriptor.status, "hibernating");
+        assert!(factory
+            .store_for(&replacement.run_id)
+            .get_blob(AGENT_STOP_REQUEST_FILE)
+            .unwrap()
+            .is_none());
     }
 
     #[derive(Debug)]

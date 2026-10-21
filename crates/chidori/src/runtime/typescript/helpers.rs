@@ -232,7 +232,7 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                     return native.join(name, options);
                 },
                 stop(options) {
-                    return native.stop(name, options);
+                    return native.stop(name, { ...options, runId: info.runId });
                 },
                 status() {
                     return native.status(name);
