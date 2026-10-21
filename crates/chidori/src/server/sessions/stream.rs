@@ -673,6 +673,12 @@ async fn resume_signal_pause_in_process(
             return SignalResumeOutcome::Retry;
         }
     };
+    if let Err(error) =
+        super::super::try_load_persisted_signal_inbox(&state.run_base, session.run_id.as_deref())
+    {
+        tracing::error!(run_id = %run_id, %error, "in-process signal resume could not read inbox; preserving pause for retry");
+        return SignalResumeOutcome::Retry;
+    }
     let resolution = if let Some(candidate) = signal_to_consume.as_ref() {
         if let Err(error) = super::super::persist_signal_consumption_intent(
             &state.run_base,

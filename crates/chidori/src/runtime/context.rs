@@ -2220,16 +2220,34 @@ fn remove_persisted_signal(inner: &mut RuntimeContextInner, delivery_seq: u64) {
     note_persist_result(inner, result);
 }
 
-/// Load the durable signal mailbox from a run directory. Returns an empty vec
-/// when the file is absent or unreadable (a fresh run with no queued signals).
-/// Used by resume/run paths to thread the inbox into a context the same way the
-/// VFS is restored.
-pub fn load_signal_inbox(run_dir: &std::path::Path) -> Vec<QueuedSignal> {
+/// Load the durable signal mailbox from a run directory, treating only a
+/// missing inbox as empty. Read and JSON errors include the inbox path.
+/// Production resume and recovery paths should use this fallible API.
+pub fn try_load_signal_inbox(run_dir: &std::path::Path) -> anyhow::Result<Vec<QueuedSignal>> {
+    use anyhow::Context as _;
+
     let path = run_dir.join(SIGNAL_INBOX_FILE);
-    let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading signal inbox {}", path.display()));
+        }
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing signal inbox {}", path.display()))
+}
+
+/// Legacy fail-open compatibility wrapper for loading a signal mailbox.
+///
+/// This preserves the historical behavior of returning an empty vector for
+/// every read or parse error. Internal Chidori production paths use
+/// [`try_load_signal_inbox`] so corruption cannot be mistaken for an empty
+/// inbox. Downstream callers that need to distinguish absence from damage
+/// should migrate to the fallible API.
+#[allow(dead_code)] // Kept for downstream library compatibility; the CLI no longer calls it.
+pub fn load_signal_inbox(run_dir: &std::path::Path) -> Vec<QueuedSignal> {
+    try_load_signal_inbox(run_dir).unwrap_or_default()
 }
 
 fn default_workspace_root() -> Option<PathBuf> {
@@ -2299,6 +2317,21 @@ fn vfs_from_seed_env() -> Vfs {
 mod tests {
     use super::*;
     use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
+
+    #[test]
+    fn try_load_signal_inbox_treats_only_missing_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(try_load_signal_inbox(dir.path()).unwrap().is_empty());
+
+        let inbox_path = dir.path().join(SIGNAL_INBOX_FILE);
+        std::fs::create_dir_all(&inbox_path).unwrap();
+        let error = try_load_signal_inbox(dir.path()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&inbox_path.display().to_string()),
+            "{message}"
+        );
+    }
 
     #[derive(Clone)]
     struct HttpInboxState {

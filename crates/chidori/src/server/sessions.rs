@@ -926,6 +926,12 @@ async fn fire_signal_timeout(state: &AppState, id: &str, seq: u64) {
     let lock = state.signal_inbox_lock(session.run_id.as_deref().unwrap_or(id));
     let completed = {
         let _guard = lock.lock().unwrap();
+        if let Err(error) =
+            super::try_load_persisted_signal_inbox(&state.run_base, session.run_id.as_deref())
+        {
+            tracing::error!(session_id = %session.id, run_id = ?session.run_id, %error, "signal timeout could not read inbox; preserving pause");
+            return;
+        }
         complete_persisted_pending_host_operation(
             &state.run_base,
             session.run_id.as_deref(),
