@@ -356,6 +356,20 @@ impl DetachedAgentHub {
         // Mail follows the NAME, not the incarnation: whatever the settled
         // predecessor never consumed is re-queued for the replacement instead
         // of stranding in the dead run's inbox.
+        #[cfg(test)]
+        if let (Some(old_run_id), Some(snapshot)) =
+            (predecessor_run_id.as_deref(), predecessor_mailbox.as_ref())
+        {
+            let snapshot_bytes = serde_json::to_vec_pretty(snapshot)
+                .expect("test inbox snapshot serializes")
+                .len();
+            tests::pause_competing_same_name_spawn_after_snapshot(
+                &name,
+                &run_id,
+                old_run_id,
+                snapshot_bytes,
+            );
+        }
         if let (Some(old_run_id), Some(leftover)) =
             (predecessor_run_id.as_deref(), predecessor_mailbox)
         {
@@ -2219,6 +2233,13 @@ mod tests {
     const PREDECESSOR_MIGRATION_SCENARIO_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_SCENARIO";
     const REGISTRY_TRUNCATION_MODE_ENV: &str = "CHIDORI_TEST_REGISTRY_TRUNCATION_MODE";
     const REGISTRY_TRUNCATION_ROOT_ENV: &str = "CHIDORI_TEST_REGISTRY_TRUNCATION_ROOT";
+    const SAME_NAME_SPAWN_MODE_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_MODE";
+    const SAME_NAME_SPAWN_ROOT_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_ROOT";
+    const SAME_NAME_SPAWN_GATE_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_GATE";
+    const SAME_NAME_SPAWN_NAME_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_NAME";
+    const SAME_NAME_SPAWN_CHILD_INDEX_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_CHILD_INDEX";
+    const SAME_NAME_SPAWN_TEST: &str =
+        "runtime::host_agent::tests::detached_same_name_spawn_competing_processes_preserve_one_delivery";
 
     struct PredecessorMigrationBarrier {
         agent_name: String,
@@ -2305,6 +2326,44 @@ mod tests {
             .unwrap()
             .recv_timeout(Duration::from_secs(20))
             .expect("predecessor migration test releases destination-write barrier");
+    }
+
+    pub(super) fn pause_competing_same_name_spawn_after_snapshot(
+        agent_name: &str,
+        run_id: &str,
+        predecessor_run_id: &str,
+        inbox_snapshot_bytes: usize,
+    ) {
+        if std::env::var(SAME_NAME_SPAWN_NAME_ENV).as_deref() != Ok(agent_name) {
+            return;
+        }
+        use std::io::{Read, Write};
+        let Ok(address) = std::env::var(SAME_NAME_SPAWN_GATE_ENV) else {
+            return;
+        };
+        let address: std::net::SocketAddr = address.parse().expect("valid gate address");
+        let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .expect("connect to same-name spawn race controller");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("set same-name spawn gate timeout");
+        writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&json!({
+                "name": agent_name,
+                "run_id": run_id,
+                "predecessor_run_id": predecessor_run_id,
+                "inbox_snapshot_bytes": inbox_snapshot_bytes,
+            }))
+            .expect("serialize same-name spawn gate report")
+        )
+        .expect("report same-name spawn snapshot");
+        let mut release = [0u8; 1];
+        stream
+            .read_exact(&mut release)
+            .expect("wait for parent to release competing spawn snapshots");
+        assert_eq!(release[0], b'R', "unexpected same-name spawn gate release");
     }
 
     fn sqlite_stale_control_wait(event: &str) -> u8 {
@@ -3628,6 +3687,181 @@ mod tests {
         bytes
     }
 
+    fn seed_same_name_spawn_race(root: &Path, backend: &str, name: &str) -> (String, Vec<u8>) {
+        let project = root.join("project");
+        migration_source(&project);
+        let run_base = project.join(".chidori/runs");
+        let predecessor_run_id = format!("old-{}", uuid::Uuid::new_v4());
+        let now = Utc::now();
+        let descriptor = json!({
+            "name": name,
+            "run_id": predecessor_run_id,
+            "source": "services/old-worker.ts",
+            "input": {},
+            "restart": "never",
+            "max_restarts": 0,
+            "backoff_ms": 0,
+            "owner_run_id": "same-name-race-seed",
+            "model": null,
+            "status": "completed",
+            "listen": null,
+            "restarts": 0,
+            "output": null,
+            "error": null,
+            "created_at": now,
+            "updated_at": now,
+        });
+        let entry = json!({
+            "name": name,
+            "run_id": predecessor_run_id,
+            "descriptor": descriptor,
+        });
+        let registry_path = run_base.join("agents").join(format!("{name}.json"));
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        std::fs::write(&registry_path, serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
+
+        let queued = vec![QueuedSignal {
+            name: "go".to_string(),
+            payload: json!({ "id": "must-survive" }),
+            from: json!({ "kind": "test", "id": "predecessor-migration" }),
+            delivery_seq: 17,
+            enqueued_at: now,
+        }];
+        let inbox = serde_json::to_vec_pretty(&queued).unwrap();
+        let inbox_path = run_base.join(&predecessor_run_id).join(SIGNAL_INBOX_FILE);
+        std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+        std::fs::write(&inbox_path, &inbox).unwrap();
+
+        if backend == "sqlite" {
+            let db_path = root.join("runs.sqlite3");
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS run_blobs (
+                         run_id TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL,
+                         PRIMARY KEY (run_id, key)
+                     );
+                     CREATE TABLE IF NOT EXISTS run_registry (
+                         name TEXT PRIMARY KEY, run_id TEXT NOT NULL, data TEXT NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO run_registry (name, run_id, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        name,
+                        predecessor_run_id,
+                        serde_json::to_string(&entry).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        (predecessor_run_id, inbox)
+    }
+
+    fn same_name_spawn_child_command(
+        root: &Path,
+        backend: &str,
+        name: &str,
+        child_index: usize,
+        gate_address: Option<&str>,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                SAME_NAME_SPAWN_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SAME_NAME_SPAWN_MODE_ENV, "worker")
+            .env(SAME_NAME_SPAWN_ROOT_ENV, root)
+            .env(SAME_NAME_SPAWN_NAME_ENV, name)
+            .env(SAME_NAME_SPAWN_CHILD_INDEX_ENV, child_index.to_string())
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_RUN_DB", root.join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(address) = gate_address {
+            command.env(SAME_NAME_SPAWN_GATE_ENV, address);
+        } else {
+            command.env_remove(SAME_NAME_SPAWN_GATE_ENV);
+        }
+        command
+    }
+
+    fn same_name_spawn_worker() {
+        let root = PathBuf::from(std::env::var_os(SAME_NAME_SPAWN_ROOT_ENV).unwrap());
+        let backend = std::env::var("CHIDORI_RUN_STORE").unwrap();
+        let name = std::env::var(SAME_NAME_SPAWN_NAME_ENV).unwrap();
+        let child_index = std::env::var(SAME_NAME_SPAWN_CHILD_INDEX_ENV).unwrap();
+        let project = root.join("project");
+        let run_base = project.join(".chidori/runs");
+        let source = project.join("services/migration-worker.ts");
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parts = sqlite_test_parts(
+            &project,
+            run_base.clone(),
+            migration_counting_tools(effects.clone()),
+        );
+        hub().install_parts(parts.clone());
+        let options = SpawnOptions {
+            name: Some(name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let spawn = hub().spawn(
+            &parts,
+            source.to_str().unwrap(),
+            json!({}),
+            &options,
+            format!("same-name-race-parent-{child_index}"),
+        );
+        let mut report = json!({
+            "backend": backend,
+            "child_index": child_index,
+            "spawn_error": null,
+            "run_id": null,
+            "status": "rejected",
+            "matching_signal_rows": 0,
+            "effect_count": 0,
+            "inbox": null,
+        });
+        match spawn {
+            Err(error) => report["spawn_error"] = json!(error),
+            Ok(value) => {
+                let run_id = value["runId"].as_str().unwrap().to_string();
+                report["run_id"] = json!(run_id);
+                let descriptor = wait_for_agent_descriptor(&parts, &name, |descriptor| {
+                    descriptor.run_id == run_id && descriptor.status == "completed"
+                });
+                let store = RunStoreFactory::shared(&run_base).store_for(&run_id);
+                let records = store.load_call_log().unwrap().unwrap_or_default();
+                let matching_signal_rows = records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal"
+                            && record.result["payload"]["id"] == "must-survive"
+                    })
+                    .count();
+                let inbox = store
+                    .get_blob(SIGNAL_INBOX_FILE)
+                    .unwrap()
+                    .unwrap_or_default();
+                report["status"] = json!(descriptor.status);
+                report["matching_signal_rows"] = json!(matching_signal_rows);
+                report["effect_count"] = json!(effects.load(Ordering::SeqCst));
+                report["inbox"] = json!(String::from_utf8_lossy(&inbox).to_string());
+            }
+        }
+        let report_path = root.join(format!("child-{child_index}-report.json"));
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
     fn run_predecessor_migration_failure(base: &Path) -> PredecessorMigrationFailureObservation {
         let project = base.join("failure");
         std::fs::create_dir_all(&project).unwrap();
@@ -4419,6 +4653,324 @@ mod tests {
         assert!(
             red_failures.is_empty(),
             "registry truncation recovery Red failures (expected on vulnerable main): {red_failures:#?}"
+        );
+    }
+
+    #[test]
+    fn detached_same_name_spawn_competing_processes_preserve_one_delivery() {
+        if std::env::var(SAME_NAME_SPAWN_MODE_ENV).as_deref() == Ok("worker") {
+            same_name_spawn_worker();
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for (backend, trial) in [("fs", 0), ("fs", 1), ("sqlite", 0), ("sqlite", 1)] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().to_path_buf();
+            let name = format!("same-name-race-{backend}-{trial}");
+            let (predecessor_run_id, predecessor_inbox) =
+                seed_same_name_spawn_race(&root, backend, &name);
+            assert_eq!(
+                predecessor_inbox.len(),
+                232,
+                "race fixture must use Golf's confirmed 232-byte queued inbox"
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let gate_address = listener.local_addr().unwrap().to_string();
+            listener.set_nonblocking(true).unwrap();
+            let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+            let gate_thread = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    let (stream, _) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = gate_tx.send(Err(
+                                        "timed out accepting both spawn snapshot reports"
+                                            .to_string(),
+                                    ));
+                                    return;
+                                }
+                                std::thread::yield_now();
+                            }
+                            Err(error) => {
+                                let _ = gate_tx.send(Err(format!("accept failed: {error}")));
+                                return;
+                            }
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    let read = std::io::BufRead::read_line(
+                        &mut std::io::BufReader::new(stream.try_clone().unwrap()),
+                        &mut line,
+                    );
+                    match read {
+                        Ok(count) if count > 0 => {
+                            let report = match serde_json::from_str::<Value>(line.trim()) {
+                                Ok(report) => report,
+                                Err(error) => {
+                                    let _ = gate_tx.send(Err(format!(
+                                        "invalid spawn snapshot report: {error}; line={line:?}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            if gate_tx.send(Ok((report, stream))).is_err() {
+                                return;
+                            }
+                        }
+                        other => {
+                            let _ = gate_tx.send(Err(format!(
+                                "child gate did not report a snapshot: {other:?}"
+                            )));
+                            return;
+                        }
+                    }
+                }
+            });
+            let mut children = (0..2)
+                .map(|index| {
+                    same_name_spawn_child_command(&root, backend, &name, index, Some(&gate_address))
+                        .spawn()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            let mut arrivals: Vec<(Value, std::net::TcpStream)> = Vec::new();
+            for _ in 0..2 {
+                match gate_rx.recv_timeout(Duration::from_secs(22)) {
+                    Ok(Ok(arrival)) => arrivals.push(arrival),
+                    Ok(Err(error)) => failures.push(format!("{backend} gate failed: {error}")),
+                    Err(error) => failures.push(format!("{backend} gate timed out: {error}")),
+                }
+            }
+            if arrivals.len() != 2 {
+                for child in &mut children {
+                    let _ = child.kill();
+                }
+                let artifact_root = temporary.keep();
+                panic!(
+                    "{backend} spawn workers did not both reach the post-snapshot gate; arrivals={:?}; failures={failures:?}; artifacts={}",
+                    arrivals.iter().map(|(report, _)| report).collect::<Vec<_>>(),
+                    artifact_root.display()
+                );
+            }
+            for (report, _) in &arrivals {
+                if report["name"] != name {
+                    failures.push(format!("unexpected gated name: {report}"));
+                }
+                if report["predecessor_run_id"] != predecessor_run_id {
+                    failures.push(format!(
+                        "child did not snapshot the same settled predecessor: {report}"
+                    ));
+                }
+                if report["inbox_snapshot_bytes"] != predecessor_inbox.len() {
+                    failures.push(format!(
+                        "child inbox snapshot did not match the seeded 232-byte inbox: {report}"
+                    ));
+                }
+            }
+            if arrivals[0].0["run_id"] == arrivals[1].0["run_id"] {
+                failures.push(format!(
+                    "competing spawn calls unexpectedly used the same incarnation id: {:?}",
+                    arrivals
+                        .iter()
+                        .map(|(report, _)| report)
+                        .collect::<Vec<_>>()
+                ));
+            }
+            for (_, stream) in &mut arrivals {
+                use std::io::Write;
+                stream.write_all(b"R").unwrap();
+                stream.flush().unwrap();
+            }
+            gate_thread.join().expect("snapshot gate worker exits");
+
+            let mut child_outputs = Vec::new();
+            for child in children {
+                child_outputs.push(child.wait_with_output().unwrap());
+            }
+            let child_reports = (0..2)
+                .map(|index| {
+                    let path = root.join(format!("child-{index}-report.json"));
+                    std::fs::read(&path)
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<Value>(&bytes).map_err(std::io::Error::other)
+                        })
+                        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+                })
+                .collect::<Vec<_>>();
+            for (index, output) in child_outputs.iter().enumerate() {
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{backend} child {index} exited {:?}: stdout={} stderr={}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+
+            let successful = child_reports
+                .iter()
+                .filter(|report| report["run_id"].is_string())
+                .collect::<Vec<_>>();
+            let total_rows = child_reports
+                .iter()
+                .map(|report| report["matching_signal_rows"].as_u64().unwrap_or(0))
+                .sum::<u64>();
+            let total_effects = child_reports
+                .iter()
+                .map(|report| report["effect_count"].as_u64().unwrap_or(0))
+                .sum::<u64>();
+            let run_base = root.join("project/.chidori/runs");
+            let registry_path = run_base.join("agents").join(format!("{name}.json"));
+            let registry: Value = serde_json::from_slice(&std::fs::read(&registry_path).unwrap())
+                .unwrap_or_else(|error| panic!("parsing {}: {error}", registry_path.display()));
+            let winner = registry["run_id"].as_str().unwrap_or_default();
+            let expected_winner = successful.iter().any(|report| report["run_id"] == winner);
+            for report in &successful {
+                if report["status"] != "completed" {
+                    failures.push(format!(
+                        "{backend} successful run did not complete: {report}"
+                    ));
+                }
+                if report["matching_signal_rows"] != 1 {
+                    failures.push(format!(
+                        "{backend} successful incarnation should journal the payload once: {report}"
+                    ));
+                }
+                if report["effect_count"] != 1 {
+                    failures.push(format!(
+                        "{backend} successful incarnation should execute one native effect: {report}"
+                    ));
+                }
+                if report["inbox"] != "[]" && report["inbox"] != "" {
+                    failures.push(format!("{backend} successful run retained inbox: {report}"));
+                }
+            }
+            if successful.len() != 1 {
+                failures.push(format!(
+                    "{backend} should start exactly one incarnation for one settled name, got {}: {child_reports:?}",
+                    successful.len()
+                ));
+            }
+            if total_rows != 1 {
+                failures.push(format!(
+                    "{backend} logical predecessor payload should have one journal consumption, got {total_rows}: {child_reports:?}"
+                ));
+            }
+            if total_effects != 1 {
+                failures.push(format!(
+                    "{backend} logical predecessor payload should cause one native effect, got {total_effects}: {child_reports:?}"
+                ));
+            }
+            if !expected_winner {
+                failures.push(format!(
+                    "{backend} registry winner {winner} is not the sole successful incarnation: {child_reports:?}"
+                ));
+            }
+            if backend == "sqlite" {
+                let connection = rusqlite::Connection::open(root.join("runs.sqlite3")).unwrap();
+                let (mirror_winner, rows): (String, i64) = connection
+                    .query_row(
+                        "SELECT run_id, COUNT(*) OVER () FROM run_registry WHERE name = ?1",
+                        [&name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                if rows != 1
+                    || !successful
+                        .iter()
+                        .any(|report| report["run_id"] == mirror_winner)
+                {
+                    failures.push(format!(
+                        "SQLite registry should retain one successful run winner; mirror_winner={mirror_winner}, rows={rows}, child_reports={child_reports:?}"
+                    ));
+                }
+            }
+            eprintln!(
+                "SAME_NAME_SPAWN_RACE backend={backend} trial={trial} artifact_root={} predecessor_run_id={predecessor_run_id} inbox_bytes={} arrivals={:?} reports={child_reports:?} local_registry_winner={winner}",
+                root.display(),
+                predecessor_inbox.len(),
+                arrivals.iter().map(|(report, _)| report).collect::<Vec<_>>()
+            );
+
+            // One uncontended real spawn/migration must still consume the
+            // queued message once and publish a re-armable registry entry.
+            if trial == 0 {
+                let control = tempfile::tempdir().unwrap();
+                let control_root = control.path();
+                let control_name = format!("same-name-single-{backend}");
+                let (control_predecessor, control_inbox) =
+                    seed_same_name_spawn_race(control_root, backend, &control_name);
+                let control_output =
+                    same_name_spawn_child_command(control_root, backend, &control_name, 0, None)
+                        .output()
+                        .unwrap();
+                assert!(
+                    control_output.status.success(),
+                    "{backend} uncontended spawn child failed: stdout={} stderr={}",
+                    String::from_utf8_lossy(&control_output.stdout),
+                    String::from_utf8_lossy(&control_output.stderr)
+                );
+                let control_report: Value = serde_json::from_slice(
+                    &std::fs::read(control_root.join("child-0-report.json")).unwrap(),
+                )
+                .unwrap();
+                let control_registry: Value = serde_json::from_slice(
+                    &std::fs::read(
+                        control_root
+                            .join("project/.chidori/runs/agents")
+                            .join(format!("{control_name}.json")),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(control_report["status"], "completed");
+                assert_eq!(control_report["matching_signal_rows"], 1);
+                assert_eq!(control_report["effect_count"], 1);
+                assert!(control_report["inbox"] == "[]" || control_report["inbox"] == "");
+                assert_eq!(control_registry["run_id"], control_report["run_id"]);
+                assert_eq!(control_inbox.len(), 232);
+                assert!(!control_predecessor.is_empty());
+                if backend == "sqlite" {
+                    let connection =
+                        rusqlite::Connection::open(control_root.join("runs.sqlite3")).unwrap();
+                    let (mirror_winner, rows): (String, i64) = connection
+                        .query_row(
+                            "SELECT run_id, COUNT(*) OVER () FROM run_registry WHERE name = ?1",
+                            [&control_name],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(rows, 1);
+                    assert_eq!(mirror_winner, control_report["run_id"]);
+                }
+                eprintln!(
+                    "SAME_NAME_SPAWN_SINGLE_CONTROL backend={backend} artifact_root={} predecessor_run_id={control_predecessor} inbox_bytes={} report={control_report}",
+                    control_root.display(),
+                    control_inbox.len()
+                );
+            }
+
+            if !failures.is_empty() {
+                let artifact_root = temporary.keep();
+                eprintln!(
+                    "SAME_NAME_SPAWN_ARTIFACTS backend={backend} root={}",
+                    artifact_root.display()
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "same-name spawn race Red: {failures:#?}"
         );
     }
 
