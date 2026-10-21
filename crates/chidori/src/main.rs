@@ -4813,14 +4813,21 @@ fn cmd_serve(
 
     let (policy, policy_posture) = serve_policy(untrusted, trusted);
     let tokio_rt = scheduler::new_tokio_runtime().context("Failed to create server runtime")?;
-    let rearm_failure_reporter: Option<Arc<dyn Fn(&str) + Send + Sync>> = if verbose {
-        None
-    } else {
-        Some(Arc::new(|err| {
-            eprintln!("Warning: re-arming detached agents: {err}");
-        }))
-    };
-    tokio_rt.block_on(server::serve_with_rearm_failure_reporter(
+    let reporter: Arc<dyn Fn(server::ServeNotice) + Send + Sync> =
+        Arc::new(move |notice| match notice {
+            server::ServeNotice::ManifestAgentSpawned { agent_name, run_id } => {
+                eprintln!("  App fleet: spawned `{agent_name}` (run {run_id})");
+            }
+            server::ServeNotice::DetachedAgentsRearmed { count } => {
+                eprintln!("  Re-armed {count} detached agent(s) from the registry");
+            }
+            server::ServeNotice::RearmFailed { error } if !verbose => {
+                eprintln!("Warning: re-arming detached agents: {error}");
+            }
+            server::ServeNotice::RearmFailed { .. } => {}
+            server::ServeNotice::StartupReady(snapshot) => print_serve_startup(&snapshot),
+        });
+    tokio_rt.block_on(server::serve_with_cli_reporter(
         providers,
         template_engine,
         file.map(|f| f.to_path_buf()),
@@ -4829,10 +4836,71 @@ fn cmd_serve(
         policy,
         policy_posture,
         app_manifest,
-        rearm_failure_reporter,
+        Some(reporter),
     ))?;
 
     Ok(())
+}
+
+fn print_serve_startup(snapshot: &server::ServeStartupSnapshot) {
+    eprintln!("Listening on http://{}", snapshot.addr);
+    if snapshot.non_loopback {
+        eprintln!(
+            "WARNING: non-loopback bind speaks plain HTTP (no TLS). Terminate TLS at a \
+             reverse proxy or platform ingress and firewall the port (docs/deployment.md)."
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  Concurrency: max {} sessions, {}ms acquire timeout",
+        snapshot.max_concurrent, snapshot.acquire_timeout_ms
+    );
+    eprintln!(
+        "  Auth:        {}",
+        if snapshot.auth_required {
+            "REQUIRED (Authorization: Bearer $CHIDORI_API_KEY)"
+        } else if snapshot.loopback {
+            "disabled (loopback bind; set CHIDORI_API_KEY to enable)"
+        } else {
+            "DISABLED on a network-reachable bind (CHIDORI_ALLOW_UNAUTHENTICATED) — \
+             anyone who can reach the port can execute agents"
+        }
+    );
+    eprintln!("  Policy:      {}", snapshot.policy_posture);
+    eprintln!(
+        "  CORS:        {}",
+        match snapshot.cors_origins.as_deref() {
+            Some(v) if v.trim() == "*" => "open (Any)".to_string(),
+            Some(v) => format!("allow: {v}"),
+            None => "disabled (set CHIDORI_CORS_ORIGINS to enable)".to_string(),
+        }
+    );
+    eprintln!();
+    if snapshot.strict_routes {
+        eprintln!(
+            "  Events:     ANY /events      → agent(event); strict routes — every other \
+             unknown path is 404"
+        );
+    } else {
+        eprintln!(
+            "  Events:     ANY /*           → agent(event); a pausing run becomes a session \
+             (202). CHIDORI_SERVE_ROUTES=strict narrows this to /events"
+        );
+    }
+    eprintln!("  Sessions:   POST /sessions   → create & run");
+    eprintln!("              GET  /sessions   → list all");
+    eprintln!("              GET  /sessions/{{id}}  → get result");
+    eprintln!("              GET  /sessions/{{id}}/checkpoint → call log");
+    eprintln!("              GET  /sessions/{{id}}/snapshot   → snapshot manifest");
+    eprintln!("              POST /sessions/{{id}}/replay     → replay from checkpoint");
+    eprintln!("              POST /sessions/{{id}}/resume     → resume paused input() call");
+    eprintln!("              POST /sessions/{{id}}/signal     → deliver a signal to a run");
+    eprintln!("              POST /sessions/{{id}}/cancel     → cancel running session");
+    eprintln!("              POST /sessions/stream            → run with SSE events");
+    eprintln!(
+        "              GET  /sessions/{{id}}/stream     → re-attach: replay + follow SSE events"
+    );
+    eprintln!("  Health:     GET  /health");
 }
 
 /// Parse CLI input args into a JSON object.
