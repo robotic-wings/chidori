@@ -5137,14 +5137,19 @@ mod tests {
                 }
                 let (attempt, _) = accept_same_name_spawn_event(&listener);
                 assert_eq!(attempt["phase"], "lock-attempt");
-                let (locked, _) = accept_same_name_spawn_event(&listener);
+                let (locked, crash_lock_stream) = accept_same_name_spawn_event(&listener);
                 assert_eq!(locked["phase"], "lock-acquired");
                 let factory = RunStoreFactory::shared(&crash_root.join("project/.chidori/runs"));
                 let lock_path = factory.registry_name_lock_path(&crash_name).unwrap();
                 assert!(lock_path.exists(), "stable lock sidecar remains on disk");
+                assert!(
+                    crash_child.try_wait().unwrap().is_none(),
+                    "crash child must still own the lock while paused"
+                );
                 crash_child.kill().unwrap();
                 let crash_output = crash_child.wait_with_output().unwrap();
                 assert!(!crash_output.status.success());
+                drop(crash_lock_stream);
                 assert_eq!(std::fs::read(&crash_registry).unwrap(), registry_before);
                 assert_eq!(std::fs::read(&crash_inbox_path).unwrap(), crash_inbox);
 
