@@ -2167,6 +2167,418 @@ fn resume_consumes_valid_signal_inbox_normally() {
     assert_eq!(observed.inbox_after.as_deref(), Some("[]"));
 }
 
+const CORRUPT_INBOX_EXECUTION_MODE: &str = "CHIDORI_TEST_CORRUPT_INBOX_EXECUTION_MODE";
+const CORRUPT_INBOX_EXECUTION_OBSERVATION_PREFIX: &str = "CORRUPT_INBOX_EXECUTION_OBSERVATION=";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CorruptInboxExecutionObservation {
+    mode: String,
+    response_status: u16,
+    response_body: Value,
+    sentinel_requests: usize,
+    session_before: Value,
+    session_after: Value,
+    session_unchanged: bool,
+    journal_unchanged: bool,
+    pending_unchanged: bool,
+    host_promises_unchanged: bool,
+    inbox_before: Option<String>,
+    inbox_after: Option<String>,
+    inbox_path: String,
+    final_status: String,
+    approvals_before: usize,
+    approvals_after: usize,
+    warm_parked_after: bool,
+}
+
+fn run_corrupt_inbox_execution_child(mode: &str) -> CorruptInboxExecutionObservation {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("server::tests::corrupt_inbox_execution_path_child_fixture")
+        .arg("--nocapture")
+        .env(CORRUPT_INBOX_EXECUTION_MODE, mode)
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .output()
+        .unwrap();
+    let report = format!(
+        "corrupt inbox child {mode} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let observation_json = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(CORRUPT_INBOX_EXECUTION_OBSERVATION_PREFIX))
+        .unwrap_or_else(|| panic!("child did not report observations: {report}"));
+    serde_json::from_str(observation_json)
+        .unwrap_or_else(|error| panic!("invalid child observation ({error}): {report}"))
+}
+
+/// Isolated local-only fixture for execution paths which used to mutate a
+/// paused run before loading its persisted signal inbox. The child process
+/// gives the HTTP allowlist its own environment and reports exact artifact
+/// snapshots back to the parent test.
+#[tokio::test]
+async fn corrupt_inbox_execution_path_child_fixture() {
+    let Ok(mode) = std::env::var(CORRUPT_INBOX_EXECUTION_MODE) else {
+        return;
+    };
+    assert!(matches!(
+        mode.as_str(),
+        "signal_bad"
+            | "signal_absent"
+            | "approve_allow_bad"
+            | "approve_deny_bad"
+            | "approve_allow_absent"
+            | "warm_bad"
+            | "warm_absent"
+            | "timeout_bad"
+            | "timeout_absent"
+    ));
+
+    let temp = tempfile::tempdir().unwrap();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sentinel_url = format!("http://{}/effect", listener.local_addr().unwrap());
+    let app = {
+        let counter = counter.clone();
+        Router::new().route(
+            "/effect",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        )
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let sentinel_server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let source = match mode.as_str() {
+        "signal_bad" | "signal_absent" => format!(
+            r#"export async function agent(input, chidori) {{
+                const signal = await chidori.signal("review");
+                await fetch("{sentinel_url}", {{ method: "POST" }});
+                return {{ received: signal.payload }};
+            }}"#
+        ),
+        "approve_allow_bad" | "approve_deny_bad" | "approve_allow_absent" => format!(
+            r#"export async function agent(input, chidori) {{
+                await fetch("{sentinel_url}", {{ method: "POST" }});
+                return {{ sent: true }};
+            }}"#
+        ),
+        "warm_bad" | "warm_absent" => format!(
+            r#"export async function agent(input, chidori) {{
+                await chidori.input("continue?");
+                await fetch("{sentinel_url}", {{ method: "POST" }});
+                return {{ sent: true }};
+            }}"#
+        ),
+        "timeout_bad" | "timeout_absent" => format!(
+            r#"export async function agent(input, chidori) {{
+                const signal = await chidori.signal("review", {{ timeoutMs: 60000 }});
+                await fetch("{sentinel_url}", {{ method: "POST" }});
+                return {{ timedOut: signal.timedOut === true }};
+            }}"#
+        ),
+        _ => unreachable!(),
+    };
+    let agent_path = write_agent(temp.path(), &source);
+    let state = signal_test_state(temp.path(), agent_path);
+    let id = "corrupt-inbox-path";
+    let policy = matches!(
+        mode.as_str(),
+        "approve_allow_bad" | "approve_deny_bad" | "approve_allow_absent"
+    )
+    .then_some("supervised");
+    let mut request = create_request(policy);
+    request.session_id = Some(id.to_string());
+    let (created_status, created) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(created_status, StatusCode::CREATED, "{created}");
+    match mode.as_str() {
+        "signal_bad" | "signal_absent" | "warm_bad" | "warm_absent" | "timeout_bad"
+        | "timeout_absent" => assert_eq!(created["status"], json!("paused"), "{created}"),
+        _ => assert_eq!(created["status"], json!("awaitingapproval"), "{created}"),
+    }
+    let mut session_before = state.session_store.get(id).unwrap().unwrap();
+    let run_id = session_before.run_id.clone().expect("run id persisted");
+    let run_dir = state.run_base.join(&run_id);
+    let inbox_path = run_dir.join(SIGNAL_INBOX_FILE);
+    let corrupt = mode.ends_with("_bad");
+    if corrupt {
+        std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+        std::fs::write(&inbox_path, b"{broken signal inbox").unwrap();
+    }
+    let warm_before = if mode.starts_with("warm_") {
+        assert!(warm_parked(&state, id), "fixture must park the VM first");
+        true
+    } else {
+        false
+    };
+    let inbox_before = std::fs::read(&inbox_path).ok();
+    let journal_before = snapshot_journal_files(&run_dir);
+    let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
+    let pending_before = std::fs::read(&pending_path).unwrap_or_default();
+    let promises_before = snapshot_host_promise_events(&run_dir);
+    let approvals_before = session_before.approvals.len();
+
+    let (response_status, response_body) = match mode.as_str() {
+        "signal_bad" | "signal_absent" => {
+            response_json(
+                signal_session(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Json(SignalRequest {
+                        name: "review".to_string(),
+                        payload: json!({"id": "route-signal"}),
+                        from: json!({"kind": "human", "id": "test"}),
+                        allow_source_change: false,
+                    }),
+                )
+                .await,
+            )
+            .await
+        }
+        "approve_allow_bad" | "approve_deny_bad" | "approve_allow_absent" => {
+            response_json(
+                approve_session(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Json(ApproveRequest {
+                        decision: if mode == "approve_deny_bad" {
+                            "deny".to_string()
+                        } else {
+                            "allow".to_string()
+                        },
+                        allow_source_change: false,
+                    }),
+                )
+                .await,
+            )
+            .await
+        }
+        "warm_bad" | "warm_absent" => {
+            response_json(
+                resume_session(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Json(ResumeRequest {
+                        response: "continue".to_string(),
+                        allow_source_change: false,
+                    }),
+                )
+                .await,
+            )
+            .await
+        }
+        "timeout_bad" | "timeout_absent" => {
+            let mut expired = state.session_store.get(id).unwrap().unwrap();
+            expired.pending_signal_deadline =
+                Some(chrono::Utc::now() - chrono::Duration::milliseconds(1));
+            state.session_store.put(&expired).unwrap();
+            session_before = expired.clone();
+            arm_signal_timeout(&state, &expired);
+            let completed = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                wait_for_status(&state, id, SessionStatus::Completed),
+            )
+            .await;
+            let (status, body) = if let Ok(completed) = completed {
+                (StatusCode::OK, json!(session_view(&completed)))
+            } else {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    json!({"status":"still_paused"}),
+                )
+            };
+            (status, body)
+        }
+        _ => unreachable!(),
+    };
+
+    let session_after = state.session_store.get(id).unwrap().unwrap();
+    let journal_after = snapshot_journal_files(&run_dir);
+    let pending_after = std::fs::read(&pending_path).unwrap_or_default();
+    let promises_after = snapshot_host_promise_events(&run_dir);
+    let inbox_after = std::fs::read(&inbox_path).ok();
+    let observation = CorruptInboxExecutionObservation {
+        mode,
+        response_status: response_status.as_u16(),
+        response_body,
+        sentinel_requests: counter.load(Ordering::SeqCst),
+        session_unchanged: serde_json::to_vec(&session_before).unwrap()
+            == serde_json::to_vec(&session_after).unwrap(),
+        session_before: serde_json::to_value(&session_before).unwrap(),
+        session_after: serde_json::to_value(&session_after).unwrap(),
+        journal_unchanged: journal_before == journal_after,
+        pending_unchanged: pending_before == pending_after,
+        host_promises_unchanged: promises_before == promises_after,
+        inbox_before: inbox_before.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        inbox_after: inbox_after.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        inbox_path: inbox_path.display().to_string(),
+        final_status: format!("{:?}", session_after.status),
+        approvals_before,
+        approvals_after: session_after.approvals.len(),
+        warm_parked_after: warm_before && warm_parked(&state, id),
+    };
+    println!(
+        "{CORRUPT_INBOX_EXECUTION_OBSERVATION_PREFIX}{}",
+        serde_json::to_string(&observation).unwrap()
+    );
+    state.warm_runs.lock().unwrap().remove(id);
+    let _ = shutdown_tx.send(());
+    sentinel_server.await.unwrap();
+}
+
+fn assert_corrupt_inbox_rejected_before_execution(observed: &CorruptInboxExecutionObservation) {
+    let mut failures = Vec::new();
+    if observed.response_status != StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+        failures.push(format!("expected 500, got {}", observed.response_status));
+    }
+    if !observed
+        .response_body
+        .to_string()
+        .contains(&observed.inbox_path)
+    {
+        failures.push(format!(
+            "response did not identify corrupt inbox path {}: {}",
+            observed.inbox_path, observed.response_body
+        ));
+    }
+    if observed.sentinel_requests != 0 {
+        failures.push(format!(
+            "effect sentinel received {} requests",
+            observed.sentinel_requests
+        ));
+    }
+    if !observed.session_unchanged {
+        failures.push(format!("session changed: {:?}", observed.session_after));
+    }
+    for (name, same) in [
+        ("journal", observed.journal_unchanged),
+        ("pending host operation", observed.pending_unchanged),
+        ("host promises", observed.host_promises_unchanged),
+    ] {
+        if !same {
+            failures.push(format!("{name} changed"));
+        }
+    }
+    if observed.inbox_before != observed.inbox_after {
+        failures.push("corrupt inbox bytes changed".to_string());
+    }
+    if observed.approvals_before != observed.approvals_after {
+        failures.push("approval list changed".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "{} mutated before rejecting malformed inbox: {}; observation={observed:#?}",
+        observed.mode,
+        failures.join("; ")
+    );
+}
+
+#[test]
+fn matching_signal_resume_rejects_malformed_inbox_before_pending_resolution() {
+    let observed = run_corrupt_inbox_execution_child("signal_bad");
+    assert_corrupt_inbox_rejected_before_execution(&observed);
+    assert_eq!(observed.final_status, "Paused", "{observed:#?}");
+}
+
+#[test]
+fn approval_allow_rejects_malformed_inbox_before_approval_or_effect() {
+    let observed = run_corrupt_inbox_execution_child("approve_allow_bad");
+    assert_corrupt_inbox_rejected_before_execution(&observed);
+    assert_eq!(observed.final_status, "AwaitingApproval", "{observed:#?}");
+}
+
+#[test]
+fn approval_deny_control_does_not_dispatch_effect_with_malformed_inbox() {
+    let observed = run_corrupt_inbox_execution_child("approve_deny_bad");
+    assert_eq!(
+        observed.response_status,
+        StatusCode::OK.as_u16(),
+        "{observed:#?}"
+    );
+    assert_eq!(observed.final_status, "Failed", "{observed:#?}");
+    assert_eq!(observed.sentinel_requests, 0, "{observed:#?}");
+    assert!(observed.inbox_before.is_some(), "{observed:#?}");
+    assert_eq!(observed.inbox_before, observed.inbox_after, "{observed:#?}");
+    assert!(!observed.pending_unchanged, "deny must reject pending call");
+    assert!(
+        observed.journal_unchanged,
+        "deny does not append an effect row"
+    );
+    assert_eq!(observed.approvals_before, observed.approvals_after);
+}
+
+#[test]
+fn warm_resume_rejects_malformed_inbox_before_delivering_to_parked_vm() {
+    let observed = run_corrupt_inbox_execution_child("warm_bad");
+    assert_corrupt_inbox_rejected_before_execution(&observed);
+    assert!(
+        observed.warm_parked_after,
+        "parked VM must remain undelivered: {observed:#?}"
+    );
+    assert_eq!(observed.final_status, "Paused", "{observed:#?}");
+}
+
+#[test]
+fn timeout_rearm_keeps_corrupt_inbox_session_retryable() {
+    let observed = run_corrupt_inbox_execution_child("timeout_bad");
+    assert_eq!(observed.final_status, "Paused", "{observed:#?}");
+    assert_eq!(observed.sentinel_requests, 0, "{observed:#?}");
+    assert!(
+        observed.session_unchanged,
+        "timeout terminalized the session: {observed:#?}"
+    );
+    assert!(
+        observed.pending_unchanged,
+        "timeout resolved the pending promise: {observed:#?}"
+    );
+    assert!(
+        observed.journal_unchanged,
+        "timeout appended a synthetic record: {observed:#?}"
+    );
+    assert!(
+        observed.host_promises_unchanged,
+        "timeout changed promise state: {observed:#?}"
+    );
+    assert_eq!(observed.inbox_before, observed.inbox_after, "{observed:#?}");
+}
+
+#[test]
+fn corrupt_inbox_execution_paths_keep_absent_inbox_controls_working() {
+    for mode in [
+        "signal_absent",
+        "approve_allow_absent",
+        "warm_absent",
+        "timeout_absent",
+    ] {
+        let observed = run_corrupt_inbox_execution_child(mode);
+        assert_eq!(
+            observed.response_status,
+            StatusCode::OK.as_u16(),
+            "{observed:#?}"
+        );
+        assert_eq!(observed.sentinel_requests, 1, "{observed:#?}");
+        assert_eq!(observed.final_status, "Completed", "{observed:#?}");
+        assert_eq!(observed.inbox_before, None, "{observed:#?}");
+    }
+}
+
 /// Signal delivered to a run paused waiting on THIS name resolves the pause
 /// and resumes to completion; the final output and the session view reflect
 /// the delivered payload.
