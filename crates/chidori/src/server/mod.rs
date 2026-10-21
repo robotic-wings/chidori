@@ -1496,7 +1496,13 @@ pub async fn serve(
                 eprintln!("  Re-armed {count} detached agent(s) from the registry");
             }
             Ok(_) => {}
-            Err(err) => tracing::warn!("re-arming detached agents: {err}"),
+            Err(err) => {
+                if tracing::enabled!(tracing::Level::WARN) {
+                    tracing::warn!("re-arming detached agents: {err}");
+                } else {
+                    eprintln!("Warning: re-arming detached agents: {err}");
+                }
+            }
         }
     }
 
