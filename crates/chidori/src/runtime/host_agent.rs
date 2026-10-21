@@ -5559,7 +5559,7 @@ mod tests {
             stale_name_cache_event(
                 "a-lookup-send-complete",
                 json!({ "lookup": lookup, "send": send }),
-                false,
+                true,
             );
             return;
         }
@@ -5674,7 +5674,7 @@ mod tests {
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
-        stale_name_cache_event("b-final-snapshot", report, false);
+        stale_name_cache_event("b-final-snapshot", report, true);
     }
 
     #[test]
@@ -5747,7 +5747,7 @@ mod tests {
             use std::io::Write;
             a_ready_stream.write_all(b"R").unwrap();
             a_ready_stream.flush().unwrap();
-            let (a_done, _) = accept_stale_name_cache_event(
+            let (a_done, mut a_done_stream) = accept_stale_name_cache_event(
                 &listener,
                 "A lookup/send complete",
                 &mut process_a.0,
@@ -5755,6 +5755,8 @@ mod tests {
                 "a",
             );
             assert_eq!(a_done["phase"], "a-lookup-send-complete");
+            a_done_stream.write_all(b"R").unwrap();
+            a_done_stream.flush().unwrap();
             b_ready_stream.write_all(b"R").unwrap();
             b_ready_stream.flush().unwrap();
 
@@ -5765,7 +5767,7 @@ mod tests {
                 std::fs::read_to_string(root.join("a.stdout")).unwrap_or_default(),
                 std::fs::read_to_string(root.join("a.stderr")).unwrap_or_default()
             );
-            let (b_final, _) = accept_stale_name_cache_event(
+            let (b_final, mut b_final_stream) = accept_stale_name_cache_event(
                 &listener,
                 "B final snapshot",
                 &mut process_b.0,
@@ -5773,6 +5775,8 @@ mod tests {
                 "b",
             );
             assert_eq!(b_final["phase"], "b-final-snapshot");
+            b_final_stream.write_all(b"R").unwrap();
+            b_final_stream.flush().unwrap();
             let b_status = process_b.0.wait().unwrap();
             assert!(
                 b_status.success(),
