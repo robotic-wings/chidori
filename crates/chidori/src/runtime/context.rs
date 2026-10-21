@@ -2300,6 +2300,202 @@ mod tests {
     use super::*;
     use crate::runtime::snapshot::{HostPromiseState, PENDING_HOST_OPERATION_FILE};
 
+    #[derive(Clone)]
+    struct HttpInboxState {
+        blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        initial_inbox_reads: Arc<std::sync::atomic::AtomicUsize>,
+        initial_inbox_barrier: Arc<tokio::sync::Barrier>,
+        gate_initial_inbox_reads: bool,
+    }
+
+    struct HttpInboxServer {
+        url: String,
+        state: HttpInboxState,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for HttpInboxServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("HTTP inbox test server panicked");
+            }
+        }
+    }
+
+    async fn http_inbox_get(
+        axum::extract::State(state): axum::extract::State<HttpInboxState>,
+        axum::extract::Path((run_id, key)): axum::extract::Path<(String, String)>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+
+        let full_key = format!("{run_id}/{key}");
+        let bytes = state.blobs.lock().unwrap().get(&full_key).cloned();
+        if state.gate_initial_inbox_reads && key == SIGNAL_INBOX_FILE {
+            let read = state
+                .initial_inbox_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read < 2
+                && tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.initial_inbox_barrier.wait(),
+                )
+                .await
+                .is_err()
+            {
+                return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
+            }
+        }
+        match bytes {
+            Some(bytes) => (axum::http::StatusCode::OK, bytes).into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn http_inbox_put(
+        axum::extract::State(state): axum::extract::State<HttpInboxState>,
+        axum::extract::Path((run_id, key)): axum::extract::Path<(String, String)>,
+        body: axum::body::Bytes,
+    ) -> axum::http::StatusCode {
+        state
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(format!("{run_id}/{key}"), body.to_vec());
+        axum::http::StatusCode::OK
+    }
+
+    fn spawn_http_inbox_server(gate_initial_inbox_reads: bool) -> HttpInboxServer {
+        use axum::routing::get;
+
+        let mut blobs = HashMap::new();
+        blobs.insert(format!("run-http/{SIGNAL_INBOX_FILE}"), b"[]".to_vec());
+        let state = HttpInboxState {
+            blobs: Arc::new(Mutex::new(blobs)),
+            initial_inbox_reads: Arc::default(),
+            initial_inbox_barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            gate_initial_inbox_reads,
+        };
+        let app = axum::Router::new()
+            .route(
+                "/runs/{id}/blobs/{*key}",
+                get(http_inbox_get).put(http_inbox_put),
+            )
+            .with_state(state.clone());
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+        HttpInboxServer {
+            url: format!("http://{}", addr_rx.recv().unwrap()),
+            state,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn http_backed_signal_context(
+        server: &HttpInboxServer,
+    ) -> (
+        RuntimeContext,
+        tempfile::TempDir,
+        Arc<crate::runtime::store::HttpRunStore>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RuntimeContext::new();
+        let store = Arc::new(crate::runtime::store::HttpRunStore::new(
+            crate::runtime::store::HttpRelay::new(server.url.clone(), None),
+            "run-http",
+        ));
+        let runtime_store: Arc<dyn crate::runtime::store::RunStore> = store.clone();
+        ctx.enable_persistence_with_store(dir.path().to_path_buf(), runtime_store);
+        (ctx, dir, store)
+    }
+
+    fn assert_http_inbox_has_each_delivery(server: &HttpInboxServer, expected_ids: &[&str]) {
+        let bytes = server
+            .state
+            .blobs
+            .lock()
+            .unwrap()
+            .get(&format!("run-http/{SIGNAL_INBOX_FILE}"))
+            .cloned()
+            .expect("signal inbox must still exist");
+        let inbox: Vec<QueuedSignal> = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<_> = inbox
+            .iter()
+            .map(|signal| signal.payload["id"].as_str().unwrap())
+            .collect();
+        let mut failures = Vec::new();
+        for expected in expected_ids {
+            let count = ids.iter().filter(|id| **id == *expected).count();
+            if count != 1 {
+                failures.push(format!(
+                    "{expected} occurs {count} times; inbox IDs={ids:?}"
+                ));
+            }
+        }
+        let mut sequences: Vec<_> = inbox.iter().map(|signal| signal.delivery_seq).collect();
+        let original_len = inbox.len();
+        sequences.sort_unstable();
+        sequences.dedup();
+        if original_len != expected_ids.len() {
+            failures.push(format!(
+                "expected {} inbox rows, found {original_len}; inbox IDs={ids:?}",
+                expected_ids.len()
+            ));
+        }
+        if sequences.len() != original_len {
+            failures.push(format!(
+                "delivery_seq values are not distinct: {sequences:?}"
+            ));
+        }
+        if inbox
+            .windows(2)
+            .any(|pair| pair[0].delivery_seq >= pair[1].delivery_seq)
+        {
+            failures.push(format!(
+                "delivery_seq values are not strictly ordered in inbox: {:?}",
+                inbox
+                    .iter()
+                    .map(|signal| signal.delivery_seq)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let mut observed_ids = ids;
+        observed_ids.sort_unstable();
+        let mut expected_ids = expected_ids.to_vec();
+        expected_ids.sort_unstable();
+        if observed_ids != expected_ids {
+            failures.push(format!(
+                "expected IDs {expected_ids:?}, found {observed_ids:?}"
+            ));
+        }
+        assert!(
+            failures.is_empty(),
+            "HTTP signal inbox did not preserve every acknowledged delivery: {}; persisted bytes={}",
+            failures.join("; "),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
     #[test]
     fn lease_loss_is_fatal_under_all_durability_modes() {
         for (mode, latches_ordinary_writes) in
@@ -2598,5 +2794,80 @@ mod tests {
         assert_eq!(ctx.pending_host_operation(tool_id).unwrap().id, tool_id);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn http_run_store_signal_inbox_two_clients_race_preserves_both_deliveries() {
+        let server = spawn_http_inbox_server(true);
+        let (first, _first_dir, first_store) = http_backed_signal_context(&server);
+        let (second, _second_dir, second_store) = http_backed_signal_context(&server);
+        let first_send = std::thread::spawn(move || {
+            first.enqueue_live_signal(
+                "review",
+                serde_json::json!({"id": "race-a"}),
+                serde_json::json!({"kind": "human", "id": "sender-a"}),
+            )
+        });
+        let second_send = std::thread::spawn(move || {
+            second.enqueue_live_signal(
+                "review",
+                serde_json::json!({"id": "race-b"}),
+                serde_json::json!({"kind": "human", "id": "sender-b"}),
+            )
+        });
+
+        let first_result = first_send.join().expect("first signal sender panicked");
+        let second_result = second_send.join().expect("second signal sender panicked");
+        assert!(
+            first_result.is_ok(),
+            "first send did not report success: {first_result:?}"
+        );
+        assert!(
+            second_result.is_ok(),
+            "second send did not report success: {second_result:?}"
+        );
+        assert_eq!(
+            server
+                .state
+                .initial_inbox_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both clients must read the same initial inbox before either response is released"
+        );
+        first_store.flush().unwrap();
+        second_store.flush().unwrap();
+        assert_http_inbox_has_each_delivery(&server, &["race-a", "race-b"]);
+    }
+
+    #[test]
+    fn http_run_store_signal_inbox_single_client_control_is_ordered() {
+        let server = spawn_http_inbox_server(false);
+        let (ctx, _dir, store) = http_backed_signal_context(&server);
+        for id in ["single-a", "single-b"] {
+            ctx.enqueue_live_signal(
+                "review",
+                serde_json::json!({"id": id}),
+                serde_json::json!({"kind": "human", "id": "single-client"}),
+            )
+            .unwrap();
+        }
+        store.flush().unwrap();
+        assert_http_inbox_has_each_delivery(&server, &["single-a", "single-b"]);
+    }
+
+    #[test]
+    fn http_run_store_signal_inbox_sequential_clients_control_is_ordered() {
+        let server = spawn_http_inbox_server(false);
+        for (id, sender) in [("sequential-a", "sender-a"), ("sequential-b", "sender-b")] {
+            let (ctx, _dir, store) = http_backed_signal_context(&server);
+            ctx.enqueue_live_signal(
+                "review",
+                serde_json::json!({"id": id}),
+                serde_json::json!({"kind": "human", "id": sender}),
+            )
+            .unwrap();
+            store.flush().unwrap();
+        }
+        assert_http_inbox_has_each_delivery(&server, &["sequential-a", "sequential-b"]);
     }
 }
