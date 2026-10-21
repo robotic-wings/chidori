@@ -4087,6 +4087,246 @@ mod tests {
         hub.ensure_entry(parts, name).unwrap()
     }
 
+    const REARM_CORRUPT_REGISTRY_ROOT: &str = "CHIDORI_TEST_REARM_CORRUPT_REGISTRY_ROOT";
+    const REARM_CORRUPT_REGISTRY_SCENARIO: &str = "CHIDORI_TEST_REARM_CORRUPT_REGISTRY_SCENARIO";
+    const REARM_CORRUPT_REGISTRY_TEST: &str =
+        "runtime::host_agent::tests::detached_rearm_from_registry_rejects_corrupt_metadata_and_preserves_controls";
+
+    fn seed_rearm_registry_entry(
+        factory: &RunStoreFactory,
+        name: &str,
+        run_id: &str,
+    ) -> (Vec<CallRecord>, Vec<u8>) {
+        let now = Utc::now();
+        let descriptor = json!({
+            "name": name,
+            "run_id": run_id,
+            "source": "services/hibernating.ts",
+            "input": {},
+            "restart": "resume",
+            "max_restarts": 0,
+            "backoff_ms": 0,
+            "owner_run_id": "registry-rearm-test",
+            "model": null,
+            "status": "hibernating",
+            "listen": null,
+            "restarts": 0,
+            "output": null,
+            "error": null,
+            "created_at": now,
+            "updated_at": now,
+        });
+        factory.registry_put(name, run_id, &descriptor).unwrap();
+        let record = CallRecord {
+            seq: 1,
+            parent_seq: None,
+            function: "tool".to_string(),
+            args: json!({"name":"preserved"}),
+            result: json!({"preserved":true}),
+            duration_ms: 1,
+            token_usage: None,
+            timestamp: now,
+            error: None,
+        };
+        let store = factory.store_for(run_id);
+        store.append_record(&record).unwrap();
+        let inbox = serde_json::to_vec(&vec![QueuedSignal {
+            name: "preserve".to_string(),
+            payload: json!({"id":"preserve-payload"}),
+            from: json!({"kind":"test"}),
+            delivery_seq: 7,
+            enqueued_at: now,
+        }])
+        .unwrap();
+        store.put_blob(SIGNAL_INBOX_FILE, &inbox).unwrap();
+        let records = store.load_call_log().unwrap().unwrap();
+        (records, inbox)
+    }
+
+    fn run_rearm_registry_child(
+        scenario: &str,
+        root: &Path,
+        backend: &str,
+    ) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", REARM_CORRUPT_REGISTRY_TEST, "--nocapture"])
+            .env(REARM_CORRUPT_REGISTRY_ROOT, root)
+            .env(REARM_CORRUPT_REGISTRY_SCENARIO, scenario)
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_RUN_DB", root.join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn detached_rearm_from_registry_rejects_corrupt_metadata_and_preserves_controls() {
+        if let Some(scenario) = std::env::var_os(REARM_CORRUPT_REGISTRY_SCENARIO) {
+            let scenario = scenario.to_string_lossy().into_owned();
+            let root = PathBuf::from(std::env::var_os(REARM_CORRUPT_REGISTRY_ROOT).unwrap());
+            let run_base = root.join(".chidori/runs");
+            std::fs::create_dir_all(&run_base).unwrap();
+            let backend = std::env::var("CHIDORI_RUN_STORE").unwrap();
+            let parts = sqlite_test_parts(&root, run_base.clone(), Arc::new(ToolRegistry::new()));
+            let factory = RunStoreFactory::shared(&run_base);
+            let hub = DetachedAgentHub {
+                parts: Mutex::new(None),
+                entries: Mutex::new(HashMap::new()),
+                timer_started: Mutex::new(false),
+            };
+
+            match scenario.as_str() {
+                "malformed-local-json" => {
+                    let (_records, _inbox) = seed_rearm_registry_entry(
+                        &factory,
+                        "zz-valid-preserved",
+                        "valid-preserved-run",
+                    );
+                    let store = factory.store_for("valid-preserved-run");
+                    let records_before = store.load_call_log().unwrap().unwrap();
+                    let inbox_before = store.get_blob(SIGNAL_INBOX_FILE).unwrap().unwrap();
+                    let corrupt_path = run_base.join("agents/aa-malformed-registry.json");
+                    std::fs::write(&corrupt_path, b"{ malformed registry").unwrap();
+
+                    let result = hub.rearm_from_registry(parts.clone());
+                    let error = result.expect_err(
+                        "rearm must fail instead of silently omitting malformed named registry metadata",
+                    );
+                    assert!(
+                        error.contains("aa-malformed-registry")
+                            || error.contains(&corrupt_path.display().to_string()),
+                        "rearm error must identify the corrupt registry path/name: {error}"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap(),
+                        serde_json::to_value(records_before).unwrap()
+                    );
+                    assert_eq!(
+                        store.get_blob(SIGNAL_INBOX_FILE).unwrap().unwrap(),
+                        inbox_before
+                    );
+                    assert!(hub.entries.lock().unwrap().values().all(|entry| {
+                        let state = entry.state.lock().unwrap();
+                        !state.thread_live && state.descriptor.status == "hibernating"
+                    }));
+                }
+                "invalid-descriptor" => {
+                    let (_records, _inbox) = seed_rearm_registry_entry(
+                        &factory,
+                        "zz-valid-preserved",
+                        "valid-preserved-run",
+                    );
+                    let store = factory.store_for("valid-preserved-run");
+                    let records_before = store.load_call_log().unwrap().unwrap();
+                    let inbox_before = store.get_blob(SIGNAL_INBOX_FILE).unwrap().unwrap();
+                    let corrupt_path = run_base.join("agents/aa-invalid-descriptor.json");
+                    std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+                    std::fs::write(
+                        &corrupt_path,
+                        br#"{"name":"aa-invalid-descriptor","run_id":"invalid-descriptor-run"}"#,
+                    )
+                    .unwrap();
+
+                    let result = hub.rearm_from_registry(parts.clone());
+                    let error = result.expect_err(
+                        "rearm must fail instead of silently skipping a named row with no valid descriptor",
+                    );
+                    assert!(
+                        error.contains("aa-invalid-descriptor"),
+                        "rearm error must identify the invalid descriptor name: {error}"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap(),
+                        serde_json::to_value(records_before).unwrap()
+                    );
+                    assert_eq!(
+                        store.get_blob(SIGNAL_INBOX_FILE).unwrap().unwrap(),
+                        inbox_before
+                    );
+                    assert!(hub.entries.lock().unwrap().values().all(|entry| {
+                        let state = entry.state.lock().unwrap();
+                        !state.thread_live && state.descriptor.status == "hibernating"
+                    }));
+                }
+                "valid-two-entry-fleet" => {
+                    seed_rearm_registry_entry(&factory, "fleet-one", "fleet-run-one");
+                    seed_rearm_registry_entry(&factory, "fleet-two", "fleet-run-two");
+                    assert_eq!(hub.rearm_from_registry(parts.clone()).unwrap(), 2);
+                    let entries = hub.entries.lock().unwrap();
+                    assert!(entries.contains_key("fleet-one"));
+                    assert!(entries.contains_key("fleet-two"));
+                    for entry in entries.values() {
+                        let state = entry.state.lock().unwrap();
+                        assert_eq!(state.descriptor.status, "hibernating");
+                        assert!(!state.thread_live, "fixture must not start a worker");
+                    }
+                }
+                "absent-agents-directory" => {
+                    assert!(!run_base.join("agents").exists());
+                    assert_eq!(hub.rearm_from_registry(parts.clone()).unwrap(), 0);
+                    assert!(!run_base.join("agents").exists());
+                }
+                "sqlite-mirror-missing-local-copy" => {
+                    assert_eq!(backend, "sqlite");
+                    let (records_before, inbox_before) =
+                        seed_rearm_registry_entry(&factory, "mirror-agent", "mirror-agent-run");
+                    std::fs::remove_file(run_base.join("agents/mirror-agent.json")).unwrap();
+                    std::fs::remove_dir_all(run_base.join("mirror-agent-run")).unwrap();
+
+                    assert_eq!(hub.rearm_from_registry(parts.clone()).unwrap(), 1);
+                    let store = factory.store_for("mirror-agent-run");
+                    assert_eq!(
+                        serde_json::to_value(store.load_call_log().unwrap().unwrap()).unwrap(),
+                        serde_json::to_value(records_before).unwrap()
+                    );
+                    assert_eq!(
+                        store.get_blob(SIGNAL_INBOX_FILE).unwrap().unwrap(),
+                        inbox_before
+                    );
+                    assert!(run_base.join("mirror-agent-run/records.jsonl").exists());
+                    assert!(run_base
+                        .join("mirror-agent-run/signals/inbox.json")
+                        .exists());
+                    let entry = hub.entries.lock().unwrap()["mirror-agent"].clone();
+                    let state = entry.state.lock().unwrap();
+                    assert_eq!(state.descriptor.status, "hibernating");
+                    assert!(!state.thread_live);
+                }
+                other => panic!("unknown registry rearm scenario {other}"),
+            }
+            eprintln!("REARM_SCENARIO_PASS={scenario} BACKEND={backend}");
+            return;
+        }
+
+        let cases = [
+            ("valid-two-entry-fleet", "fs"),
+            ("absent-agents-directory", "fs"),
+            ("sqlite-mirror-missing-local-copy", "sqlite"),
+            ("malformed-local-json", "fs"),
+            ("invalid-descriptor", "fs"),
+        ];
+        let mut failures = Vec::new();
+        let mut outcomes = Vec::new();
+        for (scenario, backend) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let output = run_rearm_registry_child(scenario, root.path(), backend);
+            let report = format!(
+                "scenario={scenario} backend={backend} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success() {
+                failures.push(report.clone());
+            }
+            outcomes.push(report);
+        }
+        assert!(
+            failures.is_empty(),
+            "detached registry rearm child failures:\n{failures:#?}\nall child outcomes:\n{outcomes:#?}"
+        );
+    }
+
     #[test]
     fn detached_name_resolution_fails_closed_and_preserves_same_incarnation_context() {
         let temp = tempfile::tempdir().unwrap();
