@@ -77,6 +77,7 @@ fn wait_for_health(port: u16) {
 fn is_server_startup_status_line(line: &str) -> bool {
     let line = line.trim_start();
     [
+        "App fleet:",
         "Re-armed ",
         "Listening on http://",
         "WARNING: non-loopback bind",
@@ -92,6 +93,20 @@ fn is_server_startup_status_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix))
+}
+
+fn trace_message(event: &serde_json::Value) -> Option<&str> {
+    event["fields"]["message"]
+        .as_str()
+        .or_else(|| event["message"].as_str())
+}
+
+fn write_manifest(project: &Path) {
+    fs::write(
+        project.join("chidori.app.yml"),
+        "name: startup-output\nagents:\n  - name: manifest-probe\n    agent: worker.ts\n    keep_alive: true\nroutes:\n  - path: /hooks/example\n    agent: manifest-probe\n    signal: event\n",
+    )
+    .unwrap();
 }
 
 fn seed_hibernating_detached_agent(project: &Path) {
@@ -159,6 +174,8 @@ fn run_public_serve_child() {
         .worker_threads(2)
         .build()
         .unwrap();
+    let manifest =
+        chidori::app_manifest::AppManifest::load(&project.join("chidori.app.yml")).unwrap();
     runtime.block_on(async move {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let project_for_server = project.clone();
@@ -172,7 +189,7 @@ fn run_public_serve_child() {
                     port,
                     Arc::new(chidori::policy::PolicyConfig::default()),
                     "trusted".to_string(),
-                    None,
+                    Some(manifest),
                 ) => result.unwrap(),
                 _ = shutdown_rx => {},
             }
@@ -199,6 +216,10 @@ fn spawn_cli_serve(project: &Path, port: u16) -> std::process::Child {
         ])
         .current_dir(project)
         .env("CHIDORI_RUN_STORE", "fs")
+        .env("CHIDORI_SERVE_ROUTES", "strict")
+        .env("CHIDORI_CORS_ORIGINS", "http://allowed.example")
+        .env("CHIDORI_MAX_CONCURRENT_SESSIONS", "3")
+        .env("CHIDORI_ACQUIRE_TIMEOUT_MS", "2500")
         .env_remove("CHIDORI_RUN_DB")
         .env_remove("CHIDORI_DURABILITY")
         .stdout(Stdio::piped())
@@ -243,6 +264,7 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
 
     let project = TempDir::new().unwrap();
     seed_hibernating_detached_agent(project.path());
+    write_manifest(project.path());
 
     let public_port = free_loopback_port();
     let trace_path = project.path().join("public-serve-trace.jsonl");
@@ -286,18 +308,50 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
         .map(|line| serde_json::from_str(line).expect("trace output is JSONL"))
         .collect();
     assert!(
-        events.iter().any(|event| event["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Listening on http://"))),
-        "structured tracing should expose the successful listening lifecycle event: {trace}"
+        events.iter().any(|event| {
+            trace_message(event) == Some("server listener ready")
+                && event["fields"]["listener_addr"]
+                    .as_str()
+                    .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                    .is_some_and(|addr| addr.ip().is_loopback())
+        }),
+        "structured tracing should expose the fixed listener event and loopback address field: {trace}"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| event["message"].as_str().is_some_and(|message| {
-                message.contains("Re-armed 1 detached agent(s) from the registry")
-            })),
-        "structured tracing should expose the successful detached rearm lifecycle event: {trace}"
+        events.iter().any(|event| {
+            trace_message(event) == Some("detached agents re-armed from registry")
+                && event["fields"]["count"].as_u64() == Some(1)
+        }),
+        "structured tracing should expose the fixed rearm event and count field: {trace}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            trace_message(event).is_some_and(|message| message.contains("server routes configured"))
+        }),
+        "structured tracing should expose startup and route configuration: {trace}"
+    );
+    let route_event = events.iter().find(|event| {
+        trace_message(event).is_some_and(|message| message.contains("server routes configured"))
+    });
+    assert!(
+        route_event.is_some_and(|event| {
+            event["fields"]["health_route"] == "GET /health"
+                && event["fields"]["routes"]
+                    .as_str()
+                    .is_some_and(|routes| routes.contains("GET /health"))
+        }),
+        "structured route event should include health and the route map: {trace}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            trace_message(event)
+                .is_some_and(|message| message.contains("spawned app manifest agent"))
+                && event["fields"]["agent"] == "manifest-probe"
+                && event["fields"]["run_id"]
+                    .as_str()
+                    .is_some_and(|run_id| !run_id.is_empty())
+        }),
+        "successful manifest spawn tracing should include agent and run id: {trace}"
     );
 }
 
@@ -309,6 +363,7 @@ fn cli_serve_retains_user_facing_startup_and_rearm_status() {
     }
     let project = TempDir::new().unwrap();
     seed_hibernating_detached_agent(project.path());
+    write_manifest(project.path());
     let cli_port = free_loopback_port();
     let cli = cli_serve_until_healthy(project.path(), cli_port);
     let cli_stderr = String::from_utf8_lossy(&cli.stderr);
@@ -319,5 +374,48 @@ fn cli_serve_retains_user_facing_startup_and_rearm_status() {
     assert!(
         cli_stderr.contains("Re-armed 1 detached agent(s) from the registry"),
         "CLI should retain its user-facing successful rearm status:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("App fleet: spawned `manifest-probe` (run "),
+        "CLI should retain successful manifest spawn and run id notice:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Agent: none — fleet-only server"),
+        "CLI should retain its agent summary:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains(
+            "App manifest: startup-output — 1 agent(s) (1 kept alive, 0 scheduled), 1 route(s)"
+        ),
+        "CLI should retain its app manifest summary:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Isolation:"),
+        "CLI should retain its isolation summary:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Concurrency: max 3 sessions, 2500ms acquire timeout"),
+        "CLI should format concurrency from the startup snapshot:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Auth:        disabled (loopback bind; set CHIDORI_API_KEY to enable)"),
+        "CLI should format authentication from the startup snapshot:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Policy:      trusted"),
+        "CLI should format policy from the startup snapshot:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("CORS:        allow: http://allowed.example"),
+        "CLI should format CORS from the startup snapshot:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("Events:     ANY /events      → agent(event); strict routes"),
+        "CLI should format the selected route mode from the startup snapshot:\n{cli_stderr}"
+    );
+    assert!(
+        cli_stderr.contains("POST /sessions   → create & run")
+            && cli_stderr.contains("GET  /health"),
+        "CLI should retain its documented route and health summaries:\n{cli_stderr}"
     );
 }

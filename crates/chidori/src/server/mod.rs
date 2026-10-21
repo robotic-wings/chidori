@@ -1193,7 +1193,10 @@ fn resolve_persisted_pending_host_operation(
 /// live in the registry. Best-effort per agent: one bad entry logs and skips
 /// rather than taking the whole boot down (the manifest itself was validated
 /// at load).
-fn boot_manifest_fleet(manifest: &crate::app_manifest::AppManifest) {
+fn boot_manifest_fleet(
+    manifest: &crate::app_manifest::AppManifest,
+    reporter: Option<&ServeReporter>,
+) {
     let hub = crate::runtime::host_agent::hub();
     let parts = match hub.installed_parts() {
         Ok(parts) => parts,
@@ -1239,14 +1242,21 @@ fn boot_manifest_fleet(manifest: &crate::app_manifest::AppManifest) {
             agent.input.clone()
         };
         match hub.spawn(&parts, &source, input, &options, "app-manifest".to_string()) {
-            Ok(receipt) => eprintln!(
-                "  App fleet: spawned `{}` (run {})",
-                agent.name,
-                receipt
+            Ok(receipt) => {
+                let run_id = receipt
                     .get("runId")
                     .and_then(Value::as_str)
                     .unwrap_or("<unknown>")
-            ),
+                    .to_string();
+                tracing::info!(agent = %agent.name, run_id = %run_id, "spawned app manifest agent");
+                notify_reporter(
+                    reporter,
+                    ServeNotice::ManifestAgentSpawned {
+                        agent_name: agent.name.clone(),
+                        run_id,
+                    },
+                );
+            }
             Err(err) => tracing::warn!("app manifest fleet: spawning `{}`: {err}", agent.name),
         }
     }
@@ -1255,6 +1265,40 @@ fn boot_manifest_fleet(manifest: &crate::app_manifest::AppManifest) {
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
+
+pub(crate) type ServeReporter = Arc<dyn Fn(ServeNotice) + Send + Sync>;
+
+#[derive(Debug)]
+// The library build has no CLI consumer; the binary build reads these payloads
+// in `cmd_serve` while the public `serve` wrapper intentionally supplies none.
+#[allow(dead_code)]
+pub(crate) enum ServeNotice {
+    ManifestAgentSpawned { agent_name: String, run_id: String },
+    DetachedAgentsRearmed { count: usize },
+    RearmFailed { error: String },
+    StartupReady(ServeStartupSnapshot),
+}
+
+#[derive(Debug)]
+// See `ServeNotice`: this snapshot is formatted only by the CLI binary.
+#[allow(dead_code)]
+pub(crate) struct ServeStartupSnapshot {
+    pub addr: std::net::SocketAddr,
+    pub non_loopback: bool,
+    pub max_concurrent: usize,
+    pub acquire_timeout_ms: u64,
+    pub auth_required: bool,
+    pub loopback: bool,
+    pub policy_posture: String,
+    pub cors_origins: Option<String>,
+    pub strict_routes: bool,
+}
+
+fn notify_reporter(reporter: Option<&ServeReporter>, notice: ServeNotice) {
+    if let Some(reporter) = reporter {
+        reporter(notice);
+    }
+}
 
 pub async fn serve(
     providers: Arc<ProviderRegistry>,
@@ -1266,7 +1310,7 @@ pub async fn serve(
     policy_posture: String,
     app_manifest: Option<crate::app_manifest::AppManifest>,
 ) -> anyhow::Result<()> {
-    serve_with_rearm_failure_reporter(
+    serve_with_cli_reporter(
         providers,
         template_engine,
         agent_path,
@@ -1280,11 +1324,8 @@ pub async fn serve(
     .await
 }
 
-/// Serve with an optional caller-owned reporter for detached rearm failures.
-/// The server always emits a structured tracing warning; this callback lets
-/// the CLI present the same startup failure to users without writing directly
-/// to an embedding application's stderr.
-pub(crate) async fn serve_with_rearm_failure_reporter(
+/// Serve with an optional CLI reporter for startup notices.
+pub(crate) async fn serve_with_cli_reporter(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
     agent_path: Option<PathBuf>,
@@ -1293,7 +1334,7 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
     policy: Arc<PolicyConfig>,
     policy_posture: String,
     app_manifest: Option<crate::app_manifest::AppManifest>,
-    rearm_failure_reporter: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    reporter: Option<ServeReporter>,
 ) -> anyhow::Result<()> {
     // No agent file → a fleet-only server: it re-arms and drives the
     // detached-agent fleet under the current directory, and every session
@@ -1327,6 +1368,9 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
     // work or cause detached effects. The unsafe-bind preflight above remains
     // first so refused configurations perform neither bind nor recovery.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener_addr = listener
+        .local_addr()
+        .context("reading bound server listener address")?;
     let base_dir = agent_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -1539,14 +1583,21 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
         };
         match crate::runtime::host_agent::hub().rearm_from_registry(parts) {
             Ok(count) if count > 0 => {
-                eprintln!("  Re-armed {count} detached agent(s) from the registry");
+                tracing::info!(count, "detached agents re-armed from registry");
+                notify_reporter(
+                    reporter.as_ref(),
+                    ServeNotice::DetachedAgentsRearmed { count },
+                );
             }
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(error = %err, "re-arming detached agents failed");
-                if let Some(report) = &rearm_failure_reporter {
-                    report(&err);
-                }
+                notify_reporter(
+                    reporter.as_ref(),
+                    ServeNotice::RearmFailed {
+                        error: err.to_string(),
+                    },
+                );
             }
         }
     }
@@ -1556,7 +1607,7 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
     // above; settled ones are replaced by a fresh spawn, mailbox migration
     // included, exactly like a `chidori.agents.spawn` reusing the name).
     if let Some(manifest) = &app_manifest {
-        boot_manifest_fleet(manifest);
+        boot_manifest_fleet(manifest, reporter.as_ref());
     }
 
     let cors_layer = build_cors_layer();
@@ -1633,30 +1684,13 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors_layer);
 
-    eprintln!("Listening on http://{addr}");
     if !loopback {
-        eprintln!(
-            "WARNING: non-loopback bind speaks plain HTTP (no TLS). Terminate TLS at a \
-             reverse proxy or platform ingress and firewall the port (docs/deployment.md)."
+        tracing::warn!(
+            host = %listener_addr.ip(),
+            port = listener_addr.port(),
+            "non-loopback server bind speaks plain HTTP; terminate TLS at a reverse proxy or platform ingress and firewall the port"
         );
     }
-    eprintln!();
-    eprintln!(
-        "  Concurrency: max {} sessions, {}ms acquire timeout",
-        max_concurrent, acquire_timeout_ms
-    );
-    eprintln!(
-        "  Auth:        {}",
-        if auth_required {
-            "REQUIRED (Authorization: Bearer $CHIDORI_API_KEY)"
-        } else if loopback {
-            "disabled (loopback bind; set CHIDORI_API_KEY to enable)"
-        } else {
-            "DISABLED on a network-reachable bind (CHIDORI_ALLOW_UNAUTHENTICATED) — \
-             anyone who can reach the port can execute agents"
-        }
-    );
-    eprintln!("  Policy:      {}", policy_posture);
     // Effect preflight (warning only, see server/preflight.rs): agents don't
     // statically declare their effects, so scan the served agent's source for
     // references to policy-gated effect surfaces and warn about any target
@@ -1665,41 +1699,6 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
     if has_default_agent {
         preflight::warn_denied_static_effects(&state.agent_path, &state.policy, &policy_posture);
     }
-    eprintln!(
-        "  CORS:        {}",
-        match std::env::var("CHIDORI_CORS_ORIGINS").ok() {
-            Some(v) if v.trim() == "*" => "open (Any)".to_string(),
-            Some(v) => format!("allow: {}", v),
-            None => "disabled (set CHIDORI_CORS_ORIGINS to enable)".to_string(),
-        }
-    );
-    eprintln!();
-    if events::strict_routes_from_env() {
-        eprintln!(
-            "  Events:     ANY /events      → agent(event); strict routes — every other \
-             unknown path is 404"
-        );
-    } else {
-        eprintln!(
-            "  Events:     ANY /*           → agent(event); a pausing run becomes a session \
-             (202). CHIDORI_SERVE_ROUTES=strict narrows this to /events"
-        );
-    }
-    eprintln!("  Sessions:   POST /sessions   → create & run");
-    eprintln!("              GET  /sessions   → list all");
-    eprintln!("              GET  /sessions/{{id}}  → get result");
-    eprintln!("              GET  /sessions/{{id}}/checkpoint → call log");
-    eprintln!("              GET  /sessions/{{id}}/snapshot   → snapshot manifest");
-    eprintln!("              POST /sessions/{{id}}/replay     → replay from checkpoint");
-    eprintln!("              POST /sessions/{{id}}/resume     → resume paused input() call");
-    eprintln!("              POST /sessions/{{id}}/signal     → deliver a signal to a run");
-    eprintln!("              POST /sessions/{{id}}/cancel     → cancel running session");
-    eprintln!("              POST /sessions/stream            → run with SSE events");
-    eprintln!(
-        "              GET  /sessions/{{id}}/stream     → re-attach: replay + follow SSE events"
-    );
-    eprintln!("  Health:     GET  /health");
-
     #[cfg(test)]
     {
         let gate = {
@@ -1718,6 +1717,58 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
             let _ = release.await;
         }
     }
+    let cors_origins = std::env::var("CHIDORI_CORS_ORIGINS").ok();
+    let strict_routes = events::strict_routes_from_env();
+    let route_summary = [
+        if strict_routes {
+            "ANY /events"
+        } else {
+            "ANY /*"
+        },
+        "POST /sessions",
+        "GET /sessions",
+        "GET /sessions/{id}",
+        "GET /sessions/{id}/checkpoint",
+        "GET /sessions/{id}/snapshot",
+        "POST /sessions/{id}/replay",
+        "POST /sessions/{id}/resume",
+        "POST /sessions/{id}/signal",
+        "POST /sessions/{id}/cancel",
+        "POST /sessions/stream",
+        "GET /sessions/{id}/stream",
+        "GET /health",
+    ];
+    tracing::info!(
+        %listener_addr,
+        max_concurrent,
+        acquire_timeout_ms,
+        auth_required,
+        loopback,
+        policy_posture = %policy_posture,
+        cors_origins = ?cors_origins,
+        strict_routes,
+        routes = ?route_summary,
+        health_route = "GET /health",
+        "server routes configured"
+    );
+    tracing::info!(
+        %listener_addr,
+        "server listener ready"
+    );
+    notify_reporter(
+        reporter.as_ref(),
+        ServeNotice::StartupReady(ServeStartupSnapshot {
+            addr: listener_addr,
+            non_loopback: !loopback,
+            max_concurrent,
+            acquire_timeout_ms,
+            auth_required,
+            loopback,
+            policy_posture,
+            cors_origins,
+            strict_routes,
+        }),
+    );
     axum::serve(listener, app).await?;
 
     Ok(())
