@@ -2234,6 +2234,7 @@ async fn corrupt_inbox_execution_path_child_fixture() {
             | "approve_allow_absent"
             | "warm_bad"
             | "warm_gap"
+            | "warm_gap_retry"
             | "warm_absent"
             | "timeout_bad"
             | "timeout_absent"
@@ -2287,6 +2288,13 @@ async fn corrupt_inbox_execution_path_child_fixture() {
                 return {{ sent: true }};
             }}"#
         ),
+        "warm_gap_retry" => format!(
+            r#"export async function agent(input, chidori) {{
+                const response = await chidori.input("continue?");
+                await fetch("{sentinel_url}", {{ method: "POST" }});
+                return {{ response }};
+            }}"#
+        ),
         "timeout_bad" | "timeout_absent" => format!(
             r#"export async function agent(input, chidori) {{
                 const signal = await chidori.signal("review", {{ timeoutMs: 60000 }});
@@ -2310,8 +2318,8 @@ async fn corrupt_inbox_execution_path_child_fixture() {
         response_json(create_session(State(state.clone()), Json(request)).await).await;
     assert_eq!(created_status, StatusCode::CREATED, "{created}");
     match mode.as_str() {
-        "signal_bad" | "signal_absent" | "warm_bad" | "warm_gap" | "warm_absent"
-        | "timeout_bad" | "timeout_absent" => {
+        "signal_bad" | "signal_absent" | "warm_bad" | "warm_gap" | "warm_gap_retry"
+        | "warm_absent" | "timeout_bad" | "timeout_absent" => {
             assert_eq!(created["status"], json!("paused"), "{created}")
         }
         _ => assert_eq!(created["status"], json!("awaitingapproval"), "{created}"),
@@ -2387,7 +2395,8 @@ async fn corrupt_inbox_execution_path_child_fixture() {
             )
             .await
         }
-        "warm_gap" => {
+        "warm_gap" | "warm_gap_retry" => {
+            let retry_mode = mode == "warm_gap_retry";
             let (reached_tx, reached_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             *super::WARM_POST_RESPONSE_INBOX_TEST_GATE.lock().unwrap() =
@@ -2400,7 +2409,11 @@ async fn corrupt_inbox_execution_path_child_fixture() {
                         State(resume_state),
                         Path(resume_id),
                         Json(ResumeRequest {
-                            response: "continue".to_string(),
+                            response: if retry_mode {
+                                "discard-this-response".to_string()
+                            } else {
+                                "continue".to_string()
+                            },
                             allow_source_change: false,
                         }),
                     )
@@ -2421,10 +2434,136 @@ async fn corrupt_inbox_execution_path_child_fixture() {
             release_tx
                 .send(())
                 .expect("warm inbox reload barrier remains connected");
-            tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+            let first_response = tokio::time::timeout(
+                std::time::Duration::from_secs(if mode == "warm_gap_retry" { 2 } else { 10 }),
+                resume,
+            )
+            .await
+            .expect("warm resume returned after inbox reload")
+            .expect("warm resume task completed");
+
+            if mode == "warm_gap_retry" {
+                let (first_status, first_body) = first_response;
+                let first_session = state.session_store.get(id).unwrap().unwrap();
+                let first_journal = snapshot_journal_files(&run_dir);
+                let first_pending = std::fs::read(&pending_path).unwrap_or_default();
+                let first_promises = snapshot_host_promise_events(&run_dir);
+                let first_inbox = std::fs::read(&inbox_path).unwrap();
+                let first_effects = counter.load(Ordering::SeqCst);
+                let mut failures = Vec::new();
+                if first_status != StatusCode::INTERNAL_SERVER_ERROR {
+                    failures.push(format!(
+                        "first resume returned {first_status}, expected 500"
+                    ));
+                }
+                if !first_body
+                    .to_string()
+                    .contains(&inbox_path.display().to_string())
+                {
+                    failures.push(format!(
+                        "first 500 did not identify inbox path {}: {first_body}",
+                        inbox_path.display()
+                    ));
+                }
+                if first_effects != 0 {
+                    failures.push(format!("first response dispatched {first_effects} effects"));
+                }
+                if serde_json::to_vec(&session_before).unwrap()
+                    != serde_json::to_vec(&first_session).unwrap()
+                    || first_session.status != SessionStatus::Paused
+                {
+                    failures.push(format!(
+                        "first response changed paused session: {first_session:?}"
+                    ));
+                }
+                if first_journal != journal_before {
+                    failures.push("first response changed journal".to_string());
+                }
+                if first_pending != pending_before {
+                    failures.push("first response changed pending host operation".to_string());
+                }
+                if first_promises != promises_before {
+                    failures.push("first response changed host promises".to_string());
+                }
+                if first_inbox != inbox_before.clone().unwrap_or_default() {
+                    failures.push("first response changed corrupt inbox bytes".to_string());
+                }
+                if !warm_parked(&state, id) {
+                    failures.push("parked VM did not retain a retryable warm entry".to_string());
+                }
+                assert!(
+                    failures.is_empty(),
+                    "first warm resume must reject post-response inbox corruption before applying its response; failures={failures:?}; status={first_status}; body={first_body}; effects={first_effects}; session={first_session:?}; journal_unchanged={}; pending_unchanged={}; promises_unchanged={}; inbox={:?}",
+                    snapshot_journal_files(&run_dir) == journal_before,
+                    std::fs::read(&pending_path).unwrap_or_default() == pending_before,
+                    snapshot_host_promise_events(&run_dir) == promises_before,
+                    String::from_utf8_lossy(&first_inbox),
+                );
+
+                // The rejected response is deliberately not restored. Repair
+                // the mailbox, then require a separate explicit resume with a
+                // different response to release the parked VM.
+                std::fs::write(&inbox_path, b"[]").unwrap();
+                let retry = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    resume_with(&state, id, "accepted-on-retry"),
+                )
                 .await
-                .expect("warm resume returned after inbox reload")
-                .expect("warm resume task completed")
+                .expect("new explicit warm resume completed after inbox repair");
+                assert_eq!(retry.0, StatusCode::OK, "retry response: {:?}", retry.1);
+                let completed = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    wait_for_status(&state, id, SessionStatus::Completed),
+                )
+                .await
+                .expect("parked VM completed after the explicit retry");
+                assert_eq!(
+                    completed.output,
+                    Some(json!({"response": "accepted-on-retry"})),
+                    "the rejected first response must never be applied"
+                );
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    1,
+                    "effect runs once on retry"
+                );
+                let records = journal_shape(&state.run_base, &run_id);
+                let input_results = records
+                    .iter()
+                    .filter(|(_, function, _, _)| function == "input")
+                    .map(|(_, _, _, result)| result.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(input_results, vec![json!("accepted-on-retry")]);
+                assert!(!records.iter().any(|(_, _, _, result)| {
+                    result.to_string().contains("discard-this-response")
+                }));
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|(_, function, _, _)| function == "http")
+                        .count(),
+                    1,
+                    "the continuation effect is journaled once"
+                );
+                let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+                let promises = crate::runtime::snapshot::load_host_promise_records(&store)
+                    .expect("load retried input promise");
+                let input_promises = promises
+                    .iter()
+                    .filter(|record| record.operation.kind == PendingHostOperationKind::Input)
+                    .collect::<Vec<_>>();
+                assert_eq!(input_promises.len(), 1, "one input promise is resolved");
+                assert!(matches!(
+                    &input_promises[0].state,
+                    HostPromiseState::Resolved { value, .. }
+                        if value == &json!("accepted-on-retry")
+                ));
+                assert!(!pending_path.exists(), "retry resolves the pending input");
+                assert_eq!(std::fs::read(&inbox_path).unwrap(), b"[]");
+                (retry.0, retry.1)
+            } else {
+                first_response
+            }
         }
         "timeout_bad" | "timeout_absent" => {
             let mut expired = state.session_store.get(id).unwrap().unwrap();
@@ -2586,6 +2725,19 @@ fn warm_resume_rejects_inbox_corrupted_after_preflight_before_reload() {
         "parked VM must remain undelivered: {observed:#?}"
     );
     assert_eq!(observed.final_status, "Paused", "{observed:#?}");
+}
+
+#[test]
+fn warm_resume_after_corrupt_reload_rejection_accepts_a_new_explicit_retry() {
+    let observed = run_corrupt_inbox_execution_child("warm_gap_retry");
+    assert_eq!(
+        observed.response_status,
+        StatusCode::OK.as_u16(),
+        "{observed:#?}"
+    );
+    assert_eq!(observed.final_status, "Completed", "{observed:#?}");
+    assert_eq!(observed.sentinel_requests, 1, "{observed:#?}");
+    assert_eq!(observed.inbox_after.as_deref(), Some("[]"), "{observed:#?}");
 }
 
 #[test]
