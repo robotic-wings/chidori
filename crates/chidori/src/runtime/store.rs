@@ -3320,8 +3320,10 @@ impl RunStoreFactory {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?;
                 for row in rows {
-                    let (name, data) = row?;
-                    by_name.insert(name, serde_json::from_str(&data)?);
+                    let (name, data) = row.context("reading detached-agent registry row")?;
+                    let entry = serde_json::from_str(&data)
+                        .with_context(|| format!("parsing SQLite registry row for {name}"))?;
+                    by_name.insert(name, entry);
                 }
             }
             RunStoreBackend::Http(relay) => {
@@ -3346,19 +3348,44 @@ impl RunStoreFactory {
         }
         // Local entries win: they reflect this machine's latest state.
         let agents_dir = self.run_base.join("agents");
-        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                            by_name.insert(name.to_string(), value.clone());
-                        }
+        match std::fs::read_dir(&agents_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.with_context(|| {
+                        format!(
+                            "reading detached-agent registry directory {}",
+                            agents_dir.display()
+                        )
+                    })?;
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
                     }
+                    let bytes = std::fs::read(&path)
+                        .with_context(|| format!("reading registry file {}", path.display()))?;
+                    let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .with_context(|| format!("parsing registry file {}", path.display()))?;
+                    let name = value
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("registry file {} has no string name", path.display())
+                        })?;
+                    let file_stem = path.file_stem().and_then(|stem| stem.to_str());
+                    if file_stem != Some(name) {
+                        anyhow::bail!(
+                            "registry file {} names detached agent {name:?}, which does not match its file name",
+                            path.display()
+                        );
+                    }
+                    by_name.insert(name.to_string(), value);
                 }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("listing registry directory {}", agents_dir.display())
+                })
             }
         }
         Ok(by_name.into_values().collect())

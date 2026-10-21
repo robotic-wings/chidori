@@ -1095,17 +1095,47 @@ impl DetachedAgentHub {
         )?;
         let factory = RunStoreFactory::shared(&parts.run_base);
         let parts_for_entries = parts.clone();
-        self.install_parts(parts);
-        let entries = factory
+        let values = factory
             .registry_list()
             .map_err(|err| format!("listing agent registry: {err}"))?;
+        // Parse and cross-check the complete snapshot before hydration, entry
+        // publication, or worker start. A damaged late row must not leave an
+        // otherwise-valid prefix of the fleet running.
+        let mut entries = Vec::with_capacity(values.len());
+        for value in values {
+            let registry_name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "detached-agent registry row has no string name".to_string())?;
+            let registry_run_id = value.get("run_id").and_then(Value::as_str).ok_or_else(|| {
+                format!("detached-agent registry row {registry_name:?} has no string run_id")
+            })?;
+            let descriptor_value = value.get("descriptor").cloned().ok_or_else(|| {
+                format!("detached-agent registry row {registry_name:?} has no descriptor")
+            })?;
+            let descriptor: AgentDescriptor = serde_json::from_value(descriptor_value)
+                .map_err(|error| {
+                    format!(
+                        "invalid descriptor for detached-agent registry row {registry_name:?}: {error}"
+                    )
+                })?;
+            if descriptor.name != registry_name {
+                return Err(format!(
+                    "detached-agent registry row {registry_name:?} contains descriptor for {:?}",
+                    descriptor.name
+                ));
+            }
+            if descriptor.run_id != registry_run_id {
+                return Err(format!(
+                    "detached-agent registry row {registry_name:?} run_id {:?} does not match descriptor run_id {:?}",
+                    registry_run_id, descriptor.run_id
+                ));
+            }
+            entries.push(descriptor);
+        }
+        self.install_parts(parts);
         let mut rearmed = 0;
-        for value in entries {
-            let Ok(descriptor) = serde_json::from_value::<AgentDescriptor>(
-                value.get("descriptor").cloned().unwrap_or_default(),
-            ) else {
-                continue;
-            };
+        for descriptor in entries {
             let name = descriptor.name.clone();
             match descriptor.status.as_str() {
                 "running" | "hibernating" => {
@@ -4248,6 +4278,24 @@ mod tests {
                         !state.thread_live && state.descriptor.status == "hibernating"
                     }));
                 }
+                "late-invalid-descriptor" => {
+                    seed_rearm_registry_entry(&factory, "aa-valid-first", "valid-first-run");
+                    let records_path = run_base.join("valid-first-run/records.jsonl");
+                    let records_before = std::fs::read(&records_path).unwrap();
+                    let corrupt_path = run_base.join("agents/zz-invalid-descriptor.json");
+                    std::fs::write(
+                        &corrupt_path,
+                        br#"{"name":"zz-invalid-descriptor","run_id":"bad-run"}"#,
+                    )
+                    .unwrap();
+
+                    let error = hub.rearm_from_registry(parts.clone()).expect_err(
+                        "a later corrupt row must fail before an earlier valid row is installed",
+                    );
+                    assert!(error.contains("zz-invalid-descriptor"), "{error}");
+                    assert!(hub.entries.lock().unwrap().is_empty());
+                    assert_eq!(std::fs::read(records_path).unwrap(), records_before);
+                }
                 "valid-two-entry-fleet" => {
                     seed_rearm_registry_entry(&factory, "fleet-one", "fleet-run-one");
                     seed_rearm_registry_entry(&factory, "fleet-two", "fleet-run-two");
@@ -4304,6 +4352,7 @@ mod tests {
             ("sqlite-mirror-missing-local-copy", "sqlite"),
             ("malformed-local-json", "fs"),
             ("invalid-descriptor", "fs"),
+            ("late-invalid-descriptor", "fs"),
         ];
         let mut failures = Vec::new();
         let mut outcomes = Vec::new();
