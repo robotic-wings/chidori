@@ -85,7 +85,7 @@ pub(super) async fn stop_detached_agent(Path(name): Path<String>) -> Response {
     match tokio::task::spawn_blocking(move || {
         let hub = crate::runtime::host_agent::hub();
         hub.installed_parts()
-            .and_then(|parts| hub.stop(&parts, &name))
+            .and_then(|parts| hub.stop_current_name(&parts, &name))
     })
     .await
     {

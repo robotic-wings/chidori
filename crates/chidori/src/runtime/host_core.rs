@@ -46,6 +46,11 @@ pub fn execute_durable_json_call_at_seq(
         return Ok(record.result);
     }
 
+    // A detached-agent stop requested by another process is observed at the
+    // next non-replayed host-call boundary, before pending state or an effect
+    // can be created.
+    ctx.run_host_call_preflight()?;
+
     let operation_kind = host_operation_kind(function);
     if let Some(kind) = operation_kind.clone() {
         if let Some(result) = replay_completed_host_operation(ctx, seq, function, kind, &args)? {
