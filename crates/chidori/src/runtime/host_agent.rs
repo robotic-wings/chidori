@@ -303,6 +303,24 @@ fn acquire_spawn_name_file_lock(path: &Path, name: &str) -> Result<std::fs::File
     }
 }
 
+fn with_agent_name_lock<T>(
+    parts: &AgentRuntimeParts,
+    name: &str,
+    operation: impl FnOnce(&RunStoreFactory) -> Result<T, String>,
+) -> Result<T, String> {
+    let factory = RunStoreFactory::shared(&parts.run_base);
+    factory
+        .ensure_initialized()
+        .map_err(|err| format!("chidori.agents: initializing run store: {err:#}"))?;
+    let lock_path = factory
+        .registry_name_lock_path(name)
+        .map_err(|err| format!("chidori.agents: preparing name lock: {err:#}"))?;
+    let process_lock = spawn_name_mutex(&lock_path);
+    let _process_name_guard = acquire_spawn_name_mutex(&process_lock, name)?;
+    let _name_file_guard = acquire_spawn_name_file_lock(&lock_path, name)?;
+    operation(&factory)
+}
+
 pub fn hub() -> &'static DetachedAgentHub {
     HUB.get_or_init(|| DetachedAgentHub {
         parts: Mutex::new(None),
@@ -340,18 +358,48 @@ impl DetachedAgentHub {
         parts: &AgentRuntimeParts,
         name: &str,
     ) -> Result<Arc<AgentEntry>, String> {
-        if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
-            return Ok(entry);
-        }
-        let parts = parts.clone();
-        let factory = RunStoreFactory::shared(&parts.run_base);
+        with_agent_name_lock(parts, name, |factory| {
+            self.resolve_entry_locked(parts, name, factory)?
+                .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))
+        })
+    }
+
+    fn resolve_entry_locked(
+        &self,
+        parts: &AgentRuntimeParts,
+        name: &str,
+        factory: &RunStoreFactory,
+    ) -> Result<Option<Arc<AgentEntry>>, String> {
         let registered = factory
             .registry_get(name)
-            .map_err(|err| format!("chidori.agents: reading registry: {err}"))?
-            .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))?;
+            .map_err(|err| format!("chidori.agents: reading registry: {err}"))?;
+        let Some(registered) = registered else {
+            return Ok(None);
+        };
+        let registered_run_id = registered
+            .get("run_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("chidori.agents: registry entry `{name}` has no run_id"))?;
         let descriptor: AgentDescriptor =
             serde_json::from_value(registered.get("descriptor").cloned().unwrap_or_default())
                 .map_err(|err| format!("chidori.agents: parsing registry entry: {err}"))?;
+        if descriptor.run_id != registered_run_id {
+            return Err(format!(
+                "chidori.agents: registry entry `{name}` run_id does not match its descriptor"
+            ));
+        }
+        if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
+            let state = entry.state.lock().unwrap();
+            if state.descriptor.run_id == registered_run_id {
+                return Ok(Some(entry.clone()));
+            }
+            if state.thread_live || state.execution_active || state.live_ctx.is_some() {
+                return Err(format!(
+                    "chidori.agents: registry incarnation for `{name}` changed while its local predecessor was active"
+                ));
+            }
+        }
+        let parts = parts.clone();
         let entry = Arc::new(AgentEntry {
             name: name.to_string(),
             parts,
@@ -371,7 +419,7 @@ impl DetachedAgentHub {
             .lock()
             .unwrap()
             .insert(name.to_string(), entry.clone());
-        Ok(entry)
+        Ok(Some(entry))
     }
 
     /// Spawn a detached agent: persist its descriptor + registry entry, then
@@ -633,108 +681,108 @@ impl DetachedAgentHub {
         payload: Value,
         from: Value,
     ) -> Result<Value, String> {
-        ensure_run_store_initialized(
-            &parts.run_base,
-            "chidori.agents.send: initializing run store",
-        )?;
-        let entry = self.ensure_entry(parts, to)?;
-        let factory = entry.factory();
-        let mut wake = false;
-        {
-            let had_live_context = entry.state.lock().unwrap().live_ctx.is_some();
-            if had_live_context {
-                // Do not carry a context snapshot across the handoff to the
-                // durable-mailbox path. The worker may clear it while a send
-                // is in flight, so pause here and re-check under the state
-                // lock before choosing which inbox writer owns this delivery.
+        with_agent_name_lock(parts, to, |factory| {
+            let entry = self
+                .resolve_entry_locked(parts, to, factory)?
+                .ok_or_else(|| format!("chidori.agents: unknown agent `{to}`"))?;
+            let mut wake = false;
+            {
+                let had_live_context = entry.state.lock().unwrap().live_ctx.is_some();
+                if had_live_context {
+                    // Do not carry a context snapshot across the handoff to the
+                    // durable-mailbox path. The worker may clear it while a send
+                    // is in flight, so pause here and re-check under the state
+                    // lock before choosing which inbox writer owns this delivery.
+                    #[cfg(test)]
+                    tests::pause_after_live_context_snapshot(&entry.name);
+                }
+                let mut state = entry.state.lock().unwrap();
+                if let Some(ctx) = state.live_ctx.clone() {
+                    // Write-through: in-memory mailbox + durable inbox mutate in
+                    // one critical section. Keep AgentState locked until the
+                    // context has persisted, so the worker cannot clear this
+                    // context and race a store-backed whole-file inbox write.
+                    if let Err(err) = ctx.enqueue_live_signal(name, payload, from) {
+                        return Err(format!(
+                            "chidori.agents.send: live signal persistence failed before acknowledgement: {err}"
+                        ));
+                    }
+                    #[cfg(test)]
+                    entry
+                        .live_send_notify_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entry.signal.notify_all();
+                    return Ok(json!({ "delivered": true }));
+                }
+                let run_id = state.descriptor.run_id.clone();
+                let store = factory.store_for(&run_id);
                 #[cfg(test)]
-                tests::pause_after_live_context_snapshot(&entry.name);
-            }
-            let mut state = entry.state.lock().unwrap();
-            if let Some(ctx) = state.live_ctx.clone() {
-                // Write-through: in-memory mailbox + durable inbox mutate in
-                // one critical section. Keep AgentState locked until the
-                // context has persisted, so the worker cannot clear this
-                // context and race a store-backed whole-file inbox write.
-                ctx.enqueue_live_signal(name, payload, from).map_err(|err| {
-                    format!(
-                        "chidori.agents.send: live signal persistence failed before acknowledgement: {err}"
-                    )
-                })?;
-                #[cfg(test)]
-                entry
-                    .live_send_notify_count
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                entry.signal.notify_all();
-                return Ok(json!({ "delivered": true }));
-            }
-            let run_id = state.descriptor.run_id.clone();
-            let store = factory.store_for(&run_id);
-            #[cfg(test)]
-            tests::pause_before_cross_process_inbox_update(&entry.name);
-            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
-                let mut inbox: Vec<QueuedSignal> = current
-                    .as_deref()
-                    .map(serde_json::from_slice)
-                    .transpose()?
-                    .unwrap_or_default();
-                let delivery_seq = inbox
-                    .iter()
-                    .map(|signal| signal.delivery_seq)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                inbox.push(QueuedSignal {
-                    name: name.to_string(),
-                    payload: payload.clone(),
-                    from: from.clone(),
-                    delivery_seq,
-                    enqueued_at: Utc::now(),
-                });
-                Ok(serde_json::to_vec_pretty(&inbox)?)
-            };
-            store
-                .update_blob(SIGNAL_INBOX_FILE, &mut update)
-                .map_err(|err| {
-                    format!(
+                tests::pause_before_cross_process_inbox_update(&entry.name);
+                let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                    let mut inbox: Vec<QueuedSignal> = current
+                        .as_deref()
+                        .map(serde_json::from_slice)
+                        .transpose()?
+                        .unwrap_or_default();
+                    let delivery_seq = inbox
+                        .iter()
+                        .map(|signal| signal.delivery_seq)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    inbox.push(QueuedSignal {
+                        name: name.to_string(),
+                        payload: payload.clone(),
+                        from: from.clone(),
+                        delivery_seq,
+                        enqueued_at: Utc::now(),
+                    });
+                    Ok(serde_json::to_vec_pretty(&inbox)?)
+                };
+                if let Err(err) = store.update_blob(SIGNAL_INBOX_FILE, &mut update) {
+                    return Err(format!(
                         "chidori.agents.send: inbox persistence failed before acknowledgement; persistence outcome may be uncertain and retry may duplicate: {err}"
-                    )
-                })?;
-            if state.descriptor.status == "hibernating" {
-                let matches = state
-                    .descriptor
-                    .listen
-                    .as_ref()
-                    .is_some_and(|l| l.names.iter().any(|n| n == name));
-                if matches {
+                    ));
+                }
+                if state.descriptor.status == "hibernating" {
+                    let matches = state
+                        .descriptor
+                        .listen
+                        .as_ref()
+                        .is_some_and(|l| l.names.iter().any(|n| n == name));
+                    if matches {
+                        wake = true;
+                    }
+                }
+                // `running` with no worker thread means the previous driver died
+                // mid-run: the delivery is durably queued, so use it as the wake
+                // signal instead of letting the message strand.
+                if state.descriptor.status == "running"
+                    && !state.thread_live
+                    && !state.stop_requested
+                {
                     wake = true;
                 }
-            }
-            // `running` with no worker thread means the previous driver died
-            // mid-run: the delivery is durably queued, so use it as the wake
-            // signal instead of letting the message strand.
-            if state.descriptor.status == "running" && !state.thread_live && !state.stop_requested {
-                wake = true;
-            }
-            if wake {
-                state.descriptor.status = "running".to_string();
-                state.descriptor.updated_at = Utc::now();
-                if state.thread_live {
-                    state.wake_pending = true;
+                if wake {
+                    state.descriptor.status = "running".to_string();
+                    state.descriptor.updated_at = Utc::now();
+                    if state.thread_live {
+                        state.wake_pending = true;
+                    }
                 }
             }
-        }
-        if wake {
-            persist_descriptor(&factory, &entry.state.lock().unwrap().descriptor.clone());
-            if !entry.state.lock().unwrap().thread_live {
-                self.start_thread(entry.clone())?;
+            if wake {
+                persist_descriptor(factory, &entry.state.lock().unwrap().descriptor.clone());
+                if !entry.state.lock().unwrap().thread_live {
+                    self.start_thread(entry.clone())?;
+                }
             }
-        }
-        let live = {
-            let state = entry.state.lock().unwrap();
-            !AgentEntry::is_settled(&state)
-        };
-        Ok(json!({ "delivered": live }))
+            let live = {
+                let state = entry.state.lock().unwrap();
+                !AgentEntry::is_settled(&state)
+            };
+            Ok(json!({ "delivered": live }))
+        })
     }
 
     /// Wait for an agent to settle (completed / failed / stopped / paused).
@@ -809,17 +857,19 @@ impl DetachedAgentHub {
     }
 
     pub fn lookup(&self, parts: &AgentRuntimeParts, name: &str) -> Result<Value, String> {
-        match self.ensure_entry(parts, name) {
-            Ok(entry) => {
-                let state = entry.state.lock().unwrap();
-                Ok(json!({
-                    "name": state.descriptor.name,
-                    "runId": state.descriptor.run_id,
-                    "status": state.descriptor.status,
-                }))
+        with_agent_name_lock(parts, name, |factory| {
+            match self.resolve_entry_locked(parts, name, factory)? {
+                Some(entry) => {
+                    let state = entry.state.lock().unwrap();
+                    Ok(json!({
+                        "name": state.descriptor.name,
+                        "runId": state.descriptor.run_id,
+                        "status": state.descriptor.status,
+                    }))
+                }
+                None => Ok(Value::Null),
             }
-            Err(_) => Ok(Value::Null),
-        }
+        })
     }
 
     /// Cooperative stop: a live iteration finishes its current host call and
@@ -3764,6 +3814,256 @@ mod tests {
             mcp: Arc::new(McpManager::new()),
             run_base,
         }
+    }
+
+    fn write_cached_resolution_fixture(
+        hub: &DetachedAgentHub,
+        parts: &AgentRuntimeParts,
+        name: &str,
+        run_id: &str,
+        status: &str,
+    ) -> Arc<AgentEntry> {
+        let descriptor = AgentDescriptor {
+            name: name.to_string(),
+            run_id: run_id.to_string(),
+            source: "agent.ts".to_string(),
+            input: Value::Null,
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            owner_run_id: "resolution-test".to_string(),
+            model: None,
+            status: status.to_string(),
+            listen: None,
+            restarts: 0,
+            output: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&descriptor).unwrap();
+        RunStoreFactory::shared(&parts.run_base)
+            .registry_put(name, run_id, &value)
+            .unwrap();
+        hub.ensure_entry(parts, name).unwrap()
+    }
+
+    #[test]
+    fn detached_name_resolution_fails_closed_and_preserves_same_incarnation_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_base = temp.path().join(".chidori/runs");
+        std::fs::create_dir_all(&run_base).unwrap();
+        let parts = sqlite_test_parts(temp.path(), run_base.clone(), Arc::new(ToolRegistry::new()));
+        let hub = DetachedAgentHub {
+            parts: Mutex::new(None),
+            entries: Mutex::new(HashMap::new()),
+            timer_started: Mutex::new(false),
+        };
+        let factory = RunStoreFactory::shared(&run_base);
+
+        // A corrupt durable registry must not make lookup or send trust the
+        // otherwise-valid process-local entry.
+        let corrupt_name = "corrupt-cache-resolution";
+        let corrupt_entry = write_cached_resolution_fixture(
+            &hub,
+            &parts,
+            corrupt_name,
+            "corrupt-cache-run",
+            "hibernating",
+        );
+        let registry_path = run_base.join("agents").join(format!("{corrupt_name}.json"));
+        std::fs::write(&registry_path, b"{ malformed registry").unwrap();
+        let lookup = hub.lookup(&parts, corrupt_name);
+        let send = hub.send(
+            &parts,
+            corrupt_name,
+            "approval",
+            json!({"id": "must-not-route"}),
+            Value::Null,
+        );
+        assert!(lookup
+            .as_ref()
+            .is_err_and(|error| error.contains("reading registry")));
+        assert!(send
+            .as_ref()
+            .is_err_and(|error| error.contains("reading registry")));
+        assert!(Arc::ptr_eq(
+            &hub.entries.lock().unwrap()[corrupt_name],
+            &corrupt_entry
+        ));
+        assert!(factory
+            .store_for("corrupt-cache-run")
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .is_none());
+
+        // A filesystem read error is equally authoritative; it must not turn
+        // a cache hit into a successful lookup or delivery.
+        let unreadable_name = "unreadable-cache-resolution";
+        let unreadable_entry = write_cached_resolution_fixture(
+            &hub,
+            &parts,
+            unreadable_name,
+            "unreadable-cache-run",
+            "hibernating",
+        );
+        let unreadable_path = run_base
+            .join("agents")
+            .join(format!("{unreadable_name}.json"));
+        std::fs::remove_file(&unreadable_path).unwrap();
+        std::fs::create_dir(&unreadable_path).unwrap();
+        let lookup = hub.lookup(&parts, unreadable_name);
+        let send = hub.send(
+            &parts,
+            unreadable_name,
+            "approval",
+            json!({"id": "must-not-route-after-read-error"}),
+            Value::Null,
+        );
+        assert!(lookup
+            .as_ref()
+            .is_err_and(|error| error.contains("reading registry")));
+        assert!(send
+            .as_ref()
+            .is_err_and(|error| error.contains("reading registry")));
+        assert!(Arc::ptr_eq(
+            &hub.entries.lock().unwrap()[unreadable_name],
+            &unreadable_entry
+        ));
+        assert!(factory
+            .store_for("unreadable-cache-run")
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .is_none());
+
+        // If durable identity changes while this process still owns a live
+        // predecessor, neither lookup nor send may replace or route around it.
+        let active_name = "active-cache-resolution";
+        let active_entry = write_cached_resolution_fixture(
+            &hub,
+            &parts,
+            active_name,
+            "active-predecessor-run",
+            "running",
+        );
+        let context = RuntimeContext::new();
+        let context_run_dir = run_base.join("active-predecessor-run");
+        context.enable_persistence_with_store(
+            context_run_dir.clone(),
+            factory.store_for("active-predecessor-run"),
+        );
+        {
+            let mut state = active_entry.state.lock().unwrap();
+            state.live_ctx = Some(context.clone());
+            state.execution_active = true;
+            state.thread_live = true;
+        }
+        let replacement = AgentDescriptor {
+            name: active_name.to_string(),
+            run_id: "replacement-run".to_string(),
+            source: "replacement.ts".to_string(),
+            input: Value::Null,
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            owner_run_id: "resolution-test".to_string(),
+            model: None,
+            status: "hibernating".to_string(),
+            listen: None,
+            restarts: 0,
+            output: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        factory
+            .registry_put(
+                active_name,
+                &replacement.run_id,
+                &serde_json::to_value(&replacement).unwrap(),
+            )
+            .unwrap();
+        let lookup = hub.lookup(&parts, active_name);
+        let send = hub.send(
+            &parts,
+            active_name,
+            "approval",
+            json!({"id": "must-not-route-to-active-predecessor"}),
+            Value::Null,
+        );
+        assert!(lookup
+            .as_ref()
+            .is_err_and(|error| error.contains("predecessor was active")));
+        assert!(send
+            .as_ref()
+            .is_err_and(|error| error.contains("predecessor was active")));
+        assert!(Arc::ptr_eq(
+            &hub.entries.lock().unwrap()[active_name],
+            &active_entry
+        ));
+        assert_eq!(context.signal_inbox().len(), 0);
+        assert!(factory
+            .store_for("active-predecessor-run")
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            factory.registry_get(active_name).unwrap().unwrap()["run_id"],
+            replacement.run_id
+        );
+
+        // An unchanged durable run_id reuses its live Arc and context, so the
+        // write-through path persists the message without a duplicate worker.
+        let same_name = "same-cache-resolution";
+        let same_entry =
+            write_cached_resolution_fixture(&hub, &parts, same_name, "same-cache-run", "running");
+        let same_context = RuntimeContext::new();
+        let same_run_dir = run_base.join("same-cache-run");
+        same_context.enable_persistence_with_store(
+            same_run_dir.clone(),
+            factory.store_for("same-cache-run"),
+        );
+        {
+            let mut state = same_entry.state.lock().unwrap();
+            state.live_ctx = Some(same_context.clone());
+            state.execution_active = true;
+            state.thread_live = true;
+        }
+        let (before_lookup, before_send) = {
+            let entries = hub.entries.lock().unwrap();
+            (entries[same_name].clone(), entries[same_name].clone())
+        };
+        assert!(Arc::ptr_eq(&before_lookup, &same_entry));
+        assert_eq!(
+            hub.lookup(&parts, same_name).unwrap()["runId"],
+            "same-cache-run"
+        );
+        let response = hub
+            .send(
+                &parts,
+                same_name,
+                "approval",
+                json!({"id": "same-incarnation"}),
+                Value::Null,
+            )
+            .unwrap();
+        assert_eq!(response["delivered"], true);
+        assert!(Arc::ptr_eq(
+            &hub.entries.lock().unwrap()[same_name],
+            &before_send
+        ));
+        assert_eq!(same_context.signal_inbox().len(), 1);
+        let persisted: Vec<QueuedSignal> = serde_json::from_slice(
+            &factory
+                .store_for("same-cache-run")
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].payload["id"], "same-incarnation");
+        assert!(same_entry.state.lock().unwrap().thread_live);
     }
 
     #[derive(Debug)]
