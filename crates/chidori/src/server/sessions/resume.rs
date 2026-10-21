@@ -17,10 +17,10 @@ use super::super::hardening::acquire_run_slot;
 use super::super::{
     acquire_route_run_lease, complete_persisted_pending_host_operation, enqueue_signal_to_inbox,
     install_warm_run, load_persisted_host_promises, load_persisted_replay_journal,
-    load_persisted_signal_inbox, load_persisted_vfs, release_warm_run_if_settled,
-    route_lease_acquisition_failed_response, session_view, store_or_500,
+    load_persisted_vfs, release_warm_run_if_settled, route_lease_acquisition_failed_response,
+    session_view, store_or_500, try_load_persisted_signal_inbox,
     validate_snapshot_manifest_for_resume, warm_resume_enabled, AppState, HostPromiseCompletion,
-    RouteRunLeaseAcquireError,
+    RouteRunLeaseAcquireError, WarmInputCommand,
 };
 use super::{agent_error_string, apply_run_outcome, arm_signal_timeout, pending_listen_names};
 
@@ -90,6 +90,15 @@ pub(in crate::server) async fn complete_pending_and_resume(
     call_log: Vec<CallRecord>,
 ) -> Response {
     if let Some(run_id) = original.run_id.as_deref() {
+        // Validate before intent reconciliation can resolve promises, remove
+        // an inbox entry, or append its journal record.
+        if let Err(error) = try_load_persisted_signal_inbox(&state.run_base, Some(run_id)) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+            )
+                .into_response();
+        }
         if let Err(error) = super::super::reconcile_signal_consumption_intent(state, run_id) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -98,6 +107,17 @@ pub(in crate::server) async fn complete_pending_and_resume(
                 .into_response();
         }
     }
+    let signal_inbox =
+        match try_load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref()) {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+                )
+                    .into_response();
+            }
+        };
     let call_log =
         match load_persisted_replay_journal(&state.run_base, original.run_id.as_deref(), &call_log)
         {
@@ -133,7 +153,6 @@ pub(in crate::server) async fn complete_pending_and_resume(
                 .into_response();
         }
     };
-    let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());
     let resume_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
@@ -330,9 +349,20 @@ pub(in crate::server) async fn resume_session(
         Ok(guard) => guard,
         Err(RouteRunLeaseAcquireError::Held(holder)) => return lease_conflict_response(&holder),
         Err(RouteRunLeaseAcquireError::Failed(error)) => {
-            return route_lease_acquisition_failed_response(&error)
+            return route_lease_acquisition_failed_response(&error);
         }
     };
+
+    // Validate the durable mailbox while the lease is held and before either
+    // warm delivery or pending-operation completion can mutate the run.
+    if let Err(error) = try_load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref())
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+        )
+            .into_response();
+    }
 
     // Warm fast path: this session's VM is parked on its thread awaiting
     // exactly this response — deliver it and await the leg's next outcome
@@ -345,7 +375,39 @@ pub(in crate::server) async fn resume_session(
     if let Some(warm) = warm_entry {
         let parked = warm.resolution.lock().unwrap().take();
         match parked {
-            Some(tx) if tx.send(body.response.clone()).is_ok() => {
+            Some(tx) => {
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(WarmInputCommand {
+                        response: body.response.clone(),
+                        completion: completion_tx,
+                    })
+                    .is_err()
+                {
+                    state.warm_runs.lock().unwrap().remove(&id);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "warm resume ended before accepting the response"})),
+                    )
+                        .into_response();
+                }
+                match completion_rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": error})),
+                        )
+                            .into_response();
+                    }
+                    Err(_) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "warm resume ended before acknowledging the response"})),
+                        )
+                            .into_response();
+                    }
+                }
                 let result = {
                     let mut outcomes = warm.outcomes.lock().await;
                     outcomes.recv().await
@@ -369,7 +431,7 @@ pub(in crate::server) async fn resume_session(
                 release_warm_run_if_settled(&state, &session);
                 return (StatusCode::OK, Json(session_view(&session))).into_response();
             }
-            _ => {
+            None => {
                 // Not parked (evicted, unwound, or a racing resume won):
                 // retire the stale entry and take the replay path.
                 state.warm_runs.lock().unwrap().remove(&id);
@@ -578,12 +640,24 @@ pub(in crate::server) async fn signal_session(
         let _lease = match acquire_route_run_lease(&state, original.run_id.as_deref()) {
             Ok(guard) => guard,
             Err(RouteRunLeaseAcquireError::Held(holder)) => {
-                return lease_conflict_response(&holder)
+                return lease_conflict_response(&holder);
             }
             Err(RouteRunLeaseAcquireError::Failed(error)) => {
-                return route_lease_acquisition_failed_response(&error)
+                return route_lease_acquisition_failed_response(&error);
             }
         };
+
+        let lock = state.signal_inbox_lock(original.run_id.as_deref().unwrap_or(&id));
+        let _guard = lock.lock().unwrap();
+        if let Err(error) =
+            try_load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref())
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+            )
+                .into_response();
+        }
 
         if let Err(err) = validate_snapshot_manifest_for_resume(
             &state.run_base,
@@ -608,9 +682,6 @@ pub(in crate::server) async fn signal_session(
 
         // Serialize against concurrent deliveries to the same run while we
         // resolve the pending op + mutate the inbox-adjacent durable state.
-        let lock = state.signal_inbox_lock(original.run_id.as_deref().unwrap_or(&id));
-        let _guard = lock.lock().unwrap();
-
         let completed = complete_persisted_pending_host_operation(
             &state.run_base,
             original.run_id.as_deref(),
@@ -769,8 +840,23 @@ pub(in crate::server) async fn approve_session(
         Ok(guard) => guard,
         Err(RouteRunLeaseAcquireError::Held(holder)) => return lease_conflict_response(&holder),
         Err(RouteRunLeaseAcquireError::Failed(error)) => {
-            return route_lease_acquisition_failed_response(&error)
+            return route_lease_acquisition_failed_response(&error);
         }
+    };
+
+    let signal_inbox = if body.decision == "allow" {
+        match try_load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref()) {
+            Ok(inbox) => Some(inbox),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
     };
 
     if let Err(err) = validate_snapshot_manifest_for_resume(
@@ -848,7 +934,7 @@ pub(in crate::server) async fn approve_session(
     };
     // Thread the signal mailbox so an approved run that reaches a `signal(name)`
     // listen point drains a queued entry instead of pausing (doc §9, §3).
-    let signal_inbox = load_persisted_signal_inbox(&state.run_base, original.run_id.as_deref());
+    let signal_inbox = signal_inbox.expect("approval allow preflight loaded the signal inbox");
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {

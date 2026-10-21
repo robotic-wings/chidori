@@ -156,8 +156,13 @@ struct AppState {
 /// (`Some` exactly while parked at an input pause) and the stream of leg
 /// outcomes — one `RunResult` per pause plus the terminal result.
 struct WarmRun {
-    resolution: StdMutex<Option<std::sync::mpsc::Sender<String>>>,
+    resolution: StdMutex<Option<std::sync::mpsc::Sender<WarmInputCommand>>>,
     outcomes: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<RunResult>>>,
+}
+
+pub(crate) struct WarmInputCommand {
+    pub(crate) response: String,
+    pub(crate) completion: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 /// Kill switch: `CHIDORI_WARM_RESUME=0|false|off` restores unwind-and-replay
@@ -220,7 +225,7 @@ fn install_warm_run(
         if ctx.flush_store().is_err() {
             return WarmInputWait::Park;
         }
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = std::sync::mpsc::channel();
         {
             let Some(warm) = bridge_warm.upgrade() else {
                 return WarmInputWait::Park;
@@ -244,45 +249,73 @@ fn install_warm_run(
             }
             return WarmInputWait::Park;
         }
-        let outcome = match rx.recv_timeout(evict) {
-            Ok(response) => {
-                // Reload the durable signal inbox before continuing: a signal
-                // delivered while this run was parked landed in
-                // `signals/inbox.json` (the server enqueues around paused
-                // runs), which the live VM's in-memory inbox cannot see. The
-                // file is the union — live drains re-persist it — so the
-                // reload is exactly what a replay resume would have seeded.
-                let run_id = ctx.run_id();
-                #[cfg(test)]
-                {
-                    let gate = {
-                        let mut slot = WARM_POST_RESPONSE_INBOX_TEST_GATE.lock().unwrap();
-                        if slot
-                            .as_ref()
-                            .is_some_and(|(expected, _, _)| expected == &run_id)
-                        {
-                            slot.take()
-                        } else {
-                            None
+        let outcome = loop {
+            match rx.recv_timeout(evict) {
+                Ok(command) => {
+                    // Reload the durable signal inbox before continuing: a signal
+                    // delivered while this run was parked landed in
+                    // `signals/inbox.json` (the server enqueues around paused
+                    // runs), which the live VM's in-memory inbox cannot see. The
+                    // file is the union — live drains re-persist it — so the
+                    // reload is exactly what a replay resume would have seeded.
+                    let run_id = ctx.run_id();
+                    #[cfg(test)]
+                    {
+                        let gate = {
+                            let mut slot = WARM_POST_RESPONSE_INBOX_TEST_GATE.lock().unwrap();
+                            if slot
+                                .as_ref()
+                                .is_some_and(|(expected, _, _)| expected == &run_id)
+                            {
+                                slot.take()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((_, reached, release)) = gate {
+                            reached
+                                .send(())
+                                .expect("warm inbox test observer remains connected");
+                            release
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .expect("warm inbox test barrier is released");
                         }
-                    };
-                    if let Some((_, reached, release)) = gate {
-                        reached
-                            .send(())
-                            .expect("warm inbox test observer remains connected");
-                        release
-                            .recv_timeout(std::time::Duration::from_secs(10))
-                            .expect("warm inbox test barrier is released");
+                    }
+                    match try_load_persisted_signal_inbox(&bridge_run_base, Some(&run_id)) {
+                        Ok(inbox) => {
+                            if command.completion.send(Ok(())).is_ok() {
+                                ctx.set_signal_inbox(inbox);
+                                break WarmInputWait::Delivered(command.response);
+                            }
+                            // The request was cancelled before its response could
+                            // be acknowledged. Keep waiting for an explicit retry.
+                            let Some(warm) = bridge_warm.upgrade() else {
+                                break WarmInputWait::Park;
+                            };
+                            let (next_tx, next_rx) = std::sync::mpsc::channel();
+                            *warm.resolution.lock().unwrap() = Some(next_tx);
+                            rx = next_rx;
+                        }
+                        Err(error) => {
+                            tracing::error!(run_id, %error, "warm resume could not reload signal inbox; leaving input pending");
+                            let Some(warm) = bridge_warm.upgrade() else {
+                                break WarmInputWait::Park;
+                            };
+                            let (next_tx, next_rx) = std::sync::mpsc::channel();
+                            *warm.resolution.lock().unwrap() = Some(next_tx);
+                            let _ = command
+                                .completion
+                                .send(Err(format!("loading signal inbox: {error:#}")));
+                            rx = next_rx;
+                        }
                     }
                 }
-                ctx.set_signal_inbox(load_persisted_signal_inbox(&bridge_run_base, Some(&run_id)));
-                WarmInputWait::Delivered(response)
+                // Eviction deadline, or the entry was dropped (cancel/restart/
+                // shutdown — the sender disconnects): unwind into the ordinary
+                // paused artifact; a later /resume replays. The engine thread
+                // and VM are reclaimed.
+                Err(_) => break WarmInputWait::Park,
             }
-            // Eviction deadline, or the entry was dropped (cancel/restart/
-            // shutdown — the sender disconnects): unwind into the ordinary
-            // paused artifact; a later /resume replays. The engine thread
-            // and VM are reclaimed.
-            Err(_) => WarmInputWait::Park,
         };
         if let Some(warm) = bridge_warm.upgrade() {
             *warm.resolution.lock().unwrap() = None;
@@ -932,6 +965,21 @@ fn retry_startup_signal_recovery(state: AppState, session: StoredSession, run_id
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             match acquire_signal_resume_lease(&state, Some(&run_id)) {
                 Ok(Some(_lease)) => {
+                    let _signal_inbox = match try_load_persisted_signal_inbox(
+                        &state.run_base,
+                        Some(&run_id),
+                    ) {
+                        Ok(inbox) => inbox,
+                        Err(error) => {
+                            tracing::error!(
+                                session_id = %session.id,
+                                run_id,
+                                %error,
+                                "startup signal recovery could not read inbox; leaving session paused and timeout unarmed"
+                            );
+                            return;
+                        }
+                    };
                     match reconcile_signal_consumption_intent(&state, &run_id) {
                         Ok(Some(record)) => {
                             let mut call_log = session.call_log.clone();
@@ -1045,14 +1093,22 @@ fn load_persisted_vfs(
 /// Load a run's durable signal mailbox (`signals/inbox.json`) so a resumed run
 /// can drain queued signals at later listen points (doc §9, sibling of
 /// `load_persisted_vfs`). Empty when the run has no inbox file yet.
+fn try_load_persisted_signal_inbox(
+    run_base: &FsPath,
+    run_id: Option<&str>,
+) -> anyhow::Result<Vec<crate::runtime::snapshot::QueuedSignal>> {
+    let Some(run_id) = run_id else {
+        return Ok(Vec::new());
+    };
+    crate::runtime::context::try_load_signal_inbox(&run_base.join(run_id))
+}
+
+#[cfg(test)]
 fn load_persisted_signal_inbox(
     run_base: &FsPath,
     run_id: Option<&str>,
 ) -> Vec<crate::runtime::snapshot::QueuedSignal> {
-    let Some(run_id) = run_id else {
-        return Vec::new();
-    };
-    crate::runtime::context::load_signal_inbox(&run_base.join(run_id))
+    try_load_persisted_signal_inbox(run_base, run_id).unwrap_or_default()
 }
 
 /// Append a signal to a run's durable mailbox through the store's serialized
@@ -1341,25 +1397,40 @@ pub async fn serve(
         let recovered = if session.status == SessionStatus::Paused {
             if let Some(run_id) = session.run_id.as_deref() {
                 match acquire_signal_resume_lease(&state, Some(run_id)) {
-                    Ok(Some(_lease)) => match reconcile_signal_consumption_intent(&state, run_id) {
-                        Ok(Some(record)) => {
-                            let mut call_log = session.call_log.clone();
-                            call_log.push(record);
-                            let _ = sessions::resume::complete_pending_and_resume(
-                                &state,
-                                session.clone(),
-                                call_log,
-                            )
-                            .await;
-                            true
+                    Ok(Some(_lease)) => {
+                        match try_load_persisted_signal_inbox(&state.run_base, Some(run_id)) {
+                            Err(error) => {
+                                tracing::error!(
+                                    session_id = %session.id,
+                                    run_id,
+                                    %error,
+                                    "startup signal recovery could not read inbox; leaving session paused and timeout unarmed"
+                                );
+                                true
+                            }
+                            Ok(_signal_inbox) => {
+                                match reconcile_signal_consumption_intent(&state, run_id) {
+                                    Ok(Some(record)) => {
+                                        let mut call_log = session.call_log.clone();
+                                        call_log.push(record);
+                                        let _ = sessions::resume::complete_pending_and_resume(
+                                            &state,
+                                            session.clone(),
+                                            call_log,
+                                        )
+                                        .await;
+                                        true
+                                    }
+                                    Ok(None) => false,
+                                    Err(error) => {
+                                        return Err(error).context(format!(
+                                            "recovering signal consumption for run {run_id}"
+                                        ));
+                                    }
+                                }
+                            }
                         }
-                        Ok(None) => false,
-                        Err(error) => {
-                            return Err(error).context(format!(
-                                "recovering signal consumption for run {run_id}"
-                            ));
-                        }
-                    },
+                    }
                     Ok(None) => false,
                     Err(RunLeaseAcquisitionError::Held(_)) => {
                         // Do not arm the persisted timeout while an accepted
