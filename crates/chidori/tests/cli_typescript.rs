@@ -4524,6 +4524,16 @@ struct DetachedServeProcess {
 
 impl DetachedServeProcess {
     fn start(project: &Path, port: u16, backend: &str, db: &Path) -> Self {
+        Self::start_with_verbosity(project, port, backend, db, false)
+    }
+
+    fn start_with_verbosity(
+        project: &Path,
+        port: u16,
+        backend: &str,
+        db: &Path,
+        verbose: bool,
+    ) -> Self {
         let mut command = Command::new(chidori_bin());
         let log = project.join(format!("serve-{port}.log"));
         let stderr = fs::File::create(&log).expect("create serve fixture log");
@@ -4542,6 +4552,9 @@ impl DetachedServeProcess {
             .env("CHIDORI_RUN_STORE", backend)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr));
+        if verbose {
+            command.arg("--verbose");
+        }
         if backend == "sqlite" {
             command.env("CHIDORI_RUN_DB", db);
         } else {
@@ -4651,6 +4664,300 @@ fn detached_run_records(project: &Path, run_id: &str) -> Vec<serde_json::Value> 
     text.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+fn prepare_rearm_diagnostic_project(project: &Path) -> String {
+    let worker = project.join("prefix-worker.ts");
+    let starter = project.join("spawn-prefix.ts");
+    fs::write(
+        &worker,
+        r#"import { chidori, run } from "chidori:agent";
+               run(async () => {
+                 const message = await chidori.signal("wake");
+                 await chidori.log("rearm-sentinel", { id: message.payload.id });
+                return { id: message.payload.id };
+               });"#,
+    )
+    .unwrap();
+    fs::write(
+        &starter,
+        r#"import { chidori, run } from "chidori:agent";
+           run(async () => {
+             const handle = await chidori.agents.spawn("prefix-worker.ts", {}, {name:"aa-valid-prefix", restart:"resume"});
+             return {runId: handle.runId};
+           });"#,
+    )
+    .unwrap();
+
+    let db = project.join("runs.sqlite3");
+    let port = DetachedServeProcess::port();
+    let mut serve = DetachedServeProcess::start(project, port, "fs", &db);
+    serve.wait_ready(port);
+    let response = serve_http_request(
+        port,
+        "POST",
+        "/sessions",
+        Some(r#"{"agent":"spawn-prefix.ts","input":{}}"#),
+    );
+    assert!(
+        [200, 201].contains(&response.status),
+        "spawn-prefix session failed: {:?}",
+        response.body
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut entry = detached_registry_entry(project, "aa-valid-prefix");
+    while detached_registry_status(&entry) != "hibernating" && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+        entry = detached_registry_entry(project, "aa-valid-prefix");
+    }
+    assert_eq!(detached_registry_status(&entry), "hibernating");
+    let run_id = detached_registry_run_id(&entry).to_string();
+    let lease_path = project
+        .join(".chidori/runs")
+        .join(&run_id)
+        .join("lease.json");
+    let lease_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let lease = fs::read(&lease_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let released = lease
+            .as_ref()
+            .and_then(|lease| lease["expires_at"].as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_none_or(|expires_at| expires_at <= chrono::Utc::now());
+        if released {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < lease_deadline,
+            "hibernating fixture still has an unexpired supervisor lease: {}",
+            fs::read_to_string(&lease_path).unwrap_or_default()
+        );
+        std::thread::yield_now();
+    }
+    serve.child.kill().unwrap();
+    let _ = serve.child.wait();
+
+    let registry_path = project.join(".chidori/runs/agents/aa-valid-prefix.json");
+    let run_dir = project.join(".chidori/runs").join(&run_id);
+    let descriptor_path = run_dir.join("agent.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry["descriptor"]["status"] = serde_json::json!("running");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let mut descriptor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&descriptor_path).unwrap()).unwrap();
+    descriptor["status"] = serde_json::json!("running");
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor).unwrap(),
+    )
+    .unwrap();
+    let inbox_path = run_dir.join("signals/inbox.json");
+    fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+    fs::write(
+        &inbox_path,
+        serde_json::to_vec(&[serde_json::json!({
+            "name": "wake",
+            "payload": {"id": "queued-prefix"},
+            "from": {"kind": "test", "id": "rearm-diagnostic"},
+            "delivery_seq": 1,
+            "enqueued_at": "2026-10-22T00:00:00Z"
+        })])
+        .unwrap(),
+    )
+    .unwrap();
+    run_id
+}
+
+fn run_rearm_diagnostic_case(case: &str, project: &Path) {
+    let corrupt = matches!(case, "default-corrupt" | "verbose-corrupt");
+    let run_id = if case == "absent-registry" {
+        None
+    } else {
+        Some(prepare_rearm_diagnostic_project(project))
+    };
+    let corrupt_path = if corrupt {
+        let path = project.join(".chidori/runs/agents/zz-corrupt-later.json");
+        fs::write(&path, b"{ malformed later registry row").unwrap();
+        Some(path)
+    } else {
+        None
+    };
+    let before_registry = run_id
+        .as_ref()
+        .map(|_| fs::read(project.join(".chidori/runs/agents/aa-valid-prefix.json")).unwrap());
+    let run_dir = run_id
+        .as_ref()
+        .map(|id| project.join(".chidori/runs").join(id));
+    let before_agent = run_dir
+        .as_ref()
+        .map(|dir| fs::read(dir.join("agent.json")).unwrap());
+    let before_journal = run_dir
+        .as_ref()
+        .map(|dir| fs::read(dir.join("records.jsonl")).unwrap_or_default());
+    let before_inbox = run_dir
+        .as_ref()
+        .map(|dir| fs::read(dir.join("signals/inbox.json")).unwrap());
+
+    let port = DetachedServeProcess::port();
+    let db = project.join("runs.sqlite3");
+    let verbose = case == "verbose-corrupt";
+    let mut serve = DetachedServeProcess::start_with_verbosity(project, port, "fs", &db, verbose);
+    serve.wait_ready(port);
+    let health = serve_http_request(port, "GET", "/health", None);
+    assert_eq!(
+        health.status, 200,
+        "serve must remain available after rearm error"
+    );
+    let stderr = fs::read_to_string(&serve.log).unwrap_or_default();
+
+    if corrupt {
+        assert_eq!(
+            fs::read(project.join(".chidori/runs/agents/aa-valid-prefix.json")).unwrap(),
+            before_registry.unwrap(),
+            "failed fleet rearm must not mutate the valid-prefix registry entry"
+        );
+        assert_eq!(
+            fs::read(run_dir.as_ref().unwrap().join("agent.json")).unwrap(),
+            before_agent.unwrap(),
+            "failed fleet rearm must not mutate the valid-prefix run descriptor"
+        );
+        assert_eq!(
+            fs::read(run_dir.as_ref().unwrap().join("records.jsonl")).unwrap_or_default(),
+            before_journal.unwrap(),
+            "failed fleet rearm must not run or journal the valid-prefix agent"
+        );
+        assert_eq!(
+            fs::read(run_dir.as_ref().unwrap().join("signals/inbox.json")).unwrap(),
+            before_inbox.unwrap(),
+            "failed fleet rearm must preserve the matching queued signal"
+        );
+        assert_eq!(
+            detached_registry_status(&detached_registry_entry(project, "aa-valid-prefix")),
+            "running",
+            "failed fleet rearm must not start the valid-prefix worker"
+        );
+        let relative_corrupt_path = format!(
+            "./.chidori/runs/agents/{}",
+            corrupt_path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert!(
+            stderr.contains("re-arming detached agents")
+                && stderr.contains(&relative_corrupt_path),
+            "serve stderr must surface rearm failure and corrupt path {relative_corrupt_path} (verbose={verbose}); stderr:\n{stderr}"
+        );
+    } else if case == "healthy-fleet" {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let journal_path = run_dir.as_ref().unwrap().join("records.jsonl");
+        loop {
+            let descriptor = detached_registry_entry(project, "aa-valid-prefix");
+            let records = journal_records(&journal_path);
+            if detached_registry_status(&descriptor) == "completed"
+                && records.iter().any(|record| {
+                    record["function"] == "log"
+                        && record["args"].to_string().contains("rearm-sentinel")
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "healthy fleet did not consume queued signal and reach sentinel; registry={descriptor}; records={records:?}; stderr={}",
+                fs::read_to_string(&serve.log).unwrap_or_default()
+            );
+            std::thread::yield_now();
+        }
+        let records = journal_records(&journal_path);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["function"] == "log"
+                    && record["args"].to_string().contains("rearm-sentinel"))
+                .count(),
+            1,
+            "healthy fleet should run its sentinel exactly once"
+        );
+        assert_eq!(
+            detached_registry_status(&detached_registry_entry(project, "aa-valid-prefix")),
+            "completed"
+        );
+        assert!(
+            !stderr.contains("re-arming detached agents"),
+            "healthy fleet must not log a rearm warning: {stderr}"
+        );
+    } else {
+        assert_eq!(health.body["status"], "ok");
+        assert!(
+            !stderr.contains("re-arming detached agents"),
+            "empty fleet must not log a rearm warning: {stderr}"
+        );
+        assert_eq!(
+            serve_http_request(port, "GET", "/agents/detached", None).body["agents"],
+            serde_json::json!([])
+        );
+        assert!(
+            !project.join(".chidori/runs/agents").exists(),
+            "empty fleet should not create a registry directory"
+        );
+    }
+}
+
+#[test]
+fn cli_serve_surfaces_detached_rearm_failure_at_default_verbosity_and_keeps_controls() {
+    const TEST: &str =
+        "cli_serve_surfaces_detached_rearm_failure_at_default_verbosity_and_keeps_controls";
+    const CASE: &str = "CHIDORI_TEST_REARM_DIAGNOSTIC_CASE";
+    const ROOT: &str = "CHIDORI_TEST_REARM_DIAGNOSTIC_ROOT";
+
+    if let Some(case) = std::env::var_os(CASE) {
+        let project = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        run_rearm_diagnostic_case(&case.to_string_lossy(), &project);
+        return;
+    }
+
+    let mut failures = Vec::new();
+    let mut outcomes = Vec::new();
+    for case in [
+        "default-corrupt",
+        "verbose-corrupt",
+        "healthy-fleet",
+        "absent-registry",
+    ] {
+        let project = temp_project(&format!("rearm-diagnostic-{case}"));
+        let _cleanup = DetachedStopProject(project.clone());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CASE, case)
+            .env(ROOT, &project)
+            .output()
+            .unwrap();
+        let report = format!(
+            "case={case} status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            failures.push(report.clone());
+        }
+        outcomes.push(report);
+    }
+    assert!(
+        failures.is_empty(),
+        "serve rearm diagnostic child failures:\n{failures:#?}\nall outcomes:\n{outcomes:#?}"
+    );
 }
 
 #[test]
