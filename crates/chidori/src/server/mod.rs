@@ -76,6 +76,17 @@ pub(crate) static STARTUP_LEASE_HELD_TEST_OBSERVER: StdMutex<
     Option<tokio::sync::oneshot::Sender<()>>,
 > = StdMutex::new(None);
 
+/// One-shot barrier after a warm VM receives its response and before it
+/// reloads the durable signal inbox. Test builds only.
+#[cfg(test)]
+pub(crate) static WARM_POST_RESPONSE_INBOX_TEST_GATE: StdMutex<
+    Option<(
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+> = StdMutex::new(None);
+
 // Test-only re-imports: they keep the flat namespace the test module's
 // `use super::*` saw when this module was a single file.
 #[cfg(test)]
@@ -242,6 +253,28 @@ fn install_warm_run(
                 // file is the union — live drains re-persist it — so the
                 // reload is exactly what a replay resume would have seeded.
                 let run_id = ctx.run_id();
+                #[cfg(test)]
+                {
+                    let gate = {
+                        let mut slot = WARM_POST_RESPONSE_INBOX_TEST_GATE.lock().unwrap();
+                        if slot
+                            .as_ref()
+                            .is_some_and(|(expected, _, _)| expected == &run_id)
+                        {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((_, reached, release)) = gate {
+                        reached
+                            .send(())
+                            .expect("warm inbox test observer remains connected");
+                        release
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("warm inbox test barrier is released");
+                    }
+                }
                 ctx.set_signal_inbox(load_persisted_signal_inbox(&bridge_run_base, Some(&run_id)));
                 WarmInputWait::Delivered(response)
             }
