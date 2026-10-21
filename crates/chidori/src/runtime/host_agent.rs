@@ -2401,6 +2401,22 @@ mod tests {
     const SAME_NAME_SPAWN_CHILD_INDEX_ENV: &str = "CHIDORI_TEST_SAME_NAME_SPAWN_CHILD_INDEX";
     const SAME_NAME_SPAWN_TEST: &str =
         "runtime::host_agent::tests::detached_same_name_spawn_competing_processes_preserve_one_delivery";
+    const STALE_NAME_CACHE_MODE_ENV: &str = "CHIDORI_TEST_STALE_NAME_CACHE_MODE";
+    const STALE_NAME_CACHE_ROOT_ENV: &str = "CHIDORI_TEST_STALE_NAME_CACHE_ROOT";
+    const STALE_NAME_CACHE_BACKEND_ENV: &str = "CHIDORI_TEST_STALE_NAME_CACHE_BACKEND";
+    const STALE_NAME_CACHE_NAME_ENV: &str = "CHIDORI_TEST_STALE_NAME_CACHE_NAME";
+    const STALE_NAME_CACHE_GATE_ENV: &str = "CHIDORI_TEST_STALE_NAME_CACHE_GATE";
+    const STALE_NAME_CACHE_TEST: &str =
+        "runtime::host_agent::tests::detached_stale_name_cache_routes_lookup_and_send_to_current_incarnation";
+
+    struct KillChildOnDrop(std::process::Child);
+
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     static SPAWN_THREAD_START_FAILURES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
@@ -4966,6 +4982,562 @@ mod tests {
                 Err(error) => panic!("accepting same-name spawn event failed: {error}"),
             }
         }
+    }
+
+    fn stale_name_cache_event(phase: &str, details: Value, wait_for_release: bool) {
+        use std::io::{Read, Write};
+        let address: std::net::SocketAddr = std::env::var(STALE_NAME_CACHE_GATE_ENV)
+            .expect("missing stale-name-cache gate address")
+            .parse()
+            .expect("valid stale-name-cache gate address");
+        let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10))
+            .expect("connect to stale-name-cache test coordinator");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("set stale-name-cache gate timeout");
+        writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&json!({ "phase": phase, "details": details }))
+                .expect("serialize stale-name-cache event")
+        )
+        .expect("report stale-name-cache event");
+        if wait_for_release {
+            let mut release = [0u8; 1];
+            stream
+                .read_exact(&mut release)
+                .expect("wait for stale-name-cache coordinator release");
+            assert_eq!(release[0], b'R', "unexpected stale-name-cache release");
+        }
+    }
+
+    fn accept_stale_name_cache_event(
+        listener: &std::net::TcpListener,
+        expected: &str,
+        child: &mut std::process::Child,
+        root: &Path,
+        role: &str,
+    ) -> (Value, std::net::TcpStream) {
+        use std::io::BufRead;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll stale-cache child") {
+                let stdout = std::fs::read_to_string(root.join(format!("{role}.stdout")))
+                    .unwrap_or_default();
+                let stderr = std::fs::read_to_string(root.join(format!("{role}.stderr")))
+                    .unwrap_or_default();
+                panic!(
+                    "timed out waiting for stale-name-cache event {expected}; {role} exited {status}; stdout={stdout}; stderr={stderr}"
+                );
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make stale-name-cache accepted stream blocking");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("set stale-name-cache event timeout");
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .expect("read stale-name-cache event");
+                    let event = serde_json::from_str(&line).unwrap_or_else(|error| {
+                        panic!("invalid stale-name-cache event {line:?}: {error}")
+                    });
+                    return (event, stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let stdout = std::fs::read_to_string(root.join(format!("{role}.stdout")))
+                            .unwrap_or_default();
+                        let stderr = std::fs::read_to_string(root.join(format!("{role}.stderr")))
+                            .unwrap_or_default();
+                        panic!(
+                            "timed out waiting for stale-name-cache event {expected}; {role} remained alive; stdout={stdout}; stderr={stderr}"
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accepting stale-name-cache event failed: {error}"),
+            }
+        }
+    }
+
+    fn stale_name_cache_child_command(
+        root: &Path,
+        backend: &str,
+        name: &str,
+        gate: &str,
+        mode: &str,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                STALE_NAME_CACHE_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STALE_NAME_CACHE_MODE_ENV, mode)
+            .env(STALE_NAME_CACHE_ROOT_ENV, root)
+            .env(STALE_NAME_CACHE_BACKEND_ENV, backend)
+            .env(STALE_NAME_CACHE_NAME_ENV, name)
+            .env(STALE_NAME_CACHE_GATE_ENV, gate)
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_RUN_DB", root.join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    fn stale_name_cache_source(project: &Path, role: &str) -> PathBuf {
+        let source = project
+            .join("services")
+            .join(format!("stale-cache-{role}.ts"));
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let body = match role {
+            "predecessor" => {
+                r#"export async function agent() {
+                    const message = await chidori.signal("finish");
+                    return { phase: "predecessor", id: message.payload.id };
+                }"#
+            }
+            "replacement" => {
+                r#"export async function agent() {
+                    const message = await chidori.signal("current-payload");
+                    await chidori.tool("migrationEffect", { id: message.payload.id });
+                    return { phase: "replacement", id: message.payload.id };
+                }"#
+            }
+            _ => panic!("unknown stale-cache source role {role}"),
+        };
+        std::fs::write(&source, body).unwrap();
+        source
+    }
+
+    fn stale_name_cache_child() {
+        let mode = std::env::var(STALE_NAME_CACHE_MODE_ENV).unwrap_or_default();
+        if !matches!(mode.as_str(), "process-a" | "process-b" | "control") {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(STALE_NAME_CACHE_ROOT_ENV).unwrap());
+        let backend = std::env::var(STALE_NAME_CACHE_BACKEND_ENV).unwrap();
+        let name = std::env::var(STALE_NAME_CACHE_NAME_ENV).unwrap();
+        let project = root.join("project");
+        let run_base = project.join(".chidori/runs");
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = migration_counting_tools(effects.clone());
+        let parts = sqlite_test_parts(&project, run_base.clone(), tools);
+        hub().install_parts(parts.clone());
+        let factory = RunStoreFactory::shared(&run_base);
+        let options = SpawnOptions {
+            name: Some(name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+
+        if mode == "control" {
+            let control_name = format!("{}-control", name);
+            let source = stale_name_cache_source(&project, "replacement");
+            let control_options = SpawnOptions {
+                name: Some(control_name.clone()),
+                ..options
+            };
+            let spawned = hub()
+                .spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &control_options,
+                    "stale-name-cache-single-hub-control".to_string(),
+                )
+                .unwrap();
+            let run_id = spawned["runId"].as_str().unwrap().to_string();
+            wait_for_agent_status(&parts, &control_name, |status| status == "hibernating");
+            let lookup = hub().lookup(&parts, &control_name).unwrap();
+            let send = hub()
+                .send(
+                    &parts,
+                    &control_name,
+                    "current-payload",
+                    json!({ "id": "stale-cache-control-payload" }),
+                    json!({ "kind": "test", "id": "single-hub-control" }),
+                )
+                .unwrap();
+            let descriptor = wait_for_agent_descriptor(&parts, &control_name, |descriptor| {
+                descriptor.run_id == run_id && descriptor.status == "completed"
+            });
+            let records = factory
+                .store_for(&run_id)
+                .load_call_log()
+                .unwrap()
+                .unwrap_or_default();
+            let rows = records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal"
+                        && record.result["payload"]["id"] == "stale-cache-control-payload"
+                })
+                .count();
+            let report = json!({
+                "lookup": lookup,
+                "send": send,
+                "descriptor": descriptor,
+                "signal_rows": rows,
+                "effect_count": effects.load(Ordering::SeqCst),
+            });
+            std::fs::write(
+                root.join("single-hub-control-report.json"),
+                serde_json::to_vec_pretty(&report).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+
+        if mode == "process-a" {
+            let source = stale_name_cache_source(&project, "predecessor");
+            let spawned = hub()
+                .spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &options,
+                    "stale-name-cache-process-a".to_string(),
+                )
+                .unwrap();
+            let predecessor_id = spawned["runId"].as_str().unwrap().to_string();
+            wait_for_agent_status(&parts, &name, |status| status == "hibernating");
+            let status = hub().status(&parts, &name).unwrap();
+            assert_eq!(status["live"], false);
+            stale_name_cache_event(
+                "a-predecessor-hibernating",
+                json!({ "run_id": predecessor_id, "status": status }),
+                true,
+            );
+
+            let lookup = hub().lookup(&parts, &name).unwrap();
+            let send = hub()
+                .send(
+                    &parts,
+                    &name,
+                    "current-payload",
+                    json!({ "id": "stale-cache-current-payload" }),
+                    json!({ "kind": "test", "id": "process-a" }),
+                )
+                .unwrap();
+            std::fs::write(
+                root.join("process-a-report.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "backend": backend,
+                    "predecessor_run_id": predecessor_id,
+                    "lookup": lookup,
+                    "send": send,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            stale_name_cache_event(
+                "a-lookup-send-complete",
+                json!({ "lookup": lookup, "send": send }),
+                false,
+            );
+            return;
+        }
+
+        let rearmed = hub().rearm_from_registry(parts.clone()).unwrap();
+        assert_eq!(rearmed, 1, "fresh process must re-arm the predecessor");
+        let predecessor = hub().lookup(&parts, &name).unwrap();
+        let predecessor_id = predecessor["runId"].as_str().unwrap().to_string();
+        hub()
+            .send(
+                &parts,
+                &name,
+                "finish",
+                json!({ "id": "finish-predecessor" }),
+                json!({ "kind": "test", "id": "process-b" }),
+            )
+            .unwrap();
+        wait_for_agent_descriptor(&parts, &name, |descriptor| {
+            descriptor.run_id == predecessor_id && descriptor.status == "completed"
+        });
+
+        let source = stale_name_cache_source(&project, "replacement");
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &options,
+                "stale-name-cache-process-b".to_string(),
+            )
+            .unwrap();
+        let replacement_id = spawned["runId"].as_str().unwrap().to_string();
+        let replacement_status =
+            wait_for_agent_status(&parts, &name, |status| status == "hibernating");
+        assert_eq!(replacement_status["runId"], replacement_id);
+        stale_name_cache_event(
+            "b-replacement-ready",
+            json!({
+                "predecessor_run_id": predecessor_id,
+                "replacement_run_id": replacement_id,
+                "status": replacement_status,
+            }),
+            true,
+        );
+
+        let replacement_entry = hub().ensure_entry(&parts, &name).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = replacement_entry.state.lock().unwrap();
+        while !AgentEntry::is_settled(&state) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (next, _) = replacement_entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+        }
+        drop(state);
+        let registry = factory.registry_get(&name).unwrap().unwrap();
+        let replacement_store = factory.store_for(&replacement_id);
+        let replacement_records = replacement_store
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default();
+        let replacement_inbox = replacement_store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .unwrap_or_default();
+        let predecessor_store = factory.store_for(&predecessor_id);
+        let predecessor_records = predecessor_store
+            .load_call_log()
+            .unwrap()
+            .unwrap_or_default();
+        let predecessor_inbox = predecessor_store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .unwrap_or_default();
+        let matching_rows = |records: &[crate::runtime::call_log::CallRecord]| {
+            records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal"
+                        && record.result["payload"]["id"] == "stale-cache-current-payload"
+                })
+                .count()
+        };
+        let inbox_count = |bytes: &[u8]| -> usize {
+            serde_json::from_slice::<Vec<QueuedSignal>>(bytes)
+                .unwrap_or_default()
+                .iter()
+                .filter(|signal| signal.payload["id"] == "stale-cache-current-payload")
+                .count()
+        };
+        let report = json!({
+            "backend": backend,
+            "predecessor_run_id": predecessor_id,
+            "replacement_run_id": replacement_id,
+            "registry_run_id": registry["run_id"],
+            "replacement_status": hub().status(&parts, &name).unwrap(),
+            "replacement_signal_rows": matching_rows(&replacement_records),
+            "replacement_inbox_count": inbox_count(&replacement_inbox),
+            "replacement_inbox": String::from_utf8_lossy(&replacement_inbox),
+            "replacement_effect_count": effects.load(Ordering::SeqCst),
+            "predecessor_signal_rows": matching_rows(&predecessor_records),
+            "predecessor_inbox_count": inbox_count(&predecessor_inbox),
+            "predecessor_inbox": String::from_utf8_lossy(&predecessor_inbox),
+        });
+        std::fs::write(
+            root.join("process-b-report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        stale_name_cache_event("b-final-snapshot", report, false);
+    }
+
+    #[test]
+    fn detached_stale_name_cache_routes_lookup_and_send_to_current_incarnation() {
+        let mode = std::env::var(STALE_NAME_CACHE_MODE_ENV).unwrap_or_default();
+        if matches!(mode.as_str(), "process-a" | "process-b" | "control") {
+            stale_name_cache_child();
+            return;
+        }
+
+        let mut red_failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().to_path_buf();
+            let project = root.join("project");
+            migration_source(&project);
+            let name = format!("stale-name-cache-{backend}");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let gate = listener.local_addr().unwrap().to_string();
+
+            let mut process_a_command =
+                stale_name_cache_child_command(&root, backend, &name, &gate, "process-a");
+            process_a_command
+                .stdout(std::process::Stdio::from(
+                    std::fs::File::create(root.join("a.stdout")).unwrap(),
+                ))
+                .stderr(std::process::Stdio::from(
+                    std::fs::File::create(root.join("a.stderr")).unwrap(),
+                ));
+            let mut process_a = KillChildOnDrop(process_a_command.spawn().unwrap());
+            let (a_ready, mut a_ready_stream) = accept_stale_name_cache_event(
+                &listener,
+                "A predecessor hibernating",
+                &mut process_a.0,
+                &root,
+                "a",
+            );
+            assert_eq!(a_ready["phase"], "a-predecessor-hibernating");
+            let predecessor_id = a_ready["details"]["run_id"].as_str().unwrap().to_string();
+            assert_eq!(a_ready["details"]["status"]["status"], "hibernating");
+            assert_eq!(a_ready["details"]["status"]["live"], false);
+
+            let mut process_b_command =
+                stale_name_cache_child_command(&root, backend, &name, &gate, "process-b");
+            process_b_command
+                .stdout(std::process::Stdio::from(
+                    std::fs::File::create(root.join("b.stdout")).unwrap(),
+                ))
+                .stderr(std::process::Stdio::from(
+                    std::fs::File::create(root.join("b.stderr")).unwrap(),
+                ));
+            let mut process_b = KillChildOnDrop(process_b_command.spawn().unwrap());
+            let (b_ready, mut b_ready_stream) = accept_stale_name_cache_event(
+                &listener,
+                "B replacement ready",
+                &mut process_b.0,
+                &root,
+                "b",
+            );
+            assert_eq!(b_ready["phase"], "b-replacement-ready");
+            assert_eq!(b_ready["details"]["predecessor_run_id"], predecessor_id);
+            assert_ne!(b_ready["details"]["replacement_run_id"], predecessor_id);
+            let replacement_id = b_ready["details"]["replacement_run_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(b_ready["details"]["status"]["status"], "hibernating");
+
+            use std::io::Write;
+            a_ready_stream.write_all(b"R").unwrap();
+            a_ready_stream.flush().unwrap();
+            let (a_done, _) = accept_stale_name_cache_event(
+                &listener,
+                "A lookup/send complete",
+                &mut process_a.0,
+                &root,
+                "a",
+            );
+            assert_eq!(a_done["phase"], "a-lookup-send-complete");
+            b_ready_stream.write_all(b"R").unwrap();
+            b_ready_stream.flush().unwrap();
+
+            let a_status = process_a.0.wait().unwrap();
+            assert!(
+                a_status.success(),
+                "{backend} process A failed: stdout={} stderr={}",
+                std::fs::read_to_string(root.join("a.stdout")).unwrap_or_default(),
+                std::fs::read_to_string(root.join("a.stderr")).unwrap_or_default()
+            );
+            let (b_final, _) = accept_stale_name_cache_event(
+                &listener,
+                "B final snapshot",
+                &mut process_b.0,
+                &root,
+                "b",
+            );
+            assert_eq!(b_final["phase"], "b-final-snapshot");
+            let b_status = process_b.0.wait().unwrap();
+            assert!(
+                b_status.success(),
+                "{backend} process B failed: stdout={} stderr={}",
+                std::fs::read_to_string(root.join("b.stdout")).unwrap_or_default(),
+                std::fs::read_to_string(root.join("b.stderr")).unwrap_or_default()
+            );
+            let a_report: Value =
+                serde_json::from_slice(&std::fs::read(root.join("process-a-report.json")).unwrap())
+                    .unwrap();
+            let b_report: Value =
+                serde_json::from_slice(&std::fs::read(root.join("process-b-report.json")).unwrap())
+                    .unwrap();
+
+            let lookup_id = a_report["lookup"]["runId"].as_str().unwrap_or_default();
+            if lookup_id != replacement_id {
+                red_failures.push(format!(
+                    "{backend}: old hub lookup returned {lookup_id}, current registry/replacement is {replacement_id}"
+                ));
+            }
+            if b_report["registry_run_id"] != replacement_id {
+                red_failures.push(format!(
+                    "{backend}: registry={} does not identify replacement={replacement_id}",
+                    b_report["registry_run_id"]
+                ));
+            }
+            if a_report["send"]["delivered"] != true {
+                red_failures.push(format!(
+                    "{backend}: public send did not report delivered=true: {}",
+                    a_report["send"]
+                ));
+            }
+            let replacement_accounted = b_report["replacement_signal_rows"].as_u64().unwrap_or(0)
+                + b_report["replacement_inbox_count"].as_u64().unwrap_or(0);
+            if replacement_accounted != 1 {
+                red_failures.push(format!(
+                    "{backend}: replacement did not account for unique payload exactly once; snapshot={b_report}"
+                ));
+            }
+            if b_report["predecessor_signal_rows"].as_u64().unwrap_or(0) != 0
+                || b_report["predecessor_inbox_count"].as_u64().unwrap_or(0) != 0
+            {
+                red_failures.push(format!(
+                    "{backend}: payload was stranded on unregistered predecessor; snapshot={b_report}"
+                ));
+            }
+            if b_report["replacement_status"]["status"] == "completed"
+                && b_report["replacement_effect_count"] != 1
+            {
+                red_failures.push(format!(
+                    "{backend}: replacement completed with effect count {}; snapshot={b_report}",
+                    b_report["replacement_effect_count"]
+                ));
+            }
+
+            let control_output =
+                stale_name_cache_child_command(&root, backend, &name, &gate, "control")
+                    .output()
+                    .unwrap();
+            assert!(
+                control_output.status.success(),
+                "{backend} same-hub control failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&control_output.stdout),
+                String::from_utf8_lossy(&control_output.stderr)
+            );
+            let control: Value = serde_json::from_slice(
+                &std::fs::read(root.join("single-hub-control-report.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(control["lookup"]["runId"], control["descriptor"]["run_id"]);
+            assert_eq!(control["send"]["delivered"], true);
+            assert_eq!(control["signal_rows"], 1);
+            assert_eq!(control["effect_count"], 1);
+        }
+
+        assert!(
+            red_failures.is_empty(),
+            "stale per-process name-cache Red failures (expected on current main): {red_failures:#?}"
+        );
     }
 
     #[test]
