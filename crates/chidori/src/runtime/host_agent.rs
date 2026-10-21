@@ -358,6 +358,12 @@ impl DetachedAgentHub {
         parts: &AgentRuntimeParts,
         name: &str,
     ) -> Result<Arc<AgentEntry>, String> {
+        // Preserve cache-first behavior for incarnation-bound operations such
+        // as status/stop/join. Name-addressed lookup/send use the locked
+        // resolver directly because they must follow the current registry name.
+        if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
+            return Ok(entry);
+        }
         with_agent_name_lock(parts, name, |factory| {
             self.resolve_entry_locked(parts, name, factory)?
                 .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))
