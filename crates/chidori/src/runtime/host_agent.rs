@@ -681,6 +681,11 @@ impl DetachedAgentHub {
         payload: Value,
         from: Value,
     ) -> Result<Value, String> {
+        // Let concurrent test senders rendezvous before same-name
+        // serialization. Once released, the production name lock owns the
+        // registry reread, inbox update, and wake decision as one operation.
+        #[cfg(test)]
+        tests::pause_before_cross_process_inbox_update(to);
         with_agent_name_lock(parts, to, |factory| {
             let entry = self
                 .resolve_entry_locked(parts, to, factory)?
@@ -716,8 +721,6 @@ impl DetachedAgentHub {
                 }
                 let run_id = state.descriptor.run_id.clone();
                 let store = factory.store_for(&run_id);
-                #[cfg(test)]
-                tests::pause_before_cross_process_inbox_update(&entry.name);
                 let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
                     let mut inbox: Vec<QueuedSignal> = current
                         .as_deref()
@@ -3548,6 +3551,11 @@ mod tests {
             #[cfg(test)]
             live_send_notify_count: std::sync::atomic::AtomicUsize::new(0),
         });
+        let registered_descriptor =
+            serde_json::to_value(&entry.state.lock().unwrap().descriptor).unwrap();
+        RunStoreFactory::shared(&parts.run_base)
+            .registry_put(&name, "live-run", &registered_descriptor)
+            .unwrap();
         hub()
             .entries
             .lock()
