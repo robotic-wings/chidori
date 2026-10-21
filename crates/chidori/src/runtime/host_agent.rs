@@ -2217,6 +2217,8 @@ mod tests {
     const PREDECESSOR_MIGRATION_CHILD_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_CHILD";
     const PREDECESSOR_MIGRATION_BASE_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_BASE";
     const PREDECESSOR_MIGRATION_SCENARIO_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_SCENARIO";
+    const REGISTRY_TRUNCATION_MODE_ENV: &str = "CHIDORI_TEST_REGISTRY_TRUNCATION_MODE";
+    const REGISTRY_TRUNCATION_ROOT_ENV: &str = "CHIDORI_TEST_REGISTRY_TRUNCATION_ROOT";
 
     struct PredecessorMigrationBarrier {
         agent_name: String,
@@ -3538,6 +3540,53 @@ mod tests {
         source
     }
 
+    fn migration_counting_tools(effects: Arc<std::sync::atomic::AtomicUsize>) -> Arc<ToolRegistry> {
+        let mut tools = ToolRegistry::new();
+        tools.register_native(
+            "migrationEffect",
+            "count migration effects",
+            Vec::new(),
+            move |_| {
+                effects.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "effect": true }))
+            },
+        );
+        Arc::new(tools)
+    }
+
+    fn registry_truncation_control_source(project: &Path) -> PathBuf {
+        let source = project.join("services/registry-control-worker.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            r#"export async function agent() {
+                await chidori.signal("gate");
+                const message = await chidori.signal("go");
+                await chidori.tool("migrationEffect", { id: message.payload.id });
+                return { id: message.payload.id };
+            }"#,
+        )
+        .unwrap();
+        source
+    }
+
+    fn registry_truncation_child(
+        test: &str,
+        mode: &str,
+        root: &Path,
+        backend: &str,
+    ) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("CHIDORI_TEST_REGISTRY_TRUNCATION_MODE", mode)
+            .env("CHIDORI_TEST_REGISTRY_TRUNCATION_ROOT", root)
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_RUN_DB", root.join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .output()
+            .unwrap()
+    }
+
     fn seed_settled_predecessor(
         factory: &RunStoreFactory,
         name: &str,
@@ -3798,6 +3847,436 @@ mod tests {
         assert!(
             failures.is_empty(),
             "migration subprocess failures:\n{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn detached_registry_prefix_write_crash_fs_and_sqlite_restart_and_control() {
+        const TEST: &str = "runtime::host_agent::tests::detached_registry_prefix_write_crash_fs_and_sqlite_restart_and_control";
+        match std::env::var(REGISTRY_TRUNCATION_MODE_ENV).as_deref() {
+            Ok("cut") => {
+                let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
+                let backend = std::env::var("CHIDORI_RUN_STORE").unwrap();
+                let project = root.join("project");
+                std::fs::create_dir_all(&project).unwrap();
+                let source = migration_source(&project);
+                let run_base = project.join(".chidori/runs");
+                let name = format!("registry-truncation-{backend}");
+                let parts = sqlite_test_parts(
+                    &project,
+                    run_base.clone(),
+                    migration_counting_tools(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                );
+                let factory = RunStoreFactory::shared(&run_base);
+                let predecessor_id = format!("old-{}", uuid::Uuid::new_v4());
+                let inbox_before =
+                    seed_settled_predecessor(&factory, &name, &predecessor_id, "must-survive");
+                std::fs::write(root.join("predecessor-inbox-before.json"), &inbox_before).unwrap();
+                std::fs::write(
+                    root.join("seed.json"),
+                    serde_json::to_vec_pretty(&json!({
+                        "name":name,
+                        "predecessor_run_id":predecessor_id
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let options = SpawnOptions {
+                    name: Some(name),
+                    restart: "never".into(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                };
+                let result = hub().spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &options,
+                    "registry-prefix-cut-parent".into(),
+                );
+                panic!(
+                    "replacement spawn returned before process kill at prefix boundary: {result:?}"
+                );
+            }
+            Ok("retry") => {
+                let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
+                let seed: Value =
+                    serde_json::from_slice(&std::fs::read(root.join("seed.json")).unwrap())
+                        .unwrap();
+                let name = seed["name"].as_str().unwrap();
+                let predecessor_id = seed["predecessor_run_id"].as_str().unwrap();
+                let project = root.join("project");
+                let run_base = project.join(".chidori/runs");
+                let source = migration_source(&project);
+                let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let parts = sqlite_test_parts(
+                    &project,
+                    run_base.clone(),
+                    migration_counting_tools(effects.clone()),
+                );
+                let factory = RunStoreFactory::shared(&run_base);
+                let registry_before = factory.registry_get(name);
+                let observed_run_id = registry_before
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| entry.as_ref())
+                    .and_then(|entry| entry["run_id"].as_str())
+                    .map(str::to_owned);
+                let old_inbox_before_retry = factory
+                    .store_for(predecessor_id)
+                    .get_blob(SIGNAL_INBOX_FILE)
+                    .unwrap()
+                    .unwrap();
+                let expected_inbox =
+                    std::fs::read(root.join("predecessor-inbox-before.json")).unwrap();
+                let registry_file = run_base.join("agents").join(format!("{name}.json"));
+                let registry_bytes_before_retry = std::fs::read(&registry_file).ok();
+                let report_before_retry = json!({
+                    "backend": std::env::var("CHIDORI_RUN_STORE").unwrap(),
+                    "name": name,
+                    "predecessor_run_id": predecessor_id,
+                    "registry_result": format!("{registry_before:?}"),
+                    "observed_registry_run_id": observed_run_id,
+                    "registry_file": registry_file.display().to_string(),
+                    "registry_file_bytes": registry_bytes_before_retry.as_ref().map(|bytes| String::from_utf8_lossy(bytes).to_string()),
+                    "predecessor_inbox_exact_original": old_inbox_before_retry == expected_inbox,
+                    "predecessor_inbox": String::from_utf8_lossy(&old_inbox_before_retry),
+                });
+                std::fs::write(
+                    root.join("retry-precondition-report.json"),
+                    serde_json::to_vec_pretty(&report_before_retry).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    observed_run_id.as_deref(),
+                    Some(predecessor_id),
+                    "fresh process must read the previous complete registry entry before same-name retry; report={report_before_retry}"
+                );
+                assert_eq!(
+                    old_inbox_before_retry, expected_inbox,
+                    "predecessor inbox must remain byte-identical until same-name retry"
+                );
+                let options = SpawnOptions {
+                    name: Some(name.to_string()),
+                    restart: "never".into(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                };
+                let spawned = hub()
+                    .spawn(
+                        &parts,
+                        source.to_str().unwrap(),
+                        json!({}),
+                        &options,
+                        "registry-prefix-retry-parent".into(),
+                    )
+                    .unwrap();
+                let replacement_id = spawned["runId"].as_str().unwrap().to_owned();
+                let descriptor = wait_for_agent_descriptor(&parts, name, |descriptor| {
+                    descriptor.run_id == replacement_id && descriptor.status == "completed"
+                });
+                let records = factory
+                    .store_for(&replacement_id)
+                    .load_call_log()
+                    .unwrap()
+                    .unwrap_or_default();
+                let matching_signal_rows = records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal"
+                            && record.result["payload"]["id"] == json!("must-survive")
+                    })
+                    .count();
+                let replacement_inbox = factory
+                    .store_for(&replacement_id)
+                    .get_blob(SIGNAL_INBOX_FILE)
+                    .unwrap()
+                    .unwrap_or_default();
+                let registry_after = factory.registry_get(name).unwrap().unwrap();
+                let report = json!({
+                    "backend": std::env::var("CHIDORI_RUN_STORE").unwrap(),
+                    "name": name,
+                    "predecessor_run_id": predecessor_id,
+                    "replacement_run_id": replacement_id,
+                    "descriptor_status": descriptor.status,
+                    "registry_run_id_after": registry_after["run_id"],
+                    "matching_signal_rows": matching_signal_rows,
+                    "effect_count": effects.load(Ordering::SeqCst),
+                    "replacement_inbox": String::from_utf8_lossy(&replacement_inbox),
+                });
+                std::fs::write(
+                    root.join("retry-report.json"),
+                    serde_json::to_vec_pretty(&report).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(registry_after["run_id"], replacement_id);
+                assert_eq!(
+                    matching_signal_rows, 1,
+                    "preserved payload must be journaled once"
+                );
+                assert_eq!(
+                    effects.load(Ordering::SeqCst),
+                    1,
+                    "preserved payload effect must run once"
+                );
+                assert!(replacement_inbox.is_empty() || replacement_inbox == b"[]");
+                return;
+            }
+            Ok("control-spawn") => {
+                let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
+                let backend = std::env::var("CHIDORI_RUN_STORE").unwrap();
+                let project = root.join("project");
+                std::fs::create_dir_all(&project).unwrap();
+                let source = registry_truncation_control_source(&project);
+                let run_base = project.join(".chidori/runs");
+                let name = format!("registry-truncation-control-{backend}");
+                let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let parts = sqlite_test_parts(
+                    &project,
+                    run_base.clone(),
+                    migration_counting_tools(effects),
+                );
+                let factory = RunStoreFactory::shared(&run_base);
+                let predecessor_id = format!("old-{}", uuid::Uuid::new_v4());
+                let _inbox_before =
+                    seed_settled_predecessor(&factory, &name, &predecessor_id, "control-payload");
+                let options = SpawnOptions {
+                    name: Some(name.clone()),
+                    restart: "never".into(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                };
+                let spawned = hub()
+                    .spawn(
+                        &parts,
+                        source.to_str().unwrap(),
+                        json!({}),
+                        &options,
+                        "registry-clean-control-parent".into(),
+                    )
+                    .unwrap();
+                let replacement_id = spawned["runId"].as_str().unwrap();
+                let descriptor = wait_for_agent_descriptor(&parts, &name, |d| {
+                    d.run_id == replacement_id && d.status == "hibernating"
+                });
+                let registry = factory.registry_get(&name).unwrap().unwrap();
+                let report = json!({"backend":backend,"name":name,"predecessor_run_id":predecessor_id,"replacement_run_id":replacement_id,"status":descriptor.status,"registry_run_id":registry["run_id"]});
+                std::fs::write(
+                    root.join("control-spawn-report.json"),
+                    serde_json::to_vec_pretty(&report).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(registry["run_id"], replacement_id);
+                return;
+            }
+            Ok("control-rearm") => {
+                let root = PathBuf::from(std::env::var_os(REGISTRY_TRUNCATION_ROOT_ENV).unwrap());
+                let project = root.join("project");
+                let run_base = project.join(".chidori/runs");
+                let spawn_report: Value = serde_json::from_slice(
+                    &std::fs::read(root.join("control-spawn-report.json")).unwrap(),
+                )
+                .unwrap();
+                let name = spawn_report["name"].as_str().unwrap();
+                let replacement_id = spawn_report["replacement_run_id"].as_str().unwrap();
+                let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let parts = sqlite_test_parts(
+                    &project,
+                    run_base.clone(),
+                    migration_counting_tools(effects.clone()),
+                );
+                let factory = RunStoreFactory::shared(&run_base);
+                let rearmed = hub().rearm_from_registry(parts.clone()).unwrap();
+                let before_wake = hub().status(&parts, name).unwrap();
+                hub()
+                    .send(
+                        &parts,
+                        name,
+                        "gate",
+                        json!({}),
+                        json!({"kind":"test-control"}),
+                    )
+                    .unwrap();
+                let descriptor = wait_for_agent_descriptor(&parts, name, |d| {
+                    d.run_id == replacement_id && d.status == "completed"
+                });
+                let records = factory
+                    .store_for(replacement_id)
+                    .load_call_log()
+                    .unwrap()
+                    .unwrap_or_default();
+                let matching = records
+                    .iter()
+                    .filter(|r| {
+                        r.function == "signal"
+                            && r.result["payload"]["id"] == json!("control-payload")
+                    })
+                    .count();
+                let inbox = factory
+                    .store_for(replacement_id)
+                    .get_blob(SIGNAL_INBOX_FILE)
+                    .unwrap()
+                    .unwrap_or_default();
+                let registry = factory.registry_get(name).unwrap().unwrap();
+                let report = json!({"rearmed":rearmed,"name":name,"replacement_run_id":replacement_id,"registry_run_id":registry["run_id"],"pre_wake_status":before_wake["status"],"descriptor_status":descriptor.status,"matching_signal_rows":matching,"replacement_inbox":String::from_utf8_lossy(&inbox),"effect_count":effects.load(Ordering::SeqCst)});
+                std::fs::write(
+                    root.join("control-rearm-report.json"),
+                    serde_json::to_vec_pretty(&report).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(rearmed, 1);
+                assert_eq!(registry["run_id"], replacement_id);
+                assert_eq!(before_wake["status"], "hibernating");
+                assert_eq!(matching, 1);
+                assert!(inbox == b"[]" || inbox.is_empty());
+                assert_eq!(effects.load(Ordering::SeqCst), 1);
+                return;
+            }
+            _ => {}
+        }
+
+        let mut red_failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.keep();
+            let name = format!("registry-truncation-{backend}");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(REGISTRY_TRUNCATION_MODE_ENV, "cut")
+                .env(REGISTRY_TRUNCATION_ROOT_ENV, &root)
+                .env("CHIDORI_TEST_REGISTRY_PREFIX_NAME", &name)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", root.join("runs.sqlite3"))
+                .env("CHIDORI_DURABILITY", "strict")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut child_stdout = child.stdout.take().unwrap();
+            let (line_tx, line_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(&mut child_stdout);
+                loop {
+                    let mut line = String::new();
+                    match std::io::BufRead::read_line(&mut reader, &mut line) {
+                        Ok(0) => {
+                            let _ = line_tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "child exited before flushed-prefix gate line",
+                            )));
+                            return;
+                        }
+                        Ok(_) => {
+                            if serde_json::from_str::<Value>(&line)
+                                .ok()
+                                .and_then(|value| {
+                                    value["registry_path"].as_str().map(str::to_owned)
+                                })
+                                .is_some()
+                            {
+                                let _ = line_tx.send(Ok(line));
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = line_tx.send(Err(error));
+                            return;
+                        }
+                    }
+                }
+            });
+            let gate_line = match line_rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(Ok(line)) if !line.is_empty() => line,
+                result => {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "{backend} registry writer did not reach the flushed-prefix gate: {result:?}\nchild stderr:\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            };
+            let gate_info: Value = serde_json::from_str(&gate_line).unwrap();
+            child.kill().expect(
+                "terminate child after target truncation/prefix write and before mirror commit",
+            );
+            let child_output = child.wait_with_output().unwrap();
+            assert!(!child_output.status.success());
+            let prefix_bytes = std::fs::read(gate_info["registry_path"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                prefix_bytes.len(),
+                gate_info["prefix_len"].as_u64().unwrap() as usize
+            );
+            assert!(serde_json::from_slice::<Value>(&prefix_bytes).is_err());
+            let retry = registry_truncation_child(TEST, "retry", &root, backend);
+            let retry_report = std::fs::read(root.join("retry-report.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            let precondition_report = std::fs::read(root.join("retry-precondition-report.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            eprintln!(
+                "REGISTRY_TRUNCATION_BACKEND={backend} ARTIFACT_ROOT={} PREFIX={} PRECONDITION={} RETRY={} CHILD_STDOUT={} CHILD_STDERR={}",
+                root.display(),
+                serde_json::to_string(&gate_info).unwrap(),
+                precondition_report
+                    .as_ref()
+                    .map(|report| serde_json::to_string(report).unwrap())
+                    .unwrap_or_else(|| "missing".into()),
+                retry_report
+                    .as_ref()
+                    .map(|report| serde_json::to_string(report).unwrap())
+                    .unwrap_or_else(|| "missing".into()),
+                String::from_utf8_lossy(&retry.stdout),
+                String::from_utf8_lossy(&retry.stderr)
+            );
+            if !retry.status.success() {
+                red_failures.push(format!(
+                    "fresh {backend} process failed the previous-entry/retry oracle; precondition={precondition_report:?} retry={retry_report:?}\nstdout:\n{}\nstderr:\n{}\nartifact_root={}",
+                    String::from_utf8_lossy(&retry.stdout),
+                    String::from_utf8_lossy(&retry.stderr),
+                    root.display()
+                ));
+            }
+
+            let control_temp = tempfile::tempdir().unwrap();
+            let control_root = control_temp.keep();
+            let control_spawn =
+                registry_truncation_child(TEST, "control-spawn", &control_root, backend);
+            assert!(
+                control_spawn.status.success(),
+                "clean {backend} replacement control spawn failed:\n{}",
+                String::from_utf8_lossy(&control_spawn.stderr)
+            );
+            let control_rearm =
+                registry_truncation_child(TEST, "control-rearm", &control_root, backend);
+            assert!(
+                control_rearm.status.success(),
+                "clean {backend} rearm control failed:\n{}\n{}",
+                String::from_utf8_lossy(&control_rearm.stdout),
+                String::from_utf8_lossy(&control_rearm.stderr)
+            );
+            let control_spawn_report: Value = serde_json::from_slice(
+                &std::fs::read(control_root.join("control-spawn-report.json")).unwrap(),
+            )
+            .unwrap();
+            let control_rearm_report: Value = serde_json::from_slice(
+                &std::fs::read(control_root.join("control-rearm-report.json")).unwrap(),
+            )
+            .unwrap();
+            eprintln!(
+                "REGISTRY_TRUNCATION_CONTROL_BACKEND={backend} ARTIFACT_ROOT={} SPAWN={} REARM={}",
+                control_root.display(),
+                serde_json::to_string(&control_spawn_report).unwrap(),
+                serde_json::to_string(&control_rearm_report).unwrap()
+            );
+        }
+        assert!(
+            red_failures.is_empty(),
+            "registry truncation recovery Red failures (expected on vulnerable main): {red_failures:#?}"
         );
     }
 
