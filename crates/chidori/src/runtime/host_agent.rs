@@ -180,6 +180,46 @@ fn load_detached_signal_inbox(
     }
 }
 
+fn persist_stop_request(
+    store: &dyn crate::runtime::store::RunStore,
+    run_id: &str,
+) -> Result<(), String> {
+    let request = serde_json::to_vec(&json!({
+        "run_id": run_id,
+        "requested_at": Utc::now(),
+    }))
+    .map_err(|err| format!("serializing detached-agent stop request: {err}"))?;
+    store
+        .put_blob(AGENT_STOP_REQUEST_FILE, &request)
+        .map_err(|err| format!("persisting detached-agent stop request: {err:#}"))
+}
+
+/// Check the run-scoped durable stop intent before replay or another live
+/// host effect. A malformed marker fails closed rather than being ignored.
+fn stop_request_matches_run(
+    store: &dyn crate::runtime::store::RunStore,
+    run_id: &str,
+) -> Result<bool, String> {
+    let Some(bytes) = store
+        .get_blob(AGENT_STOP_REQUEST_FILE)
+        .map_err(|err| format!("reading {AGENT_STOP_REQUEST_FILE}: {err:#}"))?
+    else {
+        return Ok(false);
+    };
+    let request: Value = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("parsing {AGENT_STOP_REQUEST_FILE}: {err}"))?;
+    let requested_run = request
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{AGENT_STOP_REQUEST_FILE} has no string run_id"))?;
+    if requested_run != run_id {
+        return Err(format!(
+            "{AGENT_STOP_REQUEST_FILE} run_id {requested_run} does not match {run_id}"
+        ));
+    }
+    Ok(true)
+}
+
 struct AgentState {
     descriptor: AgentDescriptor,
     /// The live iteration's context while a supervision thread is running —
@@ -897,7 +937,8 @@ impl DetachedAgentHub {
         parts: &AgentRuntimeParts,
         name: &str,
     ) -> Result<Value, String> {
-        with_agent_name_lock(parts, name, |factory| {
+        let mut wait_for_entry = None;
+        let response = with_agent_name_lock(parts, name, |factory| {
             let entry = self
                 .resolve_entry_locked(parts, name, factory)?
                 .ok_or_else(|| format!("chidori.agents: unknown agent `{name}`"))?;
@@ -905,36 +946,52 @@ impl DetachedAgentHub {
             if AgentEntry::is_settled(&state) {
                 return Ok(state.descriptor.status_json());
             }
-            if state.descriptor.status == "hibernating" && !state.thread_live {
-                drop(state);
-                return self.stop_entry(parts, name, entry);
-            }
 
             let run_id = state.descriptor.run_id.clone();
             let store = factory.store_for(&run_id);
-            let request = serde_json::to_vec(&json!({
-                "run_id": run_id,
-                "requested_at": Utc::now(),
-            }))
-            .map_err(|err| format!("serializing detached-agent stop request: {err}"))?;
-            store
-                .put_blob(AGENT_STOP_REQUEST_FILE, &request)
-                .map_err(|err| format!("persisting detached-agent stop request: {err:#}"))?;
+            persist_stop_request(store.as_ref(), &run_id)?;
 
             state.stop_requested = true;
-            let local_worker = state.thread_live;
+            let local_execution = state.execution_active;
             entry.signal.notify_all();
             let mut response = state.descriptor.status_json();
-            if !local_worker {
+            if !local_execution {
+                // This process cannot claim that a remote hibernating worker
+                // has settled. The durable request will be observed by its
+                // supervisor before replay/effects when an alarm or matching
+                // signal rearms it.
                 response["stopRequested"] = json!(true);
             }
             drop(state);
-            if local_worker {
-                self.join(parts, name, Some(60_000))
-            } else {
-                Ok(response)
+            wait_for_entry = local_execution.then(|| entry.clone());
+            Ok(response)
+        })?;
+
+        // Wait only when this process currently owns execution, and do so
+        // after releasing the per-name lock so the worker can finish calls
+        // that address agents by name. The captured entry preserves Y's
+        // identity if the name is later reused.
+        if let Some(entry) = wait_for_entry {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut state = entry.state.lock().unwrap();
+            loop {
+                if AgentEntry::is_settled(&state) {
+                    return Ok(state.descriptor.status_json());
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let mut response = state.descriptor.status_json();
+                    response["stopRequested"] = json!(true);
+                    return Ok(response);
+                }
+                state = entry
+                    .signal
+                    .wait_timeout(state, deadline.saturating_duration_since(now))
+                    .unwrap()
+                    .0;
             }
-        })
+        }
+        Ok(response)
     }
 
     fn stop_entry(
@@ -969,7 +1026,10 @@ impl DetachedAgentHub {
         run_id: &str,
     ) -> Result<Value, String> {
         if let Some(entry) = self.entries.lock().unwrap().get(name).cloned() {
-            if entry.state.lock().unwrap().descriptor.run_id == run_id {
+            let matches_run = entry.state.lock().unwrap().descriptor.run_id == run_id;
+            if matches_run {
+                let store = entry.factory().store_for(run_id);
+                persist_stop_request(store.as_ref(), run_id)?;
                 return self.stop_entry(parts, name, entry);
             }
         }
@@ -997,14 +1057,7 @@ impl DetachedAgentHub {
             return Ok(descriptor.status_json());
         }
 
-        let request = serde_json::to_vec(&json!({
-            "run_id": run_id,
-            "requested_at": Utc::now(),
-        }))
-        .map_err(|err| format!("serializing detached-agent stop request: {err}"))?;
-        store
-            .put_blob(AGENT_STOP_REQUEST_FILE, &request)
-            .map_err(|err| format!("persisting detached-agent stop request: {err:#}"))?;
+        persist_stop_request(store.as_ref(), run_id)?;
         let mut response = descriptor.status_json();
         response["stopRequested"] = json!(true);
         Ok(response)
@@ -1399,6 +1452,22 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let run_id = descriptor.run_id.clone();
         let run_dir = parts.run_base.join(&run_id);
         let store = factory.store_for(&run_id);
+        match stop_request_matches_run(store.as_ref(), &run_id) {
+            Ok(true) => {
+                entry.state.lock().unwrap().stop_requested = true;
+                settle_run("stopped", None, None);
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                settle_run(
+                    "failed",
+                    None,
+                    Some(format!("checking detached-agent stop request: {err}")),
+                );
+                return;
+            }
+        }
         let write_store: Arc<dyn crate::runtime::store::RunStore> =
             if store.supports_lease_fencing() {
                 if let Some(lease) = active_lease.as_ref() {
@@ -1580,16 +1649,16 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 let stop_entry = entry.clone();
                 let stop_run_id = run_id.clone();
                 ctx.set_host_call_preflight(HostCallPreflight::new(move || {
-                    match stop_store.get_blob(AGENT_STOP_REQUEST_FILE) {
-                        Ok(Some(_)) => {
+                    match stop_request_matches_run(stop_store.as_ref(), &stop_run_id) {
+                        Ok(true) => {
                             stop_entry.state.lock().unwrap().stop_requested = true;
                             anyhow::bail!("detached agent stop requested")
                         }
-                        Ok(None) => Ok(()),
+                        Ok(false) => Ok(()),
                         Err(err) => {
                             anyhow::bail!(
-                                "checking detached-agent stop request for run {}: {err:#}",
-                                stop_run_id
+                                "checking detached-agent stop request for run {}: {err}",
+                                stop_run_id,
                             )
                         }
                     }

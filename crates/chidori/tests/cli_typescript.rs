@@ -4671,6 +4671,7 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         let stop_x = project.join("stop-old-handle.ts");
         let worker_y = project.join("replacement-worker.ts");
         let idle_worker = project.join("idle-worker.ts");
+        let rearm_worker = project.join("hibernating-rearm-worker.ts");
         fs::write(
             &worker_x,
             r#"import { chidori, run } from "chidori:agent";
@@ -4708,6 +4709,19 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
             &idle_worker,
             r#"import { chidori, run } from "chidori:agent";
                run(async () => { await chidori.signal("never"); return {}; });"#,
+        )
+        .unwrap();
+        fs::write(
+            &rearm_worker,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     await chidori.signal("wake");
+                     await fetch("http://{}/sentinel", {{method:"POST", body:JSON.stringify({{id:"hibernating-rearm"}})}});
+                     return {{afterStop:true}};
+                   }});"#,
+                gate.address
+            ),
         )
         .unwrap();
         let port_a = DetachedServeProcess::port();
@@ -4769,9 +4783,10 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         fs::write(
             project.join("chidori.app.yml"),
             format!(
-                "name: stop-name-fixture\nagents:\n  - name: {NAME}\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: current-hub-control\n    agent: {}\n    keep_alive: true\n    restart: never\n",
+                "name: stop-name-fixture\nagents:\n  - name: {NAME}\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: current-hub-control\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: hibernating-rearm-control\n    agent: {}\n    keep_alive: true\n    restart: never\n",
                 worker_y.file_name().unwrap().to_string_lossy(),
-                idle_worker.file_name().unwrap().to_string_lossy()
+                idle_worker.file_name().unwrap().to_string_lossy(),
+                rearm_worker.file_name().unwrap().to_string_lossy()
             ),
         )
         .unwrap();
@@ -4843,6 +4858,12 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
                 stop_response.body["runId"], current_id, stop_response.body
             ));
         }
+        if stop_response.body["stopRequested"] != true {
+            failures.push(format!(
+                "{backend}: cross-process stop response did not acknowledge a pending request: {}",
+                stop_response.body
+            ));
+        }
         if sentinel_count != 0 || sentinel.is_some() || sentinel_rows != 0 {
             failures.push(format!(
                 "{backend}: replacement performed post-stop sentinel: count={sentinel_count}, event={sentinel:?}, journal_rows={sentinel_rows}"
@@ -4855,8 +4876,86 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
             ));
         }
 
-        // Current-hub route control: B's hub owns this hibernating incarnation,
-        // so a name-addressed stop there must return this exact run and settle it.
+        // A's current-name stop must leave a durable intent when the current
+        // run is hibernating in B. A later matching wake/rearm must observe the
+        // marker before dispatching the worker's next effect.
+        let rearm_name = "hibernating-rearm-control";
+        let rearm_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut rearm_entry = detached_registry_entry(&project, rearm_name);
+        while detached_registry_status(&rearm_entry) == "running"
+            && std::time::Instant::now() < rearm_deadline
+        {
+            std::thread::yield_now();
+            rearm_entry = detached_registry_entry(&project, rearm_name);
+        }
+        assert_eq!(detached_registry_status(&rearm_entry), "hibernating");
+        let rearm_run_id = detached_registry_run_id(&rearm_entry).to_string();
+        let remote_hibernating_stop = serve_http_request(
+            port_a,
+            "POST",
+            &format!("/agents/detached/{rearm_name}/stop"),
+            None,
+        );
+        assert_eq!(remote_hibernating_stop.status, 200);
+        assert_eq!(
+            remote_hibernating_stop.body["runId"].as_str(),
+            Some(rearm_run_id.as_str())
+        );
+        assert_eq!(remote_hibernating_stop.body["stopRequested"], true);
+        assert_ne!(remote_hibernating_stop.body["status"], "stopped");
+
+        let matching_wake = serde_json::json!({"name":"wake","payload":{}}).to_string();
+        let matching_wake_response = serve_http_request(
+            port_b,
+            "POST",
+            &format!("/agents/detached/{rearm_name}/send"),
+            Some(&matching_wake),
+        );
+        assert_eq!(matching_wake_response.status, 200);
+        let rearm_stop_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut rearm_final = detached_registry_entry(&project, rearm_name);
+        while detached_registry_status(&rearm_final) != "stopped"
+            && std::time::Instant::now() < rearm_stop_deadline
+        {
+            std::thread::yield_now();
+            rearm_final = detached_registry_entry(&project, rearm_name);
+        }
+        let rearm_records = detached_run_records(&project, &rearm_run_id);
+        let rearm_sentinel_rows = rearm_records
+            .iter()
+            .filter(|record| record.to_string().contains("/sentinel"))
+            .count();
+        let rearm_signal_rows = rearm_records
+            .iter()
+            .filter(|record| record["function"] == "signal")
+            .count();
+        let rearm_inbox_path = project
+            .join(".chidori/runs")
+            .join(&rearm_run_id)
+            .join("signals/inbox.json");
+        let rearm_inbox: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&rearm_inbox_path).unwrap_or_else(|err| {
+                panic!(
+                    "reading hibernating rearm inbox {}: {err}",
+                    rearm_inbox_path.display()
+                )
+            }))
+            .unwrap();
+        if detached_registry_status(&rearm_final) != "stopped"
+            || rearm_sentinel_rows != 0
+            || rearm_signal_rows != 0
+            || rearm_inbox.len() != 1
+            || rearm_inbox[0]["name"] != "wake"
+            || gate.sentinel_count.load(Ordering::SeqCst) != 0
+        {
+            failures.push(format!(
+                "{backend}: hibernating run did not observe durable stop before its matching-wake effect: final={rearm_final}, sentinel_rows={rearm_sentinel_rows}, signal_rows={rearm_signal_rows}, inbox={rearm_inbox:?}, count={}",
+                gate.sentinel_count.load(Ordering::SeqCst)
+            ));
+        }
+
+        // Current-hub route control: B's hub owns this hibernating incarnation;
+        // the durable acceptance response still avoids claiming it already settled.
         let idle_name = "current-hub-control";
         let idle_deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut idle_entry = detached_registry_entry(&project, idle_name);
@@ -4883,7 +4982,7 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
             current_hub_stop.body["runId"].as_str(),
             Some(idle_id.as_str())
         );
-        assert_eq!(current_hub_stop.body["status"].as_str(), Some("stopped"));
+        assert_eq!(current_hub_stop.body["stopRequested"], true);
 
         drop(serve_a);
         drop(serve_b);
