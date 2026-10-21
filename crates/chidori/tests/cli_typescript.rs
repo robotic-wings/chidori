@@ -4322,6 +4322,580 @@ fn cli_run_supports_unset_and_filesystem_run_store() {
     }
 }
 
+#[derive(Debug)]
+struct ServeHttpResponse {
+    status: u16,
+    body: serde_json::Value,
+}
+
+fn serve_http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> ServeHttpResponse {
+    use std::time::Duration;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let request = client
+        .request(
+            method.parse().expect("valid HTTP method"),
+            format!("http://127.0.0.1:{port}{path}"),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let response = request
+        .body(body.unwrap_or("").to_string())
+        .send()
+        .unwrap_or_else(|error| panic!("{method} {path} on serve port {port}: {error}"));
+    let status = response.status().as_u16();
+    let body = response
+        .json()
+        .unwrap_or_else(|error| panic!("invalid JSON from serve HTTP status {status}: {error}"));
+    ServeHttpResponse { status, body }
+}
+
+struct DetachedStopGate {
+    address: String,
+    hold_started: std::sync::mpsc::Receiver<()>,
+    sentinel_seen: std::sync::mpsc::Receiver<String>,
+    release: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    sentinel_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DetachedStopGate {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (hold_tx, hold_started) = mpsc::channel();
+        let (sentinel_tx, sentinel_seen) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let sentinel_count = Arc::new(AtomicUsize::new(0));
+        let server_sentinel_count = Arc::clone(&sentinel_count);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stopping = Arc::clone(&stopping);
+        let thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set detached stop gate listener nonblocking");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut hold_seen = false;
+            let mut sentinel_seen_once = false;
+            while std::time::Instant::now() < deadline
+                && !sentinel_seen_once
+                && !server_stopping.load(Ordering::SeqCst)
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make accepted detached stop gate stream blocking");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("set detached stop gate read timeout");
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        let mut header_end = None;
+                        let mut content_length = 0usize;
+                        loop {
+                            let count = stream.read(&mut chunk).expect("read gate request");
+                            if count == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..count]);
+                            if header_end.is_none() {
+                                if let Some(index) =
+                                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                                {
+                                    header_end = Some(index + 4);
+                                    let headers = String::from_utf8_lossy(&request[..index]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(header_end) = header_end {
+                                if request.len() >= header_end + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&request);
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let response = if first_line.starts_with("POST /hold ") {
+                            assert!(!hold_seen, "detached stop gate received duplicate hold");
+                            hold_seen = true;
+                            hold_tx.send(()).expect("report held host call");
+                            release_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .expect("test releases held host call");
+                            r#"{"ok":true}"#
+                        } else if first_line.starts_with("POST /sentinel ") {
+                            let body = request
+                                .split_once("\r\n\r\n")
+                                .map(|(_, body)| body)
+                                .unwrap_or_default();
+                            let value: serde_json::Value =
+                                serde_json::from_str(body).expect("parse sentinel payload");
+                            let id = value["id"].as_str().unwrap_or_default().to_string();
+                            server_sentinel_count.fetch_add(1, Ordering::SeqCst);
+                            sentinel_tx
+                                .send(id)
+                                .expect("report post-stop sentinel effect");
+                            sentinel_seen_once = true;
+                            r#"{"ok":true}"#
+                        } else {
+                            panic!("unexpected detached stop gate request: {first_line}");
+                        };
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .expect("write detached stop gate response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::yield_now();
+                    }
+                    Err(error) => panic!("detached stop gate accept failed: {error}"),
+                }
+            }
+            assert!(
+                hold_seen,
+                "detached worker never reached the held host call"
+            );
+        });
+        Self {
+            address,
+            hold_started,
+            sentinel_seen,
+            release,
+            thread: Some(thread),
+            sentinel_count,
+            stopping,
+        }
+    }
+
+    fn wait_until_held(&self) {
+        self.hold_started
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("replacement reaches the deterministic host-call barrier");
+    }
+
+    fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
+impl Drop for DetachedStopGate {
+    fn drop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() && !std::thread::panicking() {
+                panic!("detached stop gate thread panicked");
+            }
+        }
+    }
+}
+
+struct DetachedServeProcess {
+    child: std::process::Child,
+    log: PathBuf,
+}
+
+impl DetachedServeProcess {
+    fn start(project: &Path, port: u16, backend: &str, db: &Path) -> Self {
+        let mut command = Command::new(chidori_bin());
+        let log = project.join(format!("serve-{port}.log"));
+        let stderr = fs::File::create(&log).expect("create serve fixture log");
+        command
+            .args([
+                "serve",
+                "--port",
+                &port.to_string(),
+                "--no-isolate",
+                "--trusted",
+            ])
+            .current_dir(project)
+            .env("CHIDORI_ISOLATE", "off")
+            .env("CHIDORI_POLICY_PROFILE", "trusted")
+            .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+            .env("CHIDORI_RUN_STORE", backend)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr));
+        if backend == "sqlite" {
+            command.env("CHIDORI_RUN_DB", db);
+        } else {
+            command.env_remove("CHIDORI_RUN_DB");
+        }
+        Self {
+            child: command.spawn().expect("start detached-agent serve process"),
+            log,
+        }
+    }
+
+    fn port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn wait_ready(&mut self, port: u16) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "detached serve process exited before readiness: {status}; log={}",
+                    fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap();
+            if client
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .send()
+                .is_ok_and(|response| response.status().as_u16() == 200)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached serve process did not become ready on {port}"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for DetachedServeProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn detached_registry_entry(project: &Path, name: &str) -> serde_json::Value {
+    let path = project
+        .join(".chidori/runs/agents")
+        .join(format!("{name}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let last = match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(entry) => return entry,
+                Err(error) => format!("parse error {error}; bytes={bytes:?}"),
+            },
+            Err(error) => format!("read error {error}"),
+        };
+        assert!(
+            std::time::Instant::now() < deadline,
+            "registry entry {} did not become readable: {last}",
+            path.display()
+        );
+        std::thread::yield_now();
+    }
+}
+
+struct DetachedStopProject(PathBuf);
+
+impl Drop for DetachedStopProject {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn detached_registry_run_id(entry: &serde_json::Value) -> &str {
+    entry["run_id"]
+        .as_str()
+        .or_else(|| entry["runId"].as_str())
+        .or_else(|| entry["descriptor"]["run_id"].as_str())
+        .or_else(|| entry["descriptor"]["runId"].as_str())
+        .expect("registry entry has a run ID")
+}
+
+fn detached_registry_status(entry: &serde_json::Value) -> &str {
+    entry["descriptor"]["status"]
+        .as_str()
+        .or_else(|| entry["status"].as_str())
+        .expect("registry entry has a status")
+}
+
+fn detached_run_records(project: &Path, run_id: &str) -> Vec<serde_json::Value> {
+    let path = project
+        .join(".chidori/runs")
+        .join(run_id)
+        .join("records.jsonl");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[test]
+fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const NAME: &str = "stop-current-name";
+    let mut failures = Vec::new();
+    for backend in ["fs", "sqlite"] {
+        let project = temp_project("detached-stop-current-name");
+        let _project_cleanup = DetachedStopProject(project.clone());
+        let gate = DetachedStopGate::start();
+        let db = project.join("shared.sqlite3");
+        let worker_x = project.join("old-worker.ts");
+        let start_x = project.join("spawn-old.ts");
+        let stop_x = project.join("stop-old-handle.ts");
+        let worker_y = project.join("replacement-worker.ts");
+        let idle_worker = project.join("idle-worker.ts");
+        fs::write(
+            &worker_x,
+            r#"import { chidori, run } from "chidori:agent";
+               run(async () => { await chidori.signal("finish"); return {old: true}; });"#,
+        )
+        .unwrap();
+        fs::write(
+            &start_x,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     const old = await chidori.agents.spawn("{}", {{}}, {{name:"{}", restart:"never"}});
+                     return {{runId: old.runId}};
+                   }});"#,
+                worker_x.file_name().unwrap().to_string_lossy(),
+                NAME
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &worker_y,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     await chidori.signal("start");
+                     await fetch("http://{}/hold", {{method:"POST", body:JSON.stringify({{id:"held"}})}});
+                     await fetch("http://{}/sentinel", {{method:"POST", body:JSON.stringify({{id:"post-stop"}})}});
+                     return {{afterStop:true}};
+                   }});"#,
+                gate.address, gate.address
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &idle_worker,
+            r#"import { chidori, run } from "chidori:agent";
+               run(async () => { await chidori.signal("never"); return {}; });"#,
+        )
+        .unwrap();
+        let port_a = DetachedServeProcess::port();
+        let port_b = DetachedServeProcess::port();
+        let mut serve_a = DetachedServeProcess::start(&project, port_a, backend, &db);
+        serve_a.wait_ready(port_a);
+
+        let old_session = serde_json::json!({"agent":"spawn-old.ts","input":{}}).to_string();
+        let old_response = serve_http_request(port_a, "POST", "/sessions", Some(&old_session));
+        assert!(
+            [200, 201].contains(&old_response.status),
+            "old-spawn response: {:?}",
+            old_response.body
+        );
+        let old_status_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut old_status =
+            serve_http_request(port_a, "GET", &format!("/agents/detached/{NAME}"), None);
+        while old_status.body["status"] == "running"
+            && std::time::Instant::now() < old_status_deadline
+        {
+            std::thread::yield_now();
+            old_status =
+                serve_http_request(port_a, "GET", &format!("/agents/detached/{NAME}"), None);
+        }
+        assert_eq!(old_status.body["status"], "hibernating");
+        fs::write(
+            &stop_x,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   run(async () => {{
+                     const old = await chidori.agents.lookup("{}");
+                     if (!old) throw new Error("missing predecessor handle");
+                     const stopped = await old.stop();
+                     return {{runId: old.runId, status: stopped.status}};
+                   }});"#,
+                NAME
+            ),
+        )
+        .unwrap();
+        let stop_old_body =
+            serde_json::json!({"agent":"stop-old-handle.ts","input":{}}).to_string();
+        let stop_old = serve_http_request(port_a, "POST", "/sessions", Some(&stop_old_body));
+        assert!(
+            [200, 201].contains(&stop_old.status),
+            "same-hub predecessor handle stop: {:?}",
+            stop_old.body
+        );
+        let predecessor = detached_registry_entry(&project, NAME);
+        let predecessor_id = detached_registry_run_id(&predecessor).to_string();
+        assert_eq!(detached_registry_status(&predecessor), "stopped");
+        assert!(
+            stop_old.body.to_string().contains(&predecessor_id),
+            "same-hub stop handle should identify predecessor {predecessor_id}: {:?}",
+            stop_old.body
+        );
+
+        // Start a fresh server only after X settled. Its manifest causes the
+        // actual public serve boot path to replace the settled name with Y.
+        fs::write(
+            project.join("chidori.app.yml"),
+            format!(
+                "name: stop-name-fixture\nagents:\n  - name: {NAME}\n    agent: {}\n    keep_alive: true\n    restart: never\n  - name: current-hub-control\n    agent: {}\n    keep_alive: true\n    restart: never\n",
+                worker_y.file_name().unwrap().to_string_lossy(),
+                idle_worker.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut serve_b = DetachedServeProcess::start(&project, port_b, backend, &db);
+        serve_b.wait_ready(port_b);
+        let current_entry = detached_registry_entry(&project, NAME);
+        let current_id = detached_registry_run_id(&current_entry).to_string();
+        assert_ne!(
+            current_id, predecessor_id,
+            "B must publish a replacement run"
+        );
+        let start_replacement = serde_json::json!({"name":"start","payload":{}}).to_string();
+        let start_response = serve_http_request(
+            port_b,
+            "POST",
+            &format!("/agents/detached/{NAME}/send"),
+            Some(&start_replacement),
+        );
+        assert_eq!(
+            start_response.status, 200,
+            "start replacement: {:?}",
+            start_response.body
+        );
+        gate.wait_until_held();
+        let current_entry = detached_registry_entry(&project, NAME);
+        assert_eq!(detached_registry_status(&current_entry), "running");
+
+        // This name-addressed request enters A's existing public serve route.
+        // The response is the stop boundary; only after receiving it do we
+        // release Y's held host call and observe whether its next effect runs.
+        let stop_response = serve_http_request(
+            port_a,
+            "POST",
+            &format!("/agents/detached/{NAME}/stop"),
+            None,
+        );
+        gate.release();
+
+        let terminal_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut final_entry = detached_registry_entry(&project, NAME);
+        let mut final_status =
+            serve_http_request(port_b, "GET", &format!("/agents/detached/{NAME}"), None);
+        while (detached_registry_status(&final_entry) == "running"
+            || final_status.body["live"] == true)
+            && std::time::Instant::now() < terminal_deadline
+        {
+            std::thread::yield_now();
+            final_entry = detached_registry_entry(&project, NAME);
+            final_status =
+                serve_http_request(port_b, "GET", &format!("/agents/detached/{NAME}"), None);
+        }
+        let sentinel = gate.sentinel_seen.try_recv().ok();
+        let records = detached_run_records(&project, &current_id);
+        let sentinel_rows = records
+            .iter()
+            .filter(|record| record.to_string().contains("/sentinel"))
+            .count();
+        let sentinel_count = gate.sentinel_count.load(Ordering::SeqCst);
+
+        if stop_response.status != 200 {
+            failures.push(format!(
+                "{backend}: stop returned HTTP {}, body={}",
+                stop_response.status, stop_response.body
+            ));
+        }
+        if stop_response.body["runId"].as_str() != Some(current_id.as_str()) {
+            failures.push(format!(
+                "{backend}: name stop response targeted {:?}, expected current replacement {}; predecessor={predecessor_id}; body={}",
+                stop_response.body["runId"], current_id, stop_response.body
+            ));
+        }
+        if sentinel_count != 0 || sentinel.is_some() || sentinel_rows != 0 {
+            failures.push(format!(
+                "{backend}: replacement performed post-stop sentinel: count={sentinel_count}, event={sentinel:?}, journal_rows={sentinel_rows}"
+            ));
+        }
+        if detached_registry_status(&final_entry) != "stopped" {
+            failures.push(format!(
+                "{backend}: replacement did not settle stopped; current={} final={final_entry}",
+                current_id
+            ));
+        }
+
+        // Current-hub route control: B's hub owns this hibernating incarnation,
+        // so a name-addressed stop there must return this exact run and settle it.
+        let idle_name = "current-hub-control";
+        let idle_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut idle_entry = detached_registry_entry(&project, idle_name);
+        while detached_registry_status(&idle_entry) == "running"
+            && std::time::Instant::now() < idle_deadline
+        {
+            std::thread::yield_now();
+            idle_entry = detached_registry_entry(&project, idle_name);
+        }
+        assert_eq!(detached_registry_status(&idle_entry), "hibernating");
+        let idle_id = detached_registry_run_id(&idle_entry).to_string();
+        let current_hub_stop = serve_http_request(
+            port_b,
+            "POST",
+            &format!("/agents/detached/{idle_name}/stop"),
+            None,
+        );
+        assert_eq!(
+            current_hub_stop.status, 200,
+            "current-hub stop: {:?}",
+            current_hub_stop.body
+        );
+        assert_eq!(
+            current_hub_stop.body["runId"].as_str(),
+            Some(idle_id.as_str())
+        );
+        assert_eq!(current_hub_stop.body["status"].as_str(), Some("stopped"));
+
+        drop(serve_a);
+        drop(serve_b);
+        drop(gate);
+        fs::remove_dir_all(&project).ok();
+    }
+    assert!(
+        failures.is_empty(),
+        "detached name-stop Red failures: {failures:#?}"
+    );
+}
+
 struct SqliteBranchFixture {
     dir: PathBuf,
     run_id: String,
