@@ -87,8 +87,9 @@ pub(crate) static WARM_POST_RESPONSE_INBOX_TEST_GATE: StdMutex<
     )>,
 > = StdMutex::new(None);
 
-/// One-shot test barrier immediately before the OS listener bind. The port
-/// key prevents unrelated concurrent serve tests from consuming the gate.
+/// One-shot test barrier at the former late-bind point, after detached rearm.
+/// An occupied-port startup now returns during early reservation before it can
+/// reach this gate. The port key isolates concurrent serve tests.
 #[cfg(test)]
 pub(crate) static PRE_BIND_TEST_GATE: StdMutex<
     Option<(
@@ -1321,6 +1322,11 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
              this server already controls access."
         );
     }
+    let addr = format!("{host}:{port}");
+    // Reserve the requested socket before any recovery path can resume agent
+    // work or cause detached effects. The unsafe-bind preflight above remains
+    // first so refused configurations perform neither bind nor recovery.
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     let base_dir = agent_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -1627,7 +1633,6 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors_layer);
 
-    let addr = format!("{host}:{port}");
     eprintln!("Listening on http://{addr}");
     if !loopback {
         eprintln!(
@@ -1713,7 +1718,6 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
             let _ = release.await;
         }
     }
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
