@@ -348,6 +348,10 @@ async fn serve_bind_rearm_child(case: &str) {
             })
             .await
             .is_ok();
+            assert!(
+                effect_seen,
+                "current-order Red must observe the detached POST before releasing bind"
+            );
             let _ = release.send(());
             let result = server.await.unwrap();
             drop(reservation);
