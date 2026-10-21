@@ -160,6 +160,23 @@ fn ensure_run_store_initialized(run_base: &Path, operation: &str) -> Result<(), 
         .map_err(|err| format!("{operation}: {err:#}"))
 }
 
+/// Load a detached agent's durable signal inbox without treating damage as an
+/// empty mailbox. A missing blob is the only empty-inbox case.
+fn load_detached_signal_inbox(
+    store: &dyn crate::runtime::store::RunStore,
+    run_id: &str,
+) -> Result<Vec<QueuedSignal>, String> {
+    let bytes = store.get_blob(SIGNAL_INBOX_FILE).map_err(|err| {
+        format!("reading {SIGNAL_INBOX_FILE} for detached-agent run {run_id}: {err:#}")
+    })?;
+    match bytes {
+        None => Ok(Vec::new()),
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|err| {
+            format!("parsing {SIGNAL_INBOX_FILE} for detached-agent run {run_id}: {err}")
+        }),
+    }
+}
+
 struct AgentState {
     descriptor: AgentDescriptor,
     /// The live iteration's context while a supervision thread is running —
@@ -307,6 +324,14 @@ impl DetachedAgentHub {
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        let predecessor_mailbox = predecessor_run_id
+            .as_deref()
+            .map(|old_run_id| {
+                let old_store = factory.store_for(old_run_id);
+                load_detached_signal_inbox(old_store.as_ref(), old_run_id)
+                    .map_err(|err| format!("migrating predecessor mailbox: {err}"))
+            })
+            .transpose()?;
         let now = Utc::now();
         let descriptor = AgentDescriptor {
             name: name.clone(),
@@ -332,33 +357,31 @@ impl DetachedAgentHub {
         // Mail follows the NAME, not the incarnation: whatever the settled
         // predecessor never consumed is re-queued for the replacement instead
         // of stranding in the dead run's inbox.
-        if let Some(ref old_run_id) = predecessor_run_id {
+        if let (Some(old_run_id), Some(leftover)) =
+            (predecessor_run_id.as_deref(), predecessor_mailbox)
+        {
             let old_store = factory.store_for(old_run_id);
-            if let Ok(Some(bytes)) = old_store.get_blob(SIGNAL_INBOX_FILE) {
-                let leftover: Vec<QueuedSignal> =
-                    serde_json::from_slice(&bytes).unwrap_or_default();
-                if !leftover.is_empty() {
-                    let migrated: Vec<QueuedSignal> = leftover
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, queued)| QueuedSignal {
-                            delivery_seq: (i + 1) as u64,
-                            ..queued
-                        })
-                        .collect();
-                    tracing::info!(
-                        agent = %name,
-                        from_run = %old_run_id,
-                        messages = migrated.len(),
-                        "migrating unconsumed mailbox from the settled predecessor"
-                    );
-                    if let Ok(bytes) = serde_json::to_vec_pretty(&migrated) {
-                        let _ = factory
-                            .store_for(&run_id)
-                            .put_blob(SIGNAL_INBOX_FILE, &bytes);
-                    }
-                    let _ = old_store.put_blob(SIGNAL_INBOX_FILE, b"[]");
+            if !leftover.is_empty() {
+                let migrated: Vec<QueuedSignal> = leftover
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, queued)| QueuedSignal {
+                        delivery_seq: (i + 1) as u64,
+                        ..queued
+                    })
+                    .collect();
+                tracing::info!(
+                    agent = %name,
+                    from_run = %old_run_id,
+                    messages = migrated.len(),
+                    "migrating unconsumed mailbox from the settled predecessor"
+                );
+                if let Ok(bytes) = serde_json::to_vec_pretty(&migrated) {
+                    let _ = factory
+                        .store_for(&run_id)
+                        .put_blob(SIGNAL_INBOX_FILE, &bytes);
                 }
+                let _ = old_store.put_blob(SIGNAL_INBOX_FILE, b"[]");
             }
         }
 
@@ -1076,9 +1099,17 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 return;
             }
         };
-        let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            _ => Vec::new(),
+        let inbox = match load_detached_signal_inbox(store.as_ref(), &run_id) {
+            Ok(inbox) => inbox,
+            Err(err) => {
+                defer_after_inbox_read_error(
+                    entry,
+                    descriptor.listen.clone(),
+                    active_lease.as_ref(),
+                    &err,
+                );
+                return;
+            }
         };
         #[cfg(test)]
         tests::pause_after_supervisor_inbox_snapshot(&entry.name);
@@ -1110,10 +1141,19 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 });
             } else if !matched {
                 // Spuriously started with nothing to do — go back to sleep.
-                match hibernate_run(listen) {
+                match hibernate_run(listen.clone()) {
                     Ok(true) => return,
                     Ok(false) => continue,
-                    Err(err) => {
+                    Err(HibernateError::InboxRead(err)) => {
+                        defer_after_inbox_read_error(
+                            entry,
+                            Some(listen),
+                            active_lease.as_ref(),
+                            &err,
+                        );
+                        return;
+                    }
+                    Err(HibernateError::Other(err)) => {
                         settle_run(
                             "failed",
                             None,
@@ -1124,66 +1164,6 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                         return;
                     }
                 }
-            }
-            let mut state = entry.state.lock().unwrap();
-            state.descriptor.listen = None;
-        }
-
-        // Fresh VM + context under the agent's OWN durable identity: run id,
-        // journal, policy seed, and persistence handle all belong to the
-        // agent, not the spawner.
-        if let Err(err) = crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
-            write_store.as_ref(),
-            &replay,
-        ) {
-            settle_run(
-                "failed",
-                None,
-                Some(format!(
-                    "reconciling detached-agent alarm promises: {err:#}"
-                )),
-            );
-            return;
-        }
-        let host_promises =
-            match crate::runtime::snapshot::load_host_promise_records(store.as_ref()) {
-                Ok(records) => records,
-                Err(err) => {
-                    settle_run(
-                        "failed",
-                        None,
-                        Some(format!("loading detached-agent host promises: {err:#}")),
-                    );
-                    return;
-                }
-            };
-        let vfs = crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
-            .load_manifest()
-            .map(|manifest| manifest.vfs)
-            .unwrap_or_default();
-        let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
-            replay,
-            host_promises,
-            vfs,
-            inbox,
-        );
-        ctx.set_run_id(run_id.clone());
-        ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
-        ctx.enable_persistence_with_store(run_dir.clone(), write_store.clone());
-        // The agent's model travels with its descriptor: a wake in a process
-        // configured for a different provider/model must not silently switch
-        // what the agent's prompts run on.
-        if let Some(ref model) = descriptor.model {
-            ctx.set_default_model(model.clone());
-        }
-        // Same implicit workspace root as run/serve/resume: the project
-        // directory (run_base is `<project>/.chidori/runs`). Without this, a
-        // detached agent calling `chidori.workspace.*` fails unless the
-        // operator sets CHIDORI_WORKSPACE_ROOT — which, when set, has
-        // already populated the context and is left untouched here.
-        if ctx.workspace_root().is_none() {
-            if let Some(project_root) = parts.run_base.parent().and_then(|p| p.parent()) {
-                ctx.set_workspace_root(project_root.to_path_buf());
             }
         }
 
@@ -1206,6 +1186,88 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     None,
                     Some(format!("reading {}: {err}", resolved.display())),
                 );
+                return;
+            }
+        };
+        // Build the replay context only after the authoritative inbox refresh.
+        // Timeout promise reconciliation mutates durable host-promise state,
+        // so it must follow this fallible read.
+        let context_result: Result<RuntimeContext, HibernateError> = {
+            let mut state = entry.state.lock().unwrap();
+            // A store-only send can append during source loading. Keep the
+            // state lock across the authoritative read, reconciliation, and
+            // context publication so senders use the live context afterwards.
+            (|| {
+                let inbox = load_detached_signal_inbox(store.as_ref(), &run_id)
+                    .map_err(HibernateError::InboxRead)?;
+                if let Some(listen) = descriptor.listen.as_ref() {
+                    let matched = inbox
+                        .iter()
+                        .any(|queued| listen.names.iter().any(|name| name == &queued.name));
+                    if matched {
+                        replay.retain(|record| {
+                            !(record.seq == listen.seq
+                                && record.function == listen.function
+                                && record.result.get("timedOut") == Some(&Value::Bool(true)))
+                        });
+                    }
+                }
+                crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
+                    write_store.as_ref(),
+                    &replay,
+                )
+                .map_err(|err| {
+                    HibernateError::Other(format!(
+                        "reconciling detached-agent alarm promises: {err:#}"
+                    ))
+                })?;
+                let host_promises = crate::runtime::snapshot::load_host_promise_records(
+                    store.as_ref(),
+                )
+                .map_err(|err| {
+                    HibernateError::Other(format!("loading detached-agent host promises: {err:#}"))
+                })?;
+                let vfs =
+                    crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
+                        .load_manifest()
+                        .map(|manifest| manifest.vfs)
+                        .unwrap_or_default();
+                let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
+                    replay,
+                    host_promises,
+                    vfs,
+                    inbox,
+                );
+                ctx.set_run_id(run_id.clone());
+                ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
+                ctx.enable_persistence_with_store(run_dir.clone(), write_store.clone());
+                if let Some(ref model) = descriptor.model {
+                    ctx.set_default_model(model.clone());
+                }
+                if ctx.workspace_root().is_none() {
+                    if let Some(project_root) = parts.run_base.parent().and_then(|p| p.parent()) {
+                        ctx.set_workspace_root(project_root.to_path_buf());
+                    }
+                }
+                state.descriptor.listen = None;
+                state.live_ctx = Some(ctx.clone());
+                Ok(ctx)
+            })()
+        };
+        let ctx = match context_result {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                match err {
+                    HibernateError::InboxRead(err) => {
+                        defer_after_inbox_read_error(
+                            entry,
+                            descriptor.listen.clone(),
+                            active_lease.as_ref(),
+                            &err,
+                        );
+                    }
+                    HibernateError::Other(err) => settle_run("failed", None, Some(err)),
+                }
                 return;
             }
         };
@@ -1232,36 +1294,6 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             parts.tools.clone(),
             parts.mcp.clone(),
         );
-
-        let publish_result = {
-            let mut state = entry.state.lock().unwrap();
-            // The inbox snapshot used to construct `ctx` predates source
-            // loading and VM setup. A store-only send can append during that
-            // interval, so refresh under AgentState immediately before
-            // publication. Holding the lock through both operations makes a
-            // subsequent sender choose this live context instead of racing a
-            // whole-file store write against the stale snapshot.
-            match store.get_blob(SIGNAL_INBOX_FILE) {
-                Ok(Some(bytes)) => {
-                    let inbox = serde_json::from_slice(&bytes).unwrap_or_default();
-                    ctx.set_signal_inbox(inbox);
-                    state.live_ctx = Some(ctx.clone());
-                    Ok(())
-                }
-                Ok(None) => {
-                    ctx.set_signal_inbox(Vec::new());
-                    state.live_ctx = Some(ctx.clone());
-                    Ok(())
-                }
-                Err(err) => Err(format!(
-                    "reading detached-agent inbox before context publication: {err}"
-                )),
-            }
-        };
-        if let Err(err) = publish_result {
-            settle_run("failed", None, Some(err));
-            return;
-        }
         #[cfg(test)]
         tests::pause_after_supervisor_publishes_live_context(&entry.name);
         let result =
@@ -1312,10 +1344,19 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 if raced {
                     continue;
                 }
-                match hibernate_run(listen) {
+                match hibernate_run(listen.clone()) {
                     Ok(true) => return,
                     Ok(false) => continue,
-                    Err(err) => {
+                    Err(HibernateError::InboxRead(err)) => {
+                        defer_after_inbox_read_error(
+                            entry,
+                            Some(listen),
+                            active_lease.as_ref(),
+                            &err,
+                        );
+                        return;
+                    }
+                    Err(HibernateError::Other(err)) => {
                         settle_run(
                             "failed",
                             None,
@@ -1577,6 +1618,43 @@ fn release_agent_lease(
     }
 }
 
+/// Keep a worker retryable when its durable inbox cannot be decoded. The
+/// state lock remains held while the descriptor is persisted, preserving the
+/// established state -> store lock order and preventing a sender from
+/// observing a half-written handoff.
+fn defer_after_inbox_read_error(
+    entry: &Arc<AgentEntry>,
+    listen: Option<ListenState>,
+    lease: Option<&crate::runtime::store::FencedLease>,
+    error: &str,
+) {
+    let persisted = {
+        let mut state = entry.state.lock().unwrap();
+        state.descriptor.status = "running".to_string();
+        if let Some(listen) = listen {
+            state.descriptor.listen = Some(listen);
+        }
+        state.descriptor.updated_at = Utc::now();
+        state.execution_active = false;
+        let descriptor = state.descriptor.clone();
+        persist_descriptor_for_lease(&entry.factory(), &descriptor, lease)
+    };
+    if let Err(persist_error) = persisted {
+        tracing::error!(
+            agent = %entry.name,
+            error = %persist_error,
+            "persisting retryable detached-agent state after inbox read failure"
+        );
+    }
+    release_agent_lease(entry, lease);
+    tracing::warn!(
+        agent = %entry.name,
+        error,
+        "detached-agent inbox is unreadable; leaving the run driverless for retry"
+    );
+    entry.signal.notify_all();
+}
+
 /// Persist the hibernation handoff while excluding senders. Returns `Ok(false)`
 /// when a matching durable message arrived before the transition; the caller
 /// should continue the supervisor loop and consume it instead of sleeping.
@@ -1585,7 +1663,7 @@ fn hibernate(
     entry: &Arc<AgentEntry>,
     listen: ListenState,
     lease: Option<&crate::runtime::store::FencedLease>,
-) -> Result<bool, String> {
+) -> Result<bool, HibernateError> {
     let has_deadline = listen.deadline.is_some();
     let factory = entry.factory();
     {
@@ -1600,21 +1678,22 @@ fn hibernate(
                     lease.token().clone(),
                 ) {
                     Ok(fenced) => Arc::new(fenced),
-                    Err(err) => return Err(format!("creating lease-fenced store: {err}")),
+                    Err(err) => {
+                        return Err(HibernateError::Other(format!(
+                            "creating lease-fenced store: {err}"
+                        )))
+                    }
                 }
             } else {
                 store.clone()
             };
         if let Err(err) = owned_store.check_ownership() {
-            return Err(format!(
+            return Err(HibernateError::Other(format!(
                 "detached-agent lease ownership lost before hibernate: {err}"
-            ));
+            )));
         }
-        let inbox: Vec<QueuedSignal> = match store.get_blob(SIGNAL_INBOX_FILE) {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Ok(None) => Vec::new(),
-            Err(err) => return Err(format!("reading signal inbox: {err}")),
-        };
+        let inbox = load_detached_signal_inbox(store.as_ref(), &run_id)
+            .map_err(HibernateError::InboxRead)?;
         if inbox
             .iter()
             .any(|queued| listen.names.iter().any(|name| name == &queued.name))
@@ -1636,7 +1715,9 @@ fn hibernate(
         // worker, then this stale hibernate write or lease release can undo
         // that wake.
         if let Err(err) = persist_descriptor_for_lease(&factory, &descriptor, lease) {
-            return Err(format!("persisting detached-agent hibernation: {err}"));
+            return Err(HibernateError::Other(format!(
+                "persisting detached-agent hibernation: {err}"
+            )));
         }
         let released = if let Some(lease) = lease.filter(|_| store.supports_lease_fencing()) {
             crate::runtime::store::release_lease_with_token(
@@ -1658,13 +1739,18 @@ fn hibernate(
     Ok(true)
 }
 
+enum HibernateError {
+    InboxRead(String),
+    Other(String),
+}
+
 /// A false hibernate result means a matching durable signal raced with the
 /// transition. The supervisor still owns the lease and will continue driving
 /// the agent, so restore the public execution state before the next pass.
 fn finish_hibernate_transition(
     entry: &Arc<AgentEntry>,
-    result: Result<bool, String>,
-) -> Result<bool, String> {
+    result: Result<bool, HibernateError>,
+) -> Result<bool, HibernateError> {
     if matches!(result, Ok(false)) {
         entry.state.lock().unwrap().execution_active = true;
         #[cfg(test)]
