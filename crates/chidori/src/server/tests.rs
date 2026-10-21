@@ -1856,6 +1856,317 @@ async fn create_paused_session(state: &AppState, id: &str, input: Value) -> Valu
     body
 }
 
+const SIGNAL_INBOX_RESUME_CHILD_MODE: &str = "CHIDORI_TEST_SIGNAL_INBOX_RESUME_CHILD_MODE";
+const SIGNAL_INBOX_RESUME_OBSERVATION_PREFIX: &str = "SIGNAL_INBOX_RESUME_OBSERVATION=";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SignalInboxResumeObservation {
+    response_status: u16,
+    response_body: Value,
+    sentinel_requests: usize,
+    session_before: Value,
+    session_after: Value,
+    session_unchanged: bool,
+    journal_unchanged: bool,
+    pending_unchanged: bool,
+    host_promises_unchanged: bool,
+    inbox_before: Option<String>,
+    inbox_after: Option<String>,
+    inbox_path: String,
+    final_session_status: String,
+    final_pending_signal_name: Option<String>,
+    final_signal_record_count: usize,
+    final_signal_payload: Option<Value>,
+}
+
+fn run_signal_inbox_resume_child(mode: &str) -> SignalInboxResumeObservation {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("server::tests::signal_inbox_resume_child_fixture")
+        .arg("--nocapture")
+        .env(SIGNAL_INBOX_RESUME_CHILD_MODE, mode)
+        // SSRF allowlisting is process-global and cached; set it before the
+        // isolated test process starts rather than mutating this test process.
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .output()
+        .unwrap();
+    let report = format!(
+        "signal inbox child {mode} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let observation_json = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(SIGNAL_INBOX_RESUME_OBSERVATION_PREFIX))
+        .unwrap_or_else(|| panic!("child did not report observations: {report}"));
+    serde_json::from_str(observation_json)
+        .unwrap_or_else(|error| panic!("invalid child observation ({error}): {report}"))
+}
+
+fn snapshot_host_promise_events(run_dir: &FsPath) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let events_dir = run_dir.join(crate::runtime::snapshot::HOST_PROMISE_EVENTS_PREFIX);
+    let mut events = std::collections::BTreeMap::new();
+    let table = run_dir.join(HOST_PROMISE_TABLE_FILE);
+    if let Ok(bytes) = std::fs::read(table) {
+        events.insert(HOST_PROMISE_TABLE_FILE.to_string(), bytes);
+    }
+    let Ok(entries) = std::fs::read_dir(events_dir) else {
+        return events;
+    };
+    for entry in entries {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            events.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    events
+}
+
+fn snapshot_journal_files(run_dir: &FsPath) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for name in [
+        crate::runtime::store::RECORDS_FILE,
+        crate::runtime::store::CHECKPOINT_FILE,
+    ] {
+        if let Ok(bytes) = std::fs::read(run_dir.join(name)) {
+            files.insert(name.to_string(), bytes);
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn signal_inbox_resume_child_fixture() {
+    let Ok(mode) = std::env::var(SIGNAL_INBOX_RESUME_CHILD_MODE) else {
+        // Parent test processes use this executable as a subprocess fixture.
+        return;
+    };
+    assert!(matches!(mode.as_str(), "malformed" | "absent" | "valid"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let sentinel_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sentinel_url = format!("http://{}/effect", listener.local_addr().unwrap());
+    let request_counter = sentinel_requests.clone();
+    let app = axum::Router::new().route(
+        "/effect",
+        axum::routing::post(move || {
+            let request_counter = request_counter.clone();
+            async move {
+                request_counter.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let sentinel_server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let agent_path = write_agent(
+        temp.path(),
+        &format!(
+            r#"
+                export async function agent(input, chidori) {{
+                    await chidori.input("continue?");
+                    await fetch("{sentinel_url}", {{ method: "POST" }});
+                    const review = await chidori.signal("review");
+                    return {{ review: review.payload }};
+                }}
+            "#
+        ),
+    );
+    let state = signal_test_state(temp.path(), agent_path);
+    let created = create_paused_session(&state, "inbox-resume", json!({})).await;
+    assert_eq!(created["status"], json!("paused"));
+    let session_before = state
+        .session_store
+        .get("inbox-resume")
+        .unwrap()
+        .expect("initial paused session persisted");
+    let run_id = session_before.run_id.clone().expect("run id persisted");
+    let run_dir = state.run_base.join(&run_id);
+    let inbox_path = run_dir.join(SIGNAL_INBOX_FILE);
+    match mode.as_str() {
+        "malformed" => {
+            std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+            std::fs::write(&inbox_path, b"{broken signal inbox").unwrap();
+        }
+        "absent" => {
+            let _ = std::fs::remove_file(&inbox_path);
+        }
+        "valid" => {
+            let queued = crate::runtime::snapshot::QueuedSignal {
+                name: "review".to_string(),
+                payload: json!({"id": "queued-review"}),
+                from: json!({"kind": "human", "id": "test-sender"}),
+                delivery_seq: 1,
+                enqueued_at: chrono::Utc::now(),
+            };
+            std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &inbox_path,
+                serde_json::to_vec_pretty(&vec![queued]).unwrap(),
+            )
+            .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let inbox_before = std::fs::read(&inbox_path).ok();
+    let journal_before = snapshot_journal_files(&run_dir);
+    let pending_path = run_dir.join(PENDING_HOST_OPERATION_FILE);
+    let pending_before = std::fs::read(&pending_path).unwrap();
+    let promises_before = snapshot_host_promise_events(&run_dir);
+
+    let (response_status, response_body) = response_json(
+        resume_session(
+            State(state.clone()),
+            Path("inbox-resume".to_string()),
+            Json(ResumeRequest {
+                response: "continue".to_string(),
+                allow_source_change: false,
+            }),
+        )
+        .await,
+    )
+    .await;
+    let session_after = state
+        .session_store
+        .get("inbox-resume")
+        .unwrap()
+        .expect("resumed session persisted");
+    let journal_after = snapshot_journal_files(&run_dir);
+    let pending_after = std::fs::read(&pending_path).unwrap_or_default();
+    let promises_after = snapshot_host_promise_events(&run_dir);
+    let inbox_after = std::fs::read(&inbox_path).ok();
+    let signal_records: Vec<_> = session_after
+        .call_log
+        .iter()
+        .filter(|record| record.function == "signal")
+        .collect();
+    let observation = SignalInboxResumeObservation {
+        response_status: response_status.as_u16(),
+        response_body,
+        sentinel_requests: sentinel_requests.load(Ordering::SeqCst),
+        session_unchanged: serde_json::to_vec(&session_before).unwrap()
+            == serde_json::to_vec(&session_after).unwrap(),
+        session_before: serde_json::to_value(&session_before).unwrap(),
+        session_after: serde_json::to_value(&session_after).unwrap(),
+        journal_unchanged: journal_before == journal_after,
+        pending_unchanged: pending_before == pending_after,
+        host_promises_unchanged: promises_before == promises_after,
+        inbox_before: inbox_before.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        inbox_after: inbox_after.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        inbox_path: inbox_path.display().to_string(),
+        final_session_status: format!("{:?}", session_after.status),
+        final_pending_signal_name: session_after.pending_signal_name,
+        final_signal_record_count: signal_records.len(),
+        final_signal_payload: signal_records.first().map(|record| record.result.clone()),
+    };
+    println!(
+        "{SIGNAL_INBOX_RESUME_OBSERVATION_PREFIX}{}",
+        serde_json::to_string(&observation).unwrap()
+    );
+
+    let _ = shutdown_tx.send(());
+    sentinel_server.await.unwrap();
+}
+
+#[test]
+fn resume_fails_closed_on_malformed_signal_inbox_before_effect_dispatch() {
+    let observed = run_signal_inbox_resume_child("malformed");
+    let mut failures = Vec::new();
+    if observed.response_status != StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+        failures.push(format!(
+            "expected 500 corruption response, got {}",
+            observed.response_status
+        ));
+    }
+    let error = observed.response_body["error"].as_str().unwrap_or_default();
+    if !error.contains(&observed.inbox_path) {
+        failures.push(format!(
+            "error did not identify inbox path {}: {error:?}",
+            observed.inbox_path
+        ));
+    }
+    if observed.sentinel_requests != 0 {
+        failures.push(format!(
+            "HTTP effect dispatched {} times",
+            observed.sentinel_requests
+        ));
+    }
+    if !observed.session_unchanged {
+        failures.push("paused session changed".to_string());
+    }
+    if !observed.journal_unchanged {
+        failures.push("journal changed".to_string());
+    }
+    if !observed.pending_unchanged {
+        failures.push("pending host operation changed".to_string());
+    }
+    if !observed.host_promises_unchanged {
+        failures.push("host-promise state changed".to_string());
+    }
+    if observed.inbox_before != observed.inbox_after {
+        failures.push("corrupt inbox bytes changed".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "resume did not fail closed on corrupt signal inbox: {}; observations={observed:#?}",
+        failures.join("; ")
+    );
+}
+
+#[test]
+fn resume_accepts_absent_signal_inbox_as_empty() {
+    let observed = run_signal_inbox_resume_child("absent");
+    assert_eq!(
+        observed.response_status,
+        StatusCode::OK.as_u16(),
+        "{observed:#?}"
+    );
+    assert_eq!(observed.sentinel_requests, 1, "{observed:#?}");
+    assert_eq!(observed.final_session_status, "Paused", "{observed:#?}");
+    assert_eq!(
+        observed.final_pending_signal_name.as_deref(),
+        Some("review"),
+        "absent inbox is empty, so the later listen pauses normally: {observed:#?}"
+    );
+    assert_eq!(observed.inbox_before, None);
+}
+
+#[test]
+fn resume_consumes_valid_signal_inbox_normally() {
+    let observed = run_signal_inbox_resume_child("valid");
+    assert_eq!(
+        observed.response_status,
+        StatusCode::OK.as_u16(),
+        "{observed:#?}"
+    );
+    assert_eq!(observed.sentinel_requests, 1, "{observed:#?}");
+    assert_eq!(observed.final_session_status, "Completed", "{observed:#?}");
+    assert_eq!(observed.final_signal_record_count, 1, "{observed:#?}");
+    assert_eq!(
+        observed.final_signal_payload,
+        Some(
+            json!({"name": "review", "payload": {"id": "queued-review"}, "from": {"kind": "human", "id": "test-sender"}})
+        ),
+        "valid inbox entry should be recorded once as the consumed signal: {observed:#?}"
+    );
+    assert_eq!(observed.inbox_after.as_deref(), Some("[]"));
+}
+
 /// Signal delivered to a run paused waiting on THIS name resolves the pause
 /// and resumes to completion; the final output and the session view reflect
 /// the delivered payload.
