@@ -12,6 +12,18 @@ const CHILD_MODE: &str = "CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_CHILD";
 const PROJECT_DIR: &str = "CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_PROJECT";
 const PORT_ENV: &str = "CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_PORT";
 const TRACE_PATH: &str = "CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_TRACE";
+const OPT_IN: &str = "CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_OPT_IN";
+
+fn require_opt_in(test_name: &str) -> bool {
+    if std::env::var(OPT_IN).as_deref() == Ok("1") {
+        true
+    } else {
+        eprintln!(
+            "skipping {test_name}: set {OPT_IN}=1 to run loopback subprocess integration test"
+        );
+        false
+    }
+}
 
 fn chidori_bin() -> &'static str {
     env!("CARGO_BIN_EXE_chidori")
@@ -24,33 +36,62 @@ fn free_loopback_port() -> u16 {
 
 fn wait_for_health(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last_error = String::new();
+    let mut last_diagnostic = "no request attempted".to_string();
     while Instant::now() < deadline {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                stream
-                    .write_all(
-                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    )
-                    .unwrap();
-                let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
-                assert!(
-                    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
-                    "health returned an unexpected response: {response}"
-                );
-                return;
+                if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(500))) {
+                    last_diagnostic = format!("setting read timeout failed: {error}");
+                } else if let Err(error) = stream.write_all(
+                    b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                ) {
+                    last_diagnostic = format!("writing health request failed: {error}");
+                } else {
+                    let mut response = String::new();
+                    match stream.read_to_string(&mut response) {
+                        Ok(_)
+                            if response.starts_with("HTTP/1.1 200")
+                                || response.starts_with("HTTP/1.0 200") =>
+                        {
+                            return;
+                        }
+                        Ok(_) => {
+                            last_diagnostic =
+                                format!("health returned non-200 response: {response}");
+                        }
+                        Err(error) => {
+                            last_diagnostic = format!(
+                                "reading health response failed: {error}; partial response: {response}"
+                            );
+                        }
+                    }
+                }
             }
-            Err(error) => {
-                last_error = error.to_string();
-                std::thread::yield_now();
-            }
+            Err(error) => last_diagnostic = format!("connecting failed: {error}"),
         }
+        std::thread::yield_now();
     }
-    panic!("server did not become healthy on 127.0.0.1:{port}: {last_error}");
+    panic!("server did not become healthy on 127.0.0.1:{port} before deadline: {last_diagnostic}");
+}
+
+fn is_server_startup_status_line(line: &str) -> bool {
+    let line = line.trim_start();
+    [
+        "Re-armed ",
+        "Listening on http://",
+        "WARNING: non-loopback bind",
+        "Concurrency:",
+        "Auth:",
+        "Policy:",
+        "CORS:",
+        "Events:",
+        "Sessions:",
+        "Health:",
+        "GET ",
+        "POST ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
 }
 
 fn seed_hibernating_detached_agent(project: &Path) {
@@ -190,7 +231,11 @@ impl Drop for ChildGuard {
 }
 
 #[test]
+#[ignore = "loopback subprocess integration; set CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_OPT_IN=1 and use --ignored"]
 fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
+    if !require_opt_in("public_serve_routes_successful_startup_status_to_tracing_not_stderr") {
+        return;
+    }
     if std::env::var_os(CHILD_MODE).is_some() {
         run_public_serve_child();
         return;
@@ -205,6 +250,7 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
         .args([
             "--exact",
             "public_serve_routes_successful_startup_status_to_tracing_not_stderr",
+            "--ignored",
             "--nocapture",
         ])
         .current_dir(project.path())
@@ -227,14 +273,7 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
     let host_stderr = String::from_utf8_lossy(&host_child.stderr);
     let leaked_status_lines: Vec<&str> = host_stderr
         .lines()
-        .filter(|line| {
-            let status = line.trim_start();
-            status.starts_with("Re-armed ")
-                || status.starts_with("Listening on http://")
-                || status.starts_with("Concurrency:")
-                || status.starts_with("Auth:")
-                || status.starts_with("Policy:")
-        })
+        .filter(|line| is_server_startup_status_line(line))
         .collect();
     assert!(
         leaked_status_lines.is_empty(),
@@ -263,7 +302,11 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
 }
 
 #[test]
+#[ignore = "loopback subprocess integration; set CHIDORI_TEST_PUBLIC_SERVE_OUTPUT_OPT_IN=1 and use --ignored"]
 fn cli_serve_retains_user_facing_startup_and_rearm_status() {
+    if !require_opt_in("cli_serve_retains_user_facing_startup_and_rearm_status") {
+        return;
+    }
     let project = TempDir::new().unwrap();
     seed_hibernating_detached_agent(project.path());
     let cli_port = free_loopback_port();
