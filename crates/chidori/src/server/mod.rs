@@ -87,6 +87,17 @@ pub(crate) static WARM_POST_RESPONSE_INBOX_TEST_GATE: StdMutex<
     )>,
 > = StdMutex::new(None);
 
+/// One-shot test barrier immediately before the OS listener bind. The port
+/// key prevents unrelated concurrent serve tests from consuming the gate.
+#[cfg(test)]
+pub(crate) static PRE_BIND_TEST_GATE: StdMutex<
+    Option<(
+        u16,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = StdMutex::new(None);
+
 // Test-only re-imports: they keep the flat namespace the test module's
 // `use super::*` saw when this module was a single file.
 #[cfg(test)]
@@ -1684,6 +1695,24 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
     );
     eprintln!("  Health:     GET  /health");
 
+    #[cfg(test)]
+    {
+        let gate = {
+            let mut configured = PRE_BIND_TEST_GATE.lock().unwrap();
+            if configured
+                .as_ref()
+                .is_some_and(|(expected_port, _, _)| *expected_port == port)
+            {
+                configured.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_expected_port, reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
