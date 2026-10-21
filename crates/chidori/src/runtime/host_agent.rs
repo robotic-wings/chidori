@@ -941,7 +941,10 @@ impl DetachedAgentHub {
 
     /// Stop the incarnation currently registered under `name`. The name lock
     /// keeps spawn/replacement from changing the target while the request is
-    /// applied and its result is collected.
+    /// applied. If this process is actively executing the run, wait for it to
+    /// settle; otherwise return a persisted `stopRequested` result without
+    /// rewriting the descriptor. A hibernating run remains pending until a
+    /// matching wake or alarm rearms it.
     pub fn stop_current_name(
         &self,
         parts: &AgentRuntimeParts,
@@ -966,10 +969,9 @@ impl DetachedAgentHub {
             entry.signal.notify_all();
             let mut response = state.descriptor.status_json();
             if !local_execution {
-                // This process cannot claim that a remote hibernating worker
-                // has settled. The durable request will be observed by its
-                // supervisor before replay/effects when an alarm or matching
-                // signal rearms it.
+                // This process has no active execution owner to settle the
+                // descriptor. A future matching wake/alarm observes the
+                // durable request before replay/effects.
                 response["stopRequested"] = json!(true);
             }
             drop(state);
@@ -1010,6 +1012,9 @@ impl DetachedAgentHub {
 
     /// Stop the incarnation captured by a detached-agent handle. A stale
     /// handle must not stop a newer registration that reused the same name.
+    /// Without active local execution, persist the request and return
+    /// `stopRequested`; a hibernating run remains pending until a matching
+    /// wake or alarm rearms it.
     pub fn stop_incarnation(
         &self,
         parts: &AgentRuntimeParts,
@@ -1030,10 +1035,9 @@ impl DetachedAgentHub {
                 entry.signal.notify_all();
                 let mut response = state.descriptor.status_json();
                 if !local_execution {
-                    // This cache may be stale even when a lease snapshot looks
-                    // absent or expired: filesystem leases are advisory, and
-                    // another process may still be executing. Persist the
-                    // request without settling its descriptor locally.
+                    // This hub has no active execution owner to settle the
+                    // descriptor. Persist the request without rewriting it;
+                    // a future matching wake/alarm observes it before effects.
                     response["stopRequested"] = json!(true);
                 }
                 drop(state);
