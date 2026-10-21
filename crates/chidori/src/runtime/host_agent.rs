@@ -929,11 +929,14 @@ impl DetachedAgentHub {
         })
     }
 
-    /// Cooperative stop: a live iteration finishes its current host call and
-    /// stops at the next boundary; a hibernating agent settles immediately.
+    /// Request a cooperative stop for the currently registered run. Active
+    /// local execution finishes its current host call and stops at the next
+    /// boundary. When this process is not the execution owner, the durable
+    /// request remains pending until a matching wake or alarm rearms the run;
+    /// the supervisor checks it before replay or effects. A hibernating run
+    /// without a wake or alarm can therefore remain pending indefinitely.
     pub fn stop(&self, parts: &AgentRuntimeParts, to: &str) -> Result<Value, String> {
-        let entry = self.ensure_entry(parts, to)?;
-        self.stop_entry(parts, to, entry)
+        self.stop_current_name(parts, to)
     }
 
     /// Stop the incarnation currently registered under `name`. The name lock
@@ -1003,29 +1006,6 @@ impl DetachedAgentHub {
                 .unwrap()
                 .0;
         }
-    }
-
-    fn stop_entry(
-        &self,
-        parts: &AgentRuntimeParts,
-        to: &str,
-        entry: Arc<AgentEntry>,
-    ) -> Result<Value, String> {
-        let mut state = entry.state.lock().unwrap();
-        state.stop_requested = true;
-        if !state.thread_live && !AgentEntry::is_settled(&state) {
-            state.descriptor.status = "stopped".to_string();
-            state.descriptor.listen = None;
-            state.descriptor.updated_at = Utc::now();
-            let descriptor = state.descriptor.clone();
-            drop(state);
-            persist_descriptor(&entry.factory(), &descriptor);
-            entry.signal.notify_all();
-            return Ok(descriptor.status_json());
-        }
-        entry.signal.notify_all();
-        drop(state);
-        self.join(parts, to, Some(60_000))
     }
 
     /// Stop the incarnation captured by a detached-agent handle. A stale

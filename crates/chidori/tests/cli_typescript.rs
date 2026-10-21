@@ -4782,7 +4782,7 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
                 r#"import {{ chidori, run }} from "chidori:agent";
                    run(async () => {{
                      const stopped = await chidori.agents.stop("{}");
-                     return {{runId: stopped.runId, status: stopped.status}};
+                     return {{runId: stopped.runId, status: stopped.status, stopRequested: stopped.stopRequested}};
                    }});"#,
                 NAME
             ),
@@ -4797,12 +4797,35 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         );
         let predecessor = detached_registry_entry(&project, NAME);
         let predecessor_id = detached_registry_run_id(&predecessor).to_string();
-        assert_eq!(detached_registry_status(&predecessor), "stopped");
+        assert_eq!(detached_registry_status(&predecessor), "hibernating");
+        assert_eq!(stop_old.body["output"]["stopRequested"], true);
         assert!(
             stop_old.body.to_string().contains(&predecessor_id),
             "same-hub stop handle should identify predecessor {predecessor_id}: {:?}",
             stop_old.body
         );
+        assert_eq!(
+            predecessor["descriptor"]["listen"]["names"],
+            serde_json::json!(["finish"]),
+            "pending same-hub stop must preserve the hibernating listen"
+        );
+        let predecessor_wake = serde_json::json!({"name":"finish","payload":{}}).to_string();
+        let predecessor_wake_response = serve_http_request(
+            port_a,
+            "POST",
+            &format!("/agents/detached/{NAME}/send"),
+            Some(&predecessor_wake),
+        );
+        assert_eq!(predecessor_wake_response.status, 200);
+        let predecessor_stop_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut predecessor_final = detached_registry_entry(&project, NAME);
+        while detached_registry_status(&predecessor_final) != "stopped"
+            && std::time::Instant::now() < predecessor_stop_deadline
+        {
+            std::thread::yield_now();
+            predecessor_final = detached_registry_entry(&project, NAME);
+        }
+        assert_eq!(detached_registry_status(&predecessor_final), "stopped");
 
         // Start a fresh server only after X settled. Its manifest causes the
         // actual public serve boot path to replace the settled name with Y.
