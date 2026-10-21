@@ -1353,9 +1353,9 @@ pub(crate) async fn serve_with_rearm_failure_reporter(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30_000);
 
-    // Load the MCP servers, recipes, and session store up front so startup
-    // errors happen before we bind the listener. The permission policy is
-    // resolved by the caller (CLI flag or CHIDORI_POLICY* env vars).
+    // The unsafe-bind preflight above runs first, then we reserve the listener
+    // before loading MCP servers, recipes, or the session store. The permission
+    // policy is resolved by the caller (CLI flag or CHIDORI_POLICY* env vars).
     let mcp = Arc::new(McpManager::new());
     let mcp_cfg = McpServersConfig::load_from_env().unwrap_or_default();
     let mcp_tools = mcp.start_from_config(&mcp_cfg).await.unwrap_or_else(|e| {
