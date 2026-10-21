@@ -221,16 +221,18 @@ POST /agents/detached/{name}/stop   → stop request for the current registered 
 
 For same-host processes sharing a `run_base`, this name-addressed route targets
 the run currently registered under `{name}` and durably stores a run-scoped
-stop request before acknowledging it. If another process is driving that run,
-the response includes `stopRequested: true`; this confirms the request was
-persisted, not that the remote worker has settled. A host call already
-dispatched may finish, but the worker checks for the request before its next
-side effect and then stops. If persisting the request fails, the route returns
-an error without a success acknowledgment; the caller may retry, and a
-successfully persisted request is idempotent. SDK/run-handle `stop()` remains
-bound to the handle's captured `runId`. This contract is limited to same-host
-processes sharing one `run_base`; it makes no claim about cross-host or
-distinct-`run_base` use.
+stop request before acknowledging it. When the caller is not the active
+execution owner, the response includes `stopRequested: true`; this confirms
+the request was persisted, not that the worker has settled. For a remote
+hibernating run, the request remains pending until an alarm or matching signal
+causes rearm; the supervisor checks the marker before replay or effects. A host
+call already dispatched may finish, but the worker checks for the request
+before its next side effect and then stops. If persisting the request fails,
+the route returns an error without a success acknowledgment; the caller may
+retry, and a successfully persisted request is idempotent. SDK/run-handle
+`stop()` remains bound to the handle's captured `runId`. This contract is
+limited to same-host processes sharing one `run_base`; it makes no claim about
+cross-host or distinct-`run_base` use.
 
 The full HTTP endpoint reference lives in
 [Running Modes](./running-modes.md). `send` is how external systems talk to a
