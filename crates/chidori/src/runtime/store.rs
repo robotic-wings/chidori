@@ -3400,15 +3400,6 @@ impl RunStoreFactory {
             .to_ascii_lowercase();
         Ok(parent.join(format!(".{file_name}.spawn.lock")))
     }
-
-    /// The local registry is authoritative for filesystem and SQLite-primary
-    /// configurations; their mirror can fail after the atomic local rename.
-    pub(crate) fn local_registry_is_primary(&self) -> bool {
-        matches!(
-            self.backend,
-            RunStoreBackend::Fs | RunStoreBackend::Sqlite(_)
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------

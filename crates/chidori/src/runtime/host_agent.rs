@@ -1682,16 +1682,18 @@ fn persist_spawn_descriptor(
     Ok(())
 }
 
-/// Treat a complete local registry rename as committed for the local FS and
-/// SQLite-primary topology. The subsequent mirror failure is reported but
-/// cannot be rolled back safely; continue to start the locally published run.
+/// Treat a complete local registry rename as committed for this run base.
+/// Registry mirrors are updated after that rename, so a mirror failure cannot
+/// be rolled back safely; continue with the locally published run when the
+/// exact replacement descriptor is visible. This does not imply remote
+/// mirror completion or cross-store atomicity.
 fn persist_spawn_descriptor_with_local_commit(
     factory: &RunStoreFactory,
     descriptor: &AgentDescriptor,
 ) -> Result<(), String> {
     match persist_spawn_descriptor(factory, descriptor) {
         Ok(()) => Ok(()),
-        Err(error) if factory.local_registry_is_primary() => {
+        Err(error) => {
             let local_commit_is_visible = factory
                 .registry_get(&descriptor.name)
                 .ok()
@@ -1709,14 +1711,13 @@ fn persist_spawn_descriptor_with_local_commit(
                     agent = %descriptor.name,
                     run_id = %descriptor.run_id,
                     error,
-                    "local spawn registry committed but its SQLite mirror update failed; keeping the local run authoritative"
+                    "local spawn registry committed but a configured mirror update failed; keeping the local run authoritative"
                 );
                 Ok(())
             } else {
                 Err(error)
             }
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -5348,6 +5349,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(local_registry["run_id"], mirror_run_id);
+    }
+
+    #[test]
+    fn detached_spawn_http_registry_mirror_failure_keeps_local_commit_live() {
+        const CHILD: &str = "CHIDORI_TEST_SPAWN_HTTP_MIRROR_FAILURE_CHILD";
+        const BASE: &str = "CHIDORI_TEST_SPAWN_HTTP_MIRROR_FAILURE_BASE";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(BASE).unwrap());
+            let project = root.join("project");
+            let source = project.join("services/http-mirror-worker.ts");
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(
+                &source,
+                r#"export async function agent() {
+                    await chidori.tool("httpMirrorEffect", {});
+                    return { completed: true };
+                }"#,
+            )
+            .unwrap();
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut tools = ToolRegistry::new();
+            let observed_effects = effects.clone();
+            tools.register_native(
+                "httpMirrorEffect",
+                "count effects after local registry publication",
+                Vec::new(),
+                move |_| {
+                    observed_effects.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({ "effect": true }))
+                },
+            );
+            let run_base = project.join(".chidori/runs");
+            let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(tools));
+            let name = "http-registry-mirror-failure";
+            let spawned = hub()
+                .spawn(
+                    &parts,
+                    source.to_str().unwrap(),
+                    json!({}),
+                    &SpawnOptions {
+                        name: Some(name.to_string()),
+                        restart: "never".to_string(),
+                        max_restarts: 0,
+                        backoff_ms: 0,
+                        model: None,
+                    },
+                    "http-mirror-failure-test".to_string(),
+                )
+                .expect("a committed local registry entry must start despite HTTP mirror failure");
+            let run_id = spawned["runId"].as_str().unwrap();
+            let descriptor = wait_for_agent_descriptor(&parts, name, |descriptor| {
+                descriptor.run_id == run_id && descriptor.status == "completed"
+            });
+            let registry = RunStoreFactory::shared(&run_base)
+                .registry_get(name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(descriptor.status, "completed");
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(registry["run_id"], run_id);
+            assert_eq!(registry["descriptor"]["status"], "completed");
+            return;
+        }
+
+        use axum::extract::Request;
+        use axum::http::{Method, StatusCode};
+        use axum::response::IntoResponse as _;
+        let registry_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_failures = registry_failures.clone();
+        let app = axum::Router::new().fallback(move |request: Request| {
+            let registry_write =
+                request.method() == Method::PUT && request.uri().path().starts_with("/registry/");
+            let observed_failures = observed_failures.clone();
+            async move {
+                if registry_write {
+                    observed_failures.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else if request.method() == Method::GET {
+                    StatusCode::NOT_FOUND.into_response()
+                } else {
+                    StatusCode::OK.into_response()
+                }
+            }
+        });
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                address_tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let relay = format!("http://{}", address_rx.recv().unwrap());
+        let base = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::host_agent::tests::detached_spawn_http_registry_mirror_failure_keeps_local_commit_live",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(BASE, base.path())
+            .env("CHIDORI_RUN_STORE", &relay)
+            .env("CHIDORI_RUN_DB", base.path().join("runs.sqlite3"))
+            .env("CHIDORI_DURABILITY", "strict")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "HTTP mirror failure child failed; registry failures={}; stdout={} stderr={}",
+            registry_failures.load(Ordering::SeqCst),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            registry_failures.load(Ordering::SeqCst) > 0,
+            "fixture did not reject a post-rename HTTP registry mirror write"
+        );
     }
 
     #[cfg(unix)]
