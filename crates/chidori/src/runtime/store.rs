@@ -120,6 +120,13 @@ pub trait RunStore: Send + Sync + std::fmt::Debug {
     /// serialize concurrent processes. Filesystem and SQLite stores override
     /// it with a cross-process serialization point. Callers should keep the
     /// transform limited to decoding, updating, and encoding the blob.
+    /// Some implementations may invoke `update` more than once after
+    /// conditional-write contention (the HTTP store retries after a 412), so
+    /// the callback must be safe to rerun with newly read bytes. Keep it
+    /// limited to decoding, computing the updated value, and encoding; do not
+    /// perform external side effects inside it. If it writes a result to
+    /// captured local state, overwrite that result on every invocation so it
+    /// reflects the successful attempt.
     fn update_blob(
         &self,
         key: &str,
