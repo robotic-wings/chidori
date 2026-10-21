@@ -309,17 +309,20 @@ fn public_serve_routes_successful_startup_status_to_tracing_not_stderr() {
         .collect();
     assert!(
         events.iter().any(|event| {
-            trace_message(event).is_some_and(|message| message.contains("Listening on http://"))
+            trace_message(event) == Some("server listener ready")
+                && event["fields"]["listener_addr"]
+                    .as_str()
+                    .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                    .is_some_and(|addr| addr.ip().is_loopback())
         }),
-        "structured tracing should expose the successful listening lifecycle event: {trace}"
+        "structured tracing should expose the fixed listener event and loopback address field: {trace}"
     );
     assert!(
         events.iter().any(|event| {
-            trace_message(event).is_some_and(|message| {
-                message.contains("Re-armed 1 detached agent(s) from the registry")
-            })
+            trace_message(event) == Some("detached agents re-armed from registry")
+                && event["fields"]["count"].as_u64() == Some(1)
         }),
-        "structured tracing should expose the successful detached rearm lifecycle event: {trace}"
+        "structured tracing should expose the fixed rearm event and count field: {trace}"
     );
     assert!(
         events.iter().any(|event| {

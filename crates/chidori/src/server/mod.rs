@@ -1583,10 +1583,7 @@ pub(crate) async fn serve_with_cli_reporter(
         };
         match crate::runtime::host_agent::hub().rearm_from_registry(parts) {
             Ok(count) if count > 0 => {
-                tracing::info!(
-                    count,
-                    "Re-armed {count} detached agent(s) from the registry"
-                );
+                tracing::info!(count, "detached agents re-armed from registry");
                 notify_reporter(
                     reporter.as_ref(),
                     ServeNotice::DetachedAgentsRearmed { count },
@@ -1756,7 +1753,7 @@ pub(crate) async fn serve_with_cli_reporter(
     );
     tracing::info!(
         %listener_addr,
-        "Listening on http://{listener_addr}"
+        "server listener ready"
     );
     notify_reporter(
         reporter.as_ref(),
