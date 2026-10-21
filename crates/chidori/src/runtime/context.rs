@@ -2304,6 +2304,8 @@ mod tests {
     struct HttpInboxState {
         blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         initial_inbox_reads: Arc<std::sync::atomic::AtomicUsize>,
+        precondition_failures: Arc<std::sync::atomic::AtomicUsize>,
+        reject_conditional_writes: Arc<std::sync::atomic::AtomicBool>,
         initial_inbox_barrier: Arc<tokio::sync::Barrier>,
         gate_initial_inbox_reads: bool,
     }
@@ -2358,13 +2360,45 @@ mod tests {
     async fn http_inbox_put(
         axum::extract::State(state): axum::extract::State<HttpInboxState>,
         axum::extract::Path((run_id, key)): axum::extract::Path<(String, String)>,
+        headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> axum::http::StatusCode {
-        state
-            .blobs
-            .lock()
-            .unwrap()
-            .insert(format!("{run_id}/{key}"), body.to_vec());
+        use sha2::Digest as _;
+
+        if state
+            .reject_conditional_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && (headers.contains_key(axum::http::header::IF_MATCH)
+                || headers.contains_key(axum::http::header::IF_NONE_MATCH))
+        {
+            return axum::http::StatusCode::NOT_IMPLEMENTED;
+        }
+        let full_key = format!("{run_id}/{key}");
+        let mut blobs = state.blobs.lock().unwrap();
+        let current = blobs.get(&full_key);
+        let precondition_matches = if let Some(if_match) = headers.get(axum::http::header::IF_MATCH)
+        {
+            let Some(current) = current else {
+                return axum::http::StatusCode::PRECONDITION_FAILED;
+            };
+            let current_etag = format!("\"{}\"", hex::encode(sha2::Sha256::digest(current)));
+            if_match.to_str().ok() == Some(current_etag.as_str())
+        } else if headers
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            == Some("*")
+        {
+            current.is_none()
+        } else {
+            return axum::http::StatusCode::PRECONDITION_REQUIRED;
+        };
+        if !precondition_matches {
+            state
+                .precondition_failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return axum::http::StatusCode::PRECONDITION_FAILED;
+        }
+        blobs.insert(full_key, body.to_vec());
         axum::http::StatusCode::OK
     }
 
@@ -2376,6 +2410,8 @@ mod tests {
         let state = HttpInboxState {
             blobs: Arc::new(Mutex::new(blobs)),
             initial_inbox_reads: Arc::default(),
+            precondition_failures: Arc::default(),
+            reject_conditional_writes: Arc::default(),
             initial_inbox_barrier: Arc::new(tokio::sync::Barrier::new(2)),
             gate_initial_inbox_reads,
         };
@@ -2826,13 +2862,21 @@ mod tests {
             second_result.is_ok(),
             "second send did not report success: {second_result:?}"
         );
-        assert_eq!(
+        assert!(
             server
                 .state
                 .initial_inbox_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "both clients must read the initial inbox before either response is released"
+        );
+        assert_eq!(
+            server
+                .state
+                .precondition_failures
                 .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "both clients must read the same initial inbox before either response is released"
+            1,
+            "the stale conditional write must receive exactly one HTTP 412 before retry"
         );
         first_store.flush().unwrap();
         second_store.flush().unwrap();
@@ -2869,5 +2913,158 @@ mod tests {
             store.flush().unwrap();
         }
         assert_http_inbox_has_each_delivery(&server, &["sequential-a", "sequential-b"]);
+    }
+
+    #[test]
+    fn http_update_blob_fails_without_conditional_write_support() {
+        use crate::runtime::store::{HttpRelay, HttpRunStore, RunStore};
+
+        let server = spawn_http_inbox_server(false);
+        server
+            .state
+            .reject_conditional_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store = HttpRunStore::new(HttpRelay::new(server.url.clone(), None), "run-http");
+        let prior = br#"["existing"]"#.to_vec();
+        server
+            .state
+            .blobs
+            .lock()
+            .unwrap()
+            .insert(format!("run-http/{SIGNAL_INBOX_FILE}"), prior.clone());
+        let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+            let mut values: Vec<String> = current
+                .as_deref()
+                .map(serde_json::from_slice)
+                .transpose()?
+                .unwrap_or_default();
+            values.push("new".to_string());
+            Ok(serde_json::to_vec(&values)?)
+        };
+
+        let error = store
+            .update_blob(SIGNAL_INBOX_FILE, &mut update)
+            .expect_err("HTTP update must fail if the relay rejects conditional writes");
+        assert!(
+            format!("{error:#}").contains("If-Match and If-None-Match"),
+            "missing conditional-write support should be clear: {error:#}"
+        );
+        assert_eq!(
+            server
+                .state
+                .blobs
+                .lock()
+                .unwrap()
+                .get(&format!("run-http/{SIGNAL_INBOX_FILE}")),
+            Some(&prior),
+            "no unconditional fallback may overwrite the shared blob"
+        );
+    }
+
+    #[test]
+    fn tee_http_updates_share_secondary_cas_and_local_copies_converge() {
+        use crate::runtime::store::{FsRunStore, HttpRelay, HttpRunStore, RunStore, TeeRunStore};
+
+        let server = spawn_http_inbox_server(true);
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first: Arc<dyn RunStore> = Arc::new(TeeRunStore::new(
+            FsRunStore::new(first_dir.path()),
+            Arc::new(HttpRunStore::new(
+                HttpRelay::new(server.url.clone(), None),
+                "run-http",
+            )),
+        ));
+        let second: Arc<dyn RunStore> = Arc::new(TeeRunStore::new(
+            FsRunStore::new(second_dir.path()),
+            Arc::new(HttpRunStore::new(
+                HttpRelay::new(server.url.clone(), None),
+                "run-http",
+            )),
+        ));
+
+        let first_update = std::thread::spawn(move || {
+            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                let mut ids: Vec<String> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                ids.push("tee-a".to_string());
+                Ok(serde_json::to_vec(&ids)?)
+            };
+            first.update_blob(SIGNAL_INBOX_FILE, &mut update)
+        });
+        let second_update = std::thread::spawn(move || {
+            let mut update = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+                let mut ids: Vec<String> = current
+                    .as_deref()
+                    .map(serde_json::from_slice)
+                    .transpose()?
+                    .unwrap_or_default();
+                ids.push("tee-b".to_string());
+                Ok(serde_json::to_vec(&ids)?)
+            };
+            second.update_blob(SIGNAL_INBOX_FILE, &mut update)
+        });
+        first_update.join().unwrap().unwrap();
+        second_update.join().unwrap().unwrap();
+        assert!(
+            server
+                .state
+                .precondition_failures
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1,
+            "overlapping Tee writes must exercise a lost conditional update"
+        );
+
+        // Each process has its own primary. Reconcile both against the shared
+        // authority after the overlapping writes, then check local convergence.
+        let first = TeeRunStore::new(
+            FsRunStore::new(first_dir.path()),
+            Arc::new(HttpRunStore::new(
+                HttpRelay::new(server.url.clone(), None),
+                "run-http",
+            )),
+        );
+        let second = TeeRunStore::new(
+            FsRunStore::new(second_dir.path()),
+            Arc::new(HttpRunStore::new(
+                HttpRelay::new(server.url.clone(), None),
+                "run-http",
+            )),
+        );
+        let mut reconcile = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+            Ok(current.unwrap_or_default())
+        };
+        first
+            .update_blob(SIGNAL_INBOX_FILE, &mut reconcile)
+            .unwrap();
+        second
+            .update_blob(SIGNAL_INBOX_FILE, &mut reconcile)
+            .unwrap();
+
+        let remote = server
+            .state
+            .blobs
+            .lock()
+            .unwrap()
+            .get(&format!("run-http/{SIGNAL_INBOX_FILE}"))
+            .cloned()
+            .unwrap();
+        let first_local = FsRunStore::new(first_dir.path())
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .unwrap();
+        let second_local = FsRunStore::new(second_dir.path())
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_local, remote);
+        assert_eq!(second_local, remote);
+        let ids: Vec<String> = serde_json::from_slice(&remote).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"tee-a".to_string()));
+        assert!(ids.contains(&"tee-b".to_string()));
     }
 }

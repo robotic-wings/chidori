@@ -1625,6 +1625,8 @@ pub struct HttpRunStore {
 }
 
 impl HttpRunStore {
+    const MAX_UPDATE_BLOB_CAS_ATTEMPTS: usize = 32;
+
     pub fn new(relay: Arc<HttpRelay>, run_id: impl Into<String>) -> Self {
         Self {
             relay,
@@ -2112,6 +2114,32 @@ impl HttpRelay {
 }
 
 impl RunStore for HttpRunStore {
+    fn update_blob(
+        &self,
+        key: &str,
+        update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        for _ in 0..Self::MAX_UPDATE_BLOB_CAS_ATTEMPTS {
+            let current = self.get_blob(key)?;
+            let replacement = update(current.clone())?;
+            let swapped = self
+                .compare_and_swap_blob(key, current.as_deref(), Some(&replacement))
+                .with_context(|| {
+                    format!(
+                        "conditionally updating HTTP run-store blob `{key}`; the relay must support If-Match and If-None-Match"
+                    )
+                })?;
+            if swapped {
+                return Ok(replacement);
+            }
+        }
+
+        anyhow::bail!(
+            "HTTP run-store blob `{key}` update exceeded {} conditional-write attempts due to concurrent changes",
+            Self::MAX_UPDATE_BLOB_CAS_ATTEMPTS
+        )
+    }
+
     fn append_record(&self, record: &CallRecord) -> Result<()> {
         if self.pipelined {
             return self.relay.request_async(
@@ -2355,8 +2383,8 @@ impl RunStore for TeeRunStore {
         update: &mut dyn FnMut(Option<Vec<u8>>) -> Result<Vec<u8>>,
     ) -> Result<Vec<u8>> {
         self.primary.with_blob_update_lock(|| {
-            let bytes = self.primary.update_blob_under_lock(key, update)?;
-            self.secondary.put_blob(key, &bytes)?;
+            let bytes = self.secondary.update_blob(key, update)?;
+            self.primary.put_blob(key, &bytes)?;
             Ok(bytes)
         })
     }
