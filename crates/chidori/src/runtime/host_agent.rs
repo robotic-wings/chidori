@@ -354,6 +354,9 @@ impl DetachedAgentHub {
         persist_descriptor(&factory, &descriptor);
         let run_id = descriptor.run_id.clone();
 
+        #[cfg(test)]
+        tests::pause_after_predecessor_descriptor_persisted(&name, &run_id);
+
         // Mail follows the NAME, not the incarnation: whatever the settled
         // predecessor never consumed is re-queued for the replacement instead
         // of stranding in the dead run's inbox.
@@ -2160,6 +2163,96 @@ mod tests {
     const SQLITE_STALE_AGENT: &str = "sqlite-stale-owner-probe";
     const SQLITE_STALE_TEST: &str =
         "runtime::host_agent::tests::detached_sqlite_expired_live_owner_cannot_write_or_start_next_effect";
+    const PREDECESSOR_MIGRATION_CHILD_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_CHILD";
+    const PREDECESSOR_MIGRATION_BASE_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_BASE";
+    const PREDECESSOR_MIGRATION_SCENARIO_ENV: &str = "CHIDORI_TEST_PREDECESSOR_MIGRATION_SCENARIO";
+
+    struct PredecessorMigrationBarrier {
+        agent_name: String,
+        reached: std::sync::mpsc::Sender<String>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        claimed: AtomicBool,
+    }
+
+    struct PredecessorMigrationBarrierCleanup {
+        agent_name: String,
+        release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl PredecessorMigrationBarrierCleanup {
+        fn release(&mut self) {
+            if let Some(release) = self.release.take() {
+                release
+                    .send(())
+                    .expect("predecessor migration barrier is still waiting");
+            }
+        }
+    }
+
+    impl Drop for PredecessorMigrationBarrierCleanup {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(slot) = PREDECESSOR_MIGRATION_BARRIER.get() {
+                let mut slot = slot.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.agent_name == self.agent_name)
+                {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    static PREDECESSOR_MIGRATION_BARRIER: OnceLock<
+        StdMutex<Option<Arc<PredecessorMigrationBarrier>>>,
+    > = OnceLock::new();
+
+    fn install_predecessor_migration_barrier(
+        agent_name: &str,
+    ) -> (
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached, wait_until_reached) = std::sync::mpsc::channel();
+        let (release, wait_until_released) = std::sync::mpsc::channel();
+        *PREDECESSOR_MIGRATION_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap() = Some(Arc::new(PredecessorMigrationBarrier {
+            agent_name: agent_name.to_string(),
+            reached,
+            release: StdMutex::new(wait_until_released),
+            claimed: AtomicBool::new(false),
+        }));
+        (wait_until_reached, release)
+    }
+
+    pub(super) fn pause_after_predecessor_descriptor_persisted(agent_name: &str, run_id: &str) {
+        let barrier = PREDECESSOR_MIGRATION_BARRIER
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        let Some(barrier) = barrier.filter(|barrier| barrier.agent_name == agent_name) else {
+            return;
+        };
+        if barrier.claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        barrier
+            .reached
+            .send(run_id.to_string())
+            .expect("predecessor migration test receiver remains active");
+        barrier
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .expect("predecessor migration test releases descriptor/write barrier");
+    }
 
     fn sqlite_stale_control_wait(event: &str) -> u8 {
         let address = std::env::var(SQLITE_STALE_CONTROL_ENV)
@@ -3352,6 +3445,422 @@ mod tests {
             mcp: Arc::new(McpManager::new()),
             run_base,
         }
+    }
+
+    #[derive(Debug)]
+    struct PredecessorMigrationFailureObservation {
+        spawn_result: Result<Value, String>,
+        destination_run_id: String,
+        predecessor_before: Vec<u8>,
+        predecessor_after: Result<Option<Vec<u8>>, String>,
+        destination_inbox_after: Result<Option<Vec<u8>>, String>,
+        destination_write_probe: Result<(), String>,
+        sqlite_mirror_inbox_after: Option<Result<Option<Vec<u8>>, String>>,
+        destination_signal_result_count: Result<usize, String>,
+        entry_present: bool,
+        thread_live: Option<bool>,
+        effect_count: usize,
+    }
+
+    fn summarize_blob_result(result: &Result<Option<Vec<u8>>, String>) -> String {
+        match result {
+            Ok(Some(bytes)) => format!("{} bytes: {}", bytes.len(), String::from_utf8_lossy(bytes)),
+            Ok(None) => "missing".to_string(),
+            Err(error) => format!("unreadable: {error}"),
+        }
+    }
+
+    fn migration_source(project: &Path) -> PathBuf {
+        let source = project.join("services/migration-worker.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            r#"export async function agent() {
+                const message = await chidori.signal("go");
+                await chidori.tool("migrationEffect", { id: message.payload.id });
+                return { id: message.payload.id };
+            }"#,
+        )
+        .unwrap();
+        source
+    }
+
+    fn seed_settled_predecessor(
+        factory: &RunStoreFactory,
+        name: &str,
+        run_id: &str,
+        payload_id: &str,
+    ) -> Vec<u8> {
+        let now = Utc::now();
+        let descriptor = json!({
+            "name": name,
+            "run_id": run_id,
+            "source": "services/old-worker.ts",
+            "input": {},
+            "restart": "never",
+            "max_restarts": 0,
+            "backoff_ms": 0,
+            "owner_run_id": "migration-test-parent",
+            "model": null,
+            "status": "completed",
+            "listen": null,
+            "restarts": 0,
+            "output": null,
+            "error": null,
+            "created_at": now,
+            "updated_at": now,
+        });
+        factory.registry_put(name, run_id, &descriptor).unwrap();
+        let queued = vec![QueuedSignal {
+            name: "go".to_string(),
+            payload: json!({ "id": payload_id }),
+            from: json!({ "kind": "test", "id": "predecessor-migration" }),
+            delivery_seq: 17,
+            enqueued_at: now,
+        }];
+        let bytes = serde_json::to_vec_pretty(&queued).unwrap();
+        factory
+            .store_for(run_id)
+            .put_blob(SIGNAL_INBOX_FILE, &bytes)
+            .unwrap();
+        bytes
+    }
+
+    fn run_predecessor_migration_failure(base: &Path) -> PredecessorMigrationFailureObservation {
+        let project = base.join("failure");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = migration_source(&project);
+        let run_base = project.join(".chidori/runs");
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        let recorded_effects = effects.clone();
+        tools.register_native(
+            "migrationEffect",
+            "count migrated signal effects",
+            Vec::new(),
+            move |_| {
+                recorded_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "effect": true }))
+            },
+        );
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let factory = RunStoreFactory::shared(&run_base);
+        let name = unique("predecessor-write-failure");
+        let predecessor_run_id = format!("old-{}", uuid::Uuid::new_v4());
+        let predecessor_before =
+            seed_settled_predecessor(&factory, &name, &predecessor_run_id, "must-survive");
+        let old_store = factory.store_for(&predecessor_run_id);
+        let options = SpawnOptions {
+            name: Some(name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let (arrived, release) = install_predecessor_migration_barrier(&name);
+        let mut cleanup = PredecessorMigrationBarrierCleanup {
+            agent_name: name.clone(),
+            release: Some(release),
+        };
+        let thread_parts = parts.clone();
+        let thread_source = source.to_string_lossy().to_string();
+        let thread_options = options.clone();
+        let spawn_thread = std::thread::spawn(move || {
+            hub().spawn(
+                &thread_parts,
+                &thread_source,
+                json!({}),
+                &thread_options,
+                "migration-failure-parent".to_string(),
+            )
+        });
+
+        let destination_run_id = arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("spawn reaches the barrier after replacement descriptor persistence");
+        let destination_inbox_path = run_base.join(&destination_run_id).join(SIGNAL_INBOX_FILE);
+        std::fs::create_dir_all(&destination_inbox_path)
+            .expect("make destination inbox path a directory to force real FS put failure");
+        cleanup.release();
+        let spawn_result = spawn_thread
+            .join()
+            .expect("spawn worker thread returns its migration result");
+        drop(cleanup);
+
+        let predecessor_after = old_store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .map_err(|err| format!("{err:#}"));
+        let destination_store = factory.store_for(&destination_run_id);
+        let destination_inbox_after = destination_store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .map_err(|err| format!("{err:#}"));
+        let destination_write_probe = destination_store
+            .put_blob(SIGNAL_INBOX_FILE, b"migration-write-probe")
+            .map_err(|err| format!("{err:#}"));
+        let sqlite_mirror_inbox_after =
+            if std::env::var("CHIDORI_RUN_STORE").as_deref() == Ok("sqlite") {
+                let shared = SqliteRunStoreShared::open(&PathBuf::from(
+                    std::env::var_os("CHIDORI_RUN_DB").unwrap(),
+                ))
+                .map_err(|err| format!("{err:#}"));
+                Some(match shared {
+                    Ok(shared) => SqliteRunStore::new(shared, &destination_run_id)
+                        .get_blob(SIGNAL_INBOX_FILE)
+                        .map_err(|err| format!("{err:#}")),
+                    Err(err) => Err(err),
+                })
+            } else {
+                None
+            };
+        let destination_signal_result_count = destination_store
+            .load_call_log()
+            .map(|records| {
+                records
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal"
+                            && record.result["payload"]["id"] == json!("must-survive")
+                    })
+                    .count()
+            })
+            .map_err(|err| format!("{err:#}"));
+        let entry = hub().entries.lock().unwrap().get(&name).cloned();
+        let thread_live = entry.map(|entry| entry.state.lock().unwrap().thread_live);
+        let entry_present = hub().entries.lock().unwrap().contains_key(&name);
+        let effect_count = effects.load(Ordering::SeqCst);
+        PredecessorMigrationFailureObservation {
+            spawn_result,
+            destination_run_id,
+            predecessor_before,
+            predecessor_after,
+            destination_inbox_after,
+            destination_write_probe,
+            sqlite_mirror_inbox_after,
+            destination_signal_result_count,
+            entry_present,
+            thread_live,
+            effect_count,
+        }
+    }
+
+    fn run_predecessor_migration_success(
+        base: &Path,
+    ) -> (AgentDescriptor, Vec<CallRecord>, Vec<u8>, usize) {
+        let project = base.join("success");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = migration_source(&project);
+        let run_base = project.join(".chidori/runs");
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        let recorded_effects = effects.clone();
+        tools.register_native(
+            "migrationEffect",
+            "count migrated signal effects",
+            Vec::new(),
+            move |_| {
+                recorded_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "effect": true }))
+            },
+        );
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let factory = RunStoreFactory::shared(&run_base);
+        let name = unique("predecessor-write-success");
+        let predecessor_run_id = format!("old-{}", uuid::Uuid::new_v4());
+        seed_settled_predecessor(&factory, &name, &predecessor_run_id, "must-survive");
+        let options = SpawnOptions {
+            name: Some(name.clone()),
+            restart: "never".to_string(),
+            max_restarts: 0,
+            backoff_ms: 0,
+            model: None,
+        };
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &options,
+                "migration-success-parent".to_string(),
+            )
+            .expect("valid migration spawn succeeds");
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let descriptor = wait_for_agent_descriptor(&parts, &name, |descriptor| {
+            descriptor.run_id == run_id && descriptor.status == "completed"
+        });
+        let store = factory.store_for(&run_id);
+        let records = store.load_call_log().unwrap().unwrap_or_default();
+        let inbox = store
+            .get_blob(SIGNAL_INBOX_FILE)
+            .unwrap()
+            .unwrap_or_else(|| b"[]".to_vec());
+        let effect_count = effects.load(Ordering::SeqCst);
+        (descriptor, records, inbox, effect_count)
+    }
+
+    fn run_migration_child_for_backend(test_name: &str, scenario: &str) {
+        let mut failures = Vec::new();
+        for backend in ["fs", "sqlite"] {
+            let base = tempfile::tempdir().unwrap();
+            eprintln!(
+                "PREDECESSOR_MIGRATION_BACKEND={backend} SCENARIO={scenario} ARTIFACT_BASE={}",
+                base.path().display()
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(PREDECESSOR_MIGRATION_CHILD_ENV, "1")
+                .env(PREDECESSOR_MIGRATION_BASE_ENV, base.path())
+                .env(PREDECESSOR_MIGRATION_SCENARIO_ENV, scenario)
+                .env("CHIDORI_RUN_STORE", backend)
+                .env("CHIDORI_RUN_DB", base.path().join("runs.sqlite3"))
+                .env("CHIDORI_DURABILITY", "strict")
+                .output()
+                .unwrap();
+            let report = format!(
+                "backend={backend} scenario={scenario} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success() {
+                let preserved = base.keep();
+                failures.push(format!("{report}\nartifact_base={}", preserved.display()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "migration subprocess failures:\n{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn detached_predecessor_destination_write_failure_is_surfaced_before_worker_start() {
+        if std::env::var_os(PREDECESSOR_MIGRATION_CHILD_ENV).is_some() {
+            assert_eq!(
+                std::env::var(PREDECESSOR_MIGRATION_SCENARIO_ENV).as_deref(),
+                Ok("failure")
+            );
+            let base = PathBuf::from(std::env::var_os(PREDECESSOR_MIGRATION_BASE_ENV).unwrap());
+            let observed = run_predecessor_migration_failure(&base);
+            eprintln!(
+                "destination-write-failure observation: spawn={:?}; destination_run_id={}; predecessor_before={} bytes ({}); predecessor_after={}; destination_inbox_after={}; destination_write_probe={:?}; sqlite_mirror_inbox_after={:?}; destination_signal_result_count={:?}; entry_present={}; thread_live={:?}; effect_count={}",
+                observed.spawn_result,
+                observed.destination_run_id,
+                observed.predecessor_before.len(),
+                String::from_utf8_lossy(&observed.predecessor_before),
+                summarize_blob_result(&observed.predecessor_after),
+                summarize_blob_result(&observed.destination_inbox_after),
+                observed.destination_write_probe,
+                observed.sqlite_mirror_inbox_after.as_ref().map(summarize_blob_result),
+                observed.destination_signal_result_count,
+                observed.entry_present,
+                observed.thread_live,
+                observed.effect_count,
+            );
+            let mut violations = Vec::new();
+            match &observed.spawn_result {
+                Err(err) if err.contains("migrat") && err.contains(SIGNAL_INBOX_FILE) => {}
+                Err(err) => violations.push(format!(
+                    "spawn returned an error without migration/inbox context: {err}"
+                )),
+                Ok(value) => violations.push(format!(
+                    "spawn reported success despite destination write failure: {value}"
+                )),
+            }
+            match &observed.predecessor_after {
+                Ok(Some(bytes)) if bytes == &observed.predecessor_before => {}
+                other => violations.push(format!(
+                    "predecessor inbox changed or could not be read: before={:?}, after={other:?}",
+                    String::from_utf8_lossy(&observed.predecessor_before)
+                )),
+            }
+            if observed.destination_inbox_after.is_ok() {
+                violations.push(format!(
+                    "injected directory target unexpectedly read as a blob: {:?}",
+                    observed.destination_inbox_after
+                ));
+            }
+            if observed.destination_write_probe.is_ok() {
+                violations.push(
+                    "a follow-up write probe unexpectedly succeeded at the directory target"
+                        .to_string(),
+                );
+            }
+            if let Some(Err(error)) = &observed.sqlite_mirror_inbox_after {
+                violations.push(format!("SQLite mirror inbox could not be read: {error}"));
+            }
+            if observed
+                .sqlite_mirror_inbox_after
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_ok_and(Option::is_some))
+            {
+                violations.push(
+                    "SQLite mirror received destination inbox despite FS-primary failure"
+                        .to_string(),
+                );
+            }
+            match &observed.destination_signal_result_count {
+                Ok(0) => {}
+                other => violations.push(format!(
+                    "destination journal has a migrated signal result or could not be read: {other:?}"
+                )),
+            }
+            if observed.entry_present || observed.thread_live.is_some() {
+                violations.push(format!(
+                    "failed migration registered/started a worker: entry_present={}, thread_live={:?}",
+                    observed.entry_present, observed.thread_live
+                ));
+            }
+            if observed.effect_count != 0 {
+                violations.push(format!(
+                    "migration effect ran {} time(s) before write failure was surfaced",
+                    observed.effect_count
+                ));
+            }
+            assert!(
+                violations.is_empty(),
+                "migration write failure contract violations: {violations:#?}"
+            );
+            return;
+        }
+        run_migration_child_for_backend(
+            "runtime::host_agent::tests::detached_predecessor_destination_write_failure_is_surfaced_before_worker_start",
+            "failure",
+        );
+    }
+
+    #[test]
+    fn detached_predecessor_valid_migration_consumes_payload_once() {
+        if std::env::var_os(PREDECESSOR_MIGRATION_CHILD_ENV).is_some() {
+            assert_eq!(
+                std::env::var(PREDECESSOR_MIGRATION_SCENARIO_ENV).as_deref(),
+                Ok("success")
+            );
+            let base = PathBuf::from(std::env::var_os(PREDECESSOR_MIGRATION_BASE_ENV).unwrap());
+            let (descriptor, records, inbox, effect_count) =
+                run_predecessor_migration_success(&base);
+            let matching_rows: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal"
+                        && record.result["payload"]["id"] == json!("must-survive")
+                })
+                .collect();
+            assert_eq!(descriptor.status, "completed");
+            assert_eq!(matching_rows.len(), 1, "migrated payload is consumed once");
+            assert_eq!(
+                serde_json::from_slice::<Vec<Value>>(&inbox).unwrap(),
+                Vec::<Value>::new()
+            );
+            assert_eq!(effect_count, 1, "migrated effect executes once");
+            return;
+        }
+        run_migration_child_for_backend(
+            "runtime::host_agent::tests::detached_predecessor_valid_migration_consumes_payload_once",
+            "success",
+        );
     }
 
     #[test]
