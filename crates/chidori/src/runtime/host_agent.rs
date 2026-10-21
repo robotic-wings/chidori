@@ -220,27 +220,6 @@ fn stop_request_matches_run(
     Ok(true)
 }
 
-fn another_process_holds_live_run_lease(store: &dyn RunStore) -> Result<bool, String> {
-    let Some(bytes) = store
-        .get_blob(crate::runtime::store::LEASE_FILE)
-        .map_err(|err| format!("reading detached-agent lease: {err:#}"))?
-    else {
-        return Ok(false);
-    };
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|err| format!("parsing detached-agent lease: {err}"))?;
-    let owner = value["owner"]
-        .as_str()
-        .ok_or_else(|| "detached-agent lease has no owner".to_string())?;
-    let expires_at = value["expires_at"]
-        .as_str()
-        .or_else(|| value["expiresAt"].as_str())
-        .ok_or_else(|| "detached-agent lease has no expiry".to_string())?
-        .parse::<chrono::DateTime<Utc>>()
-        .map_err(|err| format!("parsing detached-agent lease expiry: {err}"))?;
-    Ok(owner != process_lease_owner() && expires_at > Utc::now())
-}
-
 fn stop_agent_call_args(to: &str, run_id: Option<&str>) -> Value {
     match run_id {
         Some(run_id) => json!({ "to": to, "runId": run_id }),
@@ -1061,27 +1040,20 @@ impl DetachedAgentHub {
             let matches_run = entry.state.lock().unwrap().descriptor.run_id == run_id;
             if matches_run {
                 let store = entry.factory().store_for(run_id);
-                persist_stop_request(store.as_ref(), run_id)?;
                 let mut state = entry.state.lock().unwrap();
                 if AgentEntry::is_settled(&state) {
                     return Ok(state.descriptor.status_json());
                 }
+                persist_stop_request(store.as_ref(), run_id)?;
                 let local_execution = state.execution_active;
-                let remote_execution =
-                    !local_execution && another_process_holds_live_run_lease(store.as_ref())?;
-                if !local_execution && !remote_execution {
-                    drop(state);
-                    // Preserve same-hub behavior when this run is truly
-                    // hibernating with no other process holding its lease.
-                    return self.stop_entry(parts, name, entry);
-                }
                 state.stop_requested = true;
                 entry.signal.notify_all();
                 let mut response = state.descriptor.status_json();
-                if remote_execution {
-                    // A cached handle can outlive this process's supervisor.
-                    // Persist the request, but do not make its stale local
-                    // descriptor claim that another process has settled it.
+                if !local_execution {
+                    // This cache may be stale even when a lease snapshot looks
+                    // absent or expired: filesystem leases are advisory, and
+                    // another process may still be executing. Persist the
+                    // request without settling its descriptor locally.
                     response["stopRequested"] = json!(true);
                 }
                 drop(state);

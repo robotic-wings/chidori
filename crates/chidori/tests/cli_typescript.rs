@@ -4667,7 +4667,7 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
         let db = project.join("shared.sqlite3");
         let worker_x = project.join("old-worker.ts");
         let start_x = project.join("spawn-old.ts");
-        let stop_x = project.join("stop-old-handle.ts");
+        let stop_x = project.join("stop-old-name.ts");
         let worker_y = project.join("replacement-worker.ts");
         let idle_worker = project.join("idle-worker.ts");
         let rearm_worker = project.join("hibernating-rearm-worker.ts");
@@ -4781,21 +4781,18 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
             format!(
                 r#"import {{ chidori, run }} from "chidori:agent";
                    run(async () => {{
-                     const old = await chidori.agents.lookup("{}");
-                     if (!old) throw new Error("missing predecessor handle");
-                     const stopped = await old.stop();
-                     return {{runId: old.runId, status: stopped.status}};
+                     const stopped = await chidori.agents.stop("{}");
+                     return {{runId: stopped.runId, status: stopped.status}};
                    }});"#,
                 NAME
             ),
         )
         .unwrap();
-        let stop_old_body =
-            serde_json::json!({"agent":"stop-old-handle.ts","input":{}}).to_string();
+        let stop_old_body = serde_json::json!({"agent":"stop-old-name.ts","input":{}}).to_string();
         let stop_old = serve_http_request(port_a, "POST", "/sessions", Some(&stop_old_body));
         assert!(
             [200, 201].contains(&stop_old.status),
-            "same-hub predecessor handle stop: {:?}",
+            "same-hub predecessor name stop: {:?}",
             stop_old.body
         );
         let predecessor = detached_registry_entry(&project, NAME);
@@ -5024,6 +5021,35 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
             );
             gate.wait_until_held();
 
+            let registry_path = project
+                .join(".chidori/runs/agents")
+                .join(format!("{name}.json"));
+            let agent_path = project
+                .join(".chidori/runs")
+                .join(&held_run_id)
+                .join("agent.json");
+            let registry_before_stop = fs::read(&registry_path).unwrap();
+            let agent_before_stop = fs::read(&agent_path).unwrap();
+            if backend == "sqlite" {
+                let connection = rusqlite::Connection::open(&db).expect("open SQLite run store");
+                let lease_bytes: Vec<u8> = connection
+                    .query_row(
+                        "SELECT data FROM run_blobs WHERE run_id = ?1 AND key = 'lease.json'",
+                        [&held_run_id],
+                        |row| row.get(0),
+                    )
+                    .expect("active SQLite lease exists while B is held");
+                let lease: serde_json::Value =
+                    serde_json::from_slice(&lease_bytes).expect("parse active SQLite lease");
+                let owner = lease["owner"].as_str().expect("lease owner");
+                let expires_at = chrono::DateTime::parse_from_rfc3339(
+                    lease["expires_at"].as_str().expect("lease expiry"),
+                )
+                .expect("parse SQLite lease expiry");
+                assert!(!owner.is_empty());
+                assert!(expires_at > chrono::Utc::now());
+            }
+
             let stop_response = if stop_via_handle {
                 let handle_script = project.join("stop-cached-handle.ts");
                 fs::write(
@@ -5065,6 +5091,16 @@ fn cli_detached_stop_by_name_targets_current_cross_process_incarnation() {
                     && stop_response.body.to_string().contains("true"),
                 "remote cached stop must report stopRequested: {:?}",
                 stop_response.body
+            );
+            let registry_after_stop = fs::read(&registry_path).unwrap();
+            let agent_after_stop = fs::read(&agent_path).unwrap();
+            assert_eq!(
+                registry_after_stop, registry_before_stop,
+                "stop response must not rewrite registry descriptor for {name}"
+            );
+            assert_eq!(
+                agent_after_stop, agent_before_stop,
+                "stop response must not rewrite run descriptor for {name}"
             );
             gate.release();
 
