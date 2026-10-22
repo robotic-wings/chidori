@@ -955,7 +955,7 @@ enum CheckpointAction {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = on_js_stack(Cli::parse);
 
     // The isolate worker speaks a binary frame protocol over stdout, so it must
     // short-circuit before any of the normal startup path can write there.
