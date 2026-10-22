@@ -1302,6 +1302,7 @@ fn notify_reporter(reporter: Option<&ServeReporter>, notice: ServeNotice) {
     }
 }
 
+#[allow(dead_code)] // Public compatibility wrapper; the CLI uses the reporter-aware entrypoint.
 pub async fn serve(
     providers: Arc<ProviderRegistry>,
     template_engine: Arc<TemplateEngine>,
