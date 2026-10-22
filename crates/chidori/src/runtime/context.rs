@@ -2315,7 +2315,7 @@ fn note_cap(inner: &mut RuntimeContextInner, cap: Capability) {
 /// `{ "base64": "..." }` for binary. This is the only host-disk-adjacent input
 /// to the VFS and it is read once, before agent code runs, so the seeded tree
 /// is identical on every (re)construction and therefore deterministic.
-fn vfs_from_seed_env() -> Vfs {
+pub(crate) fn vfs_from_seed_env() -> Vfs {
     let mut vfs = Vfs::new();
     let Ok(raw) = std::env::var("CHIDORI_VFS_SEED") else {
         return vfs;
