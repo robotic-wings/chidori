@@ -296,6 +296,10 @@ The VFS serializes with the snapshot. Because it is plain data
 (`BTreeMap<String, VfsNode>`), it serializes deterministically and restores
 identically. On resume:
 
+- Only a genuinely absent first-run snapshot manifest yields an empty VFS. If
+  an existing `runtime.snapshot.json` is unreadable or malformed, resume fails
+  before delivering work or advancing durable state.
+
 - A read of a file present in the VFS is **pure-in-VM** → inline, flagged
   `FsRead`, not call-logged (the bytes are already in restored state).
 - A write mutates VFS state and is flagged `FsWrite`. Writes are **not** host
