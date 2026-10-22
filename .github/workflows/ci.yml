@@ -21,6 +21,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Direct SQLite effect intent barrier
+        run: |
+          python3 --version
+          cargo test --locked -p chidori --test effect_sqlite_production_serve effect_direct_sqlite_intent_barrier_on_production_serve -- --exact
+
       - name: Test workspace
         run: cargo test --workspace
 
