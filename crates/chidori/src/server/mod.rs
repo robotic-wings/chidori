@@ -1363,6 +1363,9 @@ pub(crate) async fn serve_with_cli_reporter(
              this server already controls access."
         );
     }
+    if let Some(manifest) = &app_manifest {
+        manifest.validate()?;
+    }
     let addr = format!("{host}:{port}");
     // Reserve the requested socket before any recovery path can resume agent
     // work or cause detached effects. The unsafe-bind preflight above remains
