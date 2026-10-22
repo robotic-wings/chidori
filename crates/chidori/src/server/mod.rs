@@ -1096,10 +1096,12 @@ fn load_persisted_vfs(
         return Ok(crate::runtime::vfs::Vfs::new());
     };
     crate::runtime::store::RunStoreFactory::shared(run_base).hydrate(run_id)?;
-    match crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id)).load_manifest() {
-        Ok(manifest) => Ok(manifest.vfs),
-        Err(_) => Ok(crate::runtime::vfs::Vfs::new()),
-    }
+    Ok(
+        crate::runtime::snapshot::SnapshotStore::new(run_base.join(run_id))
+            .load_manifest_if_present()?
+            .map(|manifest| manifest.vfs)
+            .unwrap_or_else(crate::runtime::vfs::Vfs::new),
+    )
 }
 
 /// Load a run's durable signal mailbox (`signals/inbox.json`) so a resumed run

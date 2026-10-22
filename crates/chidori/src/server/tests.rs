@@ -5191,6 +5191,105 @@ async fn stream_session_resolves_signal_pause_in_process() {
     let _ = std::fs::remove_dir_all(dir_b);
 }
 
+/// A live signal can already be durably acknowledged when its worker wakes.
+/// If the persisted VFS has become unreadable in that interval, the worker
+/// must leave that exact delivery and all paused-run artifacts for a repaired
+/// manifest to retry; it must not resolve the pending signal first.
+#[tokio::test]
+async fn stream_signal_resume_preserves_delivery_when_persisted_vfs_is_corrupt() {
+    use crate::runtime::store::RunStore as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let agent_path = write_agent(
+        temp.path(),
+        r#"
+            export async function agent(input, chidori) {
+                const review = await chidori.signal("review");
+                return review.payload;
+            }
+        "#,
+    );
+    let state = signal_test_state(temp.path(), agent_path);
+    let sse = start_stream(&state, "live-corrupt-vfs", json!({})).await;
+    let paused = wait_for_status(&state, "live-corrupt-vfs", SessionStatus::Paused).await;
+    let run_id = paused.run_id.clone().expect("paused stream has a run id");
+    let run_dir = state.run_base.join(&run_id);
+    let store = crate::runtime::store::FsRunStore::new(run_dir.clone());
+    let session_before = serde_json::to_vec(&paused).unwrap();
+    let journal_before = serde_json::to_vec(&store.load_call_log().unwrap()).unwrap();
+    let pending_before = store
+        .get_blob(PENDING_HOST_OPERATION_FILE)
+        .unwrap()
+        .expect("paused signal has pending operation");
+
+    let (ctx_slot, signal_tx) = {
+        let active = state.active_sessions.lock().unwrap();
+        let live = active
+            .get("live-corrupt-vfs")
+            .and_then(|active| active.signals.as_ref())
+            .expect("paused stream has live signal routing");
+        (live.ctx_slot.clone(), live.signal_tx.clone())
+    };
+    let queued = ctx_slot
+        .lock()
+        .unwrap()
+        .enqueue_live_signal("review", json!({"id": "accepted"}), json!(null))
+        .expect("direct live delivery persists before worker wake");
+    let inbox_before = store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+
+    store
+        .put_blob(SNAPSHOT_MANIFEST_FILE, b"{corrupt persisted VFS manifest")
+        .unwrap();
+    assert!(SnapshotStore::new(&run_dir).load_manifest().is_err());
+
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    super::sessions::stream::observe_signal_resume_dispatch(&run_id, observed_tx, release_rx);
+    signal_tx
+        .send((queued.delivery_seq, queued.name.clone()))
+        .expect("live supervisor is available");
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(2), observed_rx)
+        .await
+        .expect("supervisor attempted the queued signal")
+        .expect("supervisor observation delivered");
+
+    assert!(!observed.handled, "corrupt VFS must defer live resume");
+    assert!(
+        observed.remains_supervised,
+        "corrupt VFS must preserve live retry supervision: {observed:?}"
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            &state
+                .session_store
+                .get("live-corrupt-vfs")
+                .unwrap()
+                .expect("paused session remains stored"),
+        )
+        .unwrap(),
+        session_before,
+        "session must remain at the signal pause"
+    );
+    assert_eq!(
+        serde_json::to_vec(&store.load_call_log().unwrap()).unwrap(),
+        journal_before
+    );
+    assert_eq!(
+        store.get_blob(PENDING_HOST_OPERATION_FILE).unwrap(),
+        Some(pending_before)
+    );
+    assert_eq!(store.get_blob(SIGNAL_INBOX_FILE).unwrap(), inbox_before);
+    assert_eq!(
+        ctx_slot.lock().unwrap().signal_inbox(),
+        observed.memory_inbox
+    );
+    assert_eq!(observed.durable_inbox.len(), 1);
+    assert_eq!(observed.durable_inbox[0].delivery_seq, queued.delivery_seq);
+
+    let _ = release_tx.send(());
+    sse.abort();
+}
+
 /// A process cut after the completed host-promise write but before durable
 /// inbox retirement must recover the first consumption exactly once. The
 /// child uses the live signal route for the acknowledgment, pauses the real

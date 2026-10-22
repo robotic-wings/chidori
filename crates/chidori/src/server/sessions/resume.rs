@@ -89,6 +89,19 @@ pub(in crate::server) async fn complete_pending_and_resume(
     original: StoredSession,
     call_log: Vec<CallRecord>,
 ) -> Response {
+    // Validate the replay snapshot before reconciling a signal-consumption
+    // intent, which can resolve a promise, remove an inbox entry, or append
+    // its journal record.
+    let vfs = match load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
+    };
     if let Some(run_id) = original.run_id.as_deref() {
         // Validate before intent reconciliation can resolve promises, remove
         // an inbox entry, or append its journal record.
@@ -143,16 +156,6 @@ pub(in crate::server) async fn complete_pending_and_resume(
             }
         };
     let approvals = original.approvals.clone();
-    let vfs = match load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
-        Ok(vfs) => vfs,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
-            )
-                .into_response();
-        }
-    };
     let resume_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
@@ -364,6 +367,17 @@ pub(in crate::server) async fn resume_session(
             .into_response();
     }
 
+    // A parked VM can write its pending completion as soon as it accepts the
+    // response. Read the persisted VFS before handing it that response so a
+    // corrupt existing snapshot cannot advance the run through the warm path.
+    if let Err(error) = load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+        )
+            .into_response();
+    }
+
     // Warm fast path: this session's VM is parked on its thread awaiting
     // exactly this response — deliver it and await the leg's next outcome
     // (the next pause or the terminal result). The parked engine records the
@@ -571,6 +585,13 @@ pub(in crate::server) async fn signal_session(
         .get(&id)
         .and_then(|active| active.signals.clone());
     if let Some(live) = live {
+        if let Err(error) = load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
         let queued = {
             let ctx = live.ctx_slot.lock().unwrap();
             ctx.enqueue_live_signal(&body.name, body.payload.clone(), body.from.clone())
@@ -655,6 +676,14 @@ pub(in crate::server) async fn signal_session(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("loading signal inbox: {error:#}")})),
+            )
+                .into_response();
+        }
+
+        if let Err(error) = load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
             )
                 .into_response();
         }
@@ -858,6 +887,16 @@ pub(in crate::server) async fn approve_session(
     } else {
         None
     };
+
+    if body.decision == "allow" {
+        if let Err(error) = load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("loading replay snapshot: {error:#}")})),
+            )
+                .into_response();
+        }
+    }
 
     if let Err(err) = validate_snapshot_manifest_for_resume(
         &state.run_base,
