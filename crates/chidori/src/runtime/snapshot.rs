@@ -1778,12 +1778,20 @@ impl SnapshotStore {
 
     pub fn load_manifest(&self) -> Result<SnapshotManifest> {
         let manifest_path = self.run_dir.join(SNAPSHOT_MANIFEST_FILE);
-        let bytes = self
-            .store
-            .get_blob(SNAPSHOT_MANIFEST_FILE)?
-            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", manifest_path.display()))?;
+        self.load_manifest_if_present()?
+            .ok_or_else(|| anyhow::anyhow!("reading {}: not found", manifest_path.display()))
+    }
+
+    /// Load a persisted manifest while distinguishing a genuinely absent
+    /// first-run manifest from an unreadable or malformed one.
+    pub(crate) fn load_manifest_if_present(&self) -> Result<Option<SnapshotManifest>> {
+        let manifest_path = self.run_dir.join(SNAPSHOT_MANIFEST_FILE);
+        let Some(bytes) = self.store.get_blob(SNAPSHOT_MANIFEST_FILE)? else {
+            return Ok(None);
+        };
         serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", manifest_path.display()))
+            .map(Some)
     }
 
     pub fn load_for_resume(
