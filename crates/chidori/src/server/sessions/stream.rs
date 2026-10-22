@@ -679,6 +679,13 @@ async fn resume_signal_pause_in_process(
         tracing::error!(run_id = %run_id, %error, "in-process signal resume could not read inbox; preserving pause for retry");
         return SignalResumeOutcome::Retry;
     }
+    let vfs = match load_persisted_vfs(&state.run_base, session.run_id.as_deref()) {
+        Ok(vfs) => vfs,
+        Err(error) => {
+            tracing::error!(run_id = %run_id, %error, "in-process signal resume could not load replay snapshot; preserving pause for retry");
+            return SignalResumeOutcome::Retry;
+        }
+    };
     let resolution = if let Some(candidate) = signal_to_consume.as_ref() {
         if let Err(error) = super::super::persist_signal_consumption_intent(
             &state.run_base,
@@ -774,14 +781,6 @@ async fn resume_signal_pause_in_process(
                 return SignalResumeOutcome::Started;
             }
         };
-    let vfs = match load_persisted_vfs(&state.run_base, session.run_id.as_deref()) {
-        Ok(vfs) => vfs,
-        Err(error) => {
-            let _ = result_tx.send(Err(error.context("loading replay snapshot")));
-            return SignalResumeOutcome::Started;
-        }
-    };
-
     // Swap the resumed run's context into the live slot while holding it: the
     // delivery endpoint enqueues into whatever context the slot currently
     // names, so carrying the old context's in-memory mailbox into the new one
