@@ -12,29 +12,6 @@ use axum::body;
 use axum::extract::{Path, State};
 use std::sync::atomic::Ordering;
 
-struct EnvVarRestore {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarRestore {
-    fn set(name: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(name);
-        std::env::set_var(name, value);
-        Self { name, previous }
-    }
-}
-
-impl Drop for EnvVarRestore {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            std::env::set_var(self.name, previous);
-        } else {
-            std::env::remove_var(self.name);
-        }
-    }
-}
-
 /// A failed session's `error` must carry stack frames in ORIGINAL
 /// TypeScript coordinates for every frame, not just the throwing one —
 /// the engine hands the server transpiled-bundle positions, and the
@@ -301,7 +278,7 @@ async fn serve_bind_rearm_child(case: &str) {
     std::fs::create_dir_all(&root).unwrap();
     std::env::set_var("CHIDORI_RUN_STORE", "fs");
     std::env::remove_var("CHIDORI_RUN_DB");
-    let _allow_hosts = EnvVarRestore::set("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+    std::env::set_var("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
     std::env::remove_var("CHIDORI_API_KEY");
     std::env::remove_var("CHIDORI_ALLOW_UNAUTHENTICATED");
 
@@ -2529,11 +2506,13 @@ fn resume_consumes_valid_signal_inbox_normally() {
 /// before it can consume the pending input, dispatch an effect, or rewrite the
 /// paused session.  The current implementation incorrectly treats every load
 /// error as a missing manifest and constructs an empty VFS instead.
+const PERSISTED_VFS_RESUME_CHILD: &str = "CHIDORI_TEST_PERSISTED_VFS_RESUME_CHILD";
+
 #[tokio::test]
-async fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_advance() {
-    // The loopback effect is the observable resumed side effect. This focused
-    // test runs it only after the paused snapshot was created.
-    std::env::set_var("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+async fn malformed_persisted_vfs_resume_child() {
+    if std::env::var_os(PERSISTED_VFS_RESUME_CHILD).is_none() {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2656,6 +2635,26 @@ async fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_a
         failures.is_empty(),
         "malformed persisted VFS did not fail closed: {}",
         failures.join("; ")
+    );
+}
+
+#[test]
+fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_advance() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server::tests::malformed_persisted_vfs_resume_child",
+            "--nocapture",
+        ])
+        .env(PERSISTED_VFS_RESUME_CHILD, "1")
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "malformed persisted VFS child failed closed check:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
