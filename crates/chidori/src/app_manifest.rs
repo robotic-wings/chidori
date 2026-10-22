@@ -197,6 +197,7 @@ impl AppManifest {
             }
         }
         let mut seen_paths = std::collections::HashSet::new();
+        let mut route_patterns = matchit::Router::new();
         for route in &self.routes {
             if !route.path.starts_with('/') {
                 anyhow::bail!(
@@ -230,6 +231,37 @@ impl AppManifest {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+            }
+            if let Some(segment) = route
+                .path
+                .split('/')
+                .find(|segment| segment.starts_with(':'))
+            {
+                anyhow::bail!(
+                    "app manifest: invalid route `{}`: Axum path segments must not start with `:`; use `{{capture}}` for a capture segment (found `{segment}`)",
+                    route.path
+                );
+            }
+            if let Some(segment) = route
+                .path
+                .split('/')
+                .find(|segment| segment.starts_with('*'))
+            {
+                anyhow::bail!(
+                    "app manifest: invalid route `{}`: Axum path segments must not start with `*`; use `{{*wildcard}}` for a catch-all segment (found `{segment}`)",
+                    route.path
+                );
+            }
+            match route_patterns.insert(route.path.as_str(), ()) {
+                Ok(()) => {}
+                Err(matchit::InsertError::Conflict { with }) => anyhow::bail!(
+                    "app manifest: route pattern conflict between `{with}` and `{}`",
+                    route.path
+                ),
+                Err(error) => anyhow::bail!(
+                    "app manifest: invalid route pattern `{}`: {error}",
+                    route.path
+                ),
             }
             // A route usually targets a manifest-managed agent; targeting a
             // name spawned by other means is legal, so an unknown name is a
@@ -436,6 +468,10 @@ routes:
             "route diagnostic should identify an overlap/conflict: {diagnostic}"
         );
         assert!(
+            normalized.contains("app manifest") && normalized.contains("route"),
+            "route diagnostic should include app-manifest route context: {diagnostic}"
+        );
+        assert!(
             diagnostic.contains("/hooks/{id}") && diagnostic.contains("/hooks/{event}"),
             "route conflict diagnostic should identify both paths: {diagnostic}"
         );
@@ -452,6 +488,61 @@ routes:
 
         let manifest = AppManifest::load(&path).unwrap();
         assert_eq!(manifest.routes.len(), 2);
+    }
+
+    #[test]
+    fn route_patterns_follow_matchit_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        for routes in [
+            vec!["/{first}/foo", "/{second}/bar"],
+            vec!["/src/{*filepath}", "/src/static.json"],
+            vec!["/foo", "/foo/"],
+        ] {
+            let routes = routes
+                .into_iter()
+                .map(|path| format!("  - path: {path}\n    agent: worker\n    signal: event\n"))
+                .collect::<String>();
+            let path = write_manifest(
+                dir.path(),
+                "chidori.app.yml",
+                &format!("agents: []\nroutes:\n{routes}"),
+            );
+            let manifest = AppManifest::load(&path).unwrap();
+            assert_eq!(manifest.routes.len(), 2);
+        }
+    }
+
+    #[test]
+    fn malformed_axum_route_patterns_are_rejected_with_route_context() {
+        let dir = tempfile::tempdir().unwrap();
+        for (route, expected) in [
+            ("/src/{*filepath}/tail", "invalid route pattern"),
+            ("/hooks/{}", "invalid route pattern"),
+            ("/hooks/:id", "must not start with `:`"),
+            ("/hooks/*path", "must not start with `*`"),
+        ] {
+            let path = write_manifest(
+                dir.path(),
+                "chidori.app.yml",
+                &format!(
+                    "agents: []\nroutes:\n  - path: {route}\n    agent: worker\n    signal: event\n"
+                ),
+            );
+            let error = AppManifest::load(&path).unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("app manifest: invalid route"),
+                "missing app-manifest route context: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(route),
+                "missing invalid route path: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(expected),
+                "expected `{expected}` in: {diagnostic}"
+            );
+        }
     }
 
     #[test]

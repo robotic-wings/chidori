@@ -403,6 +403,7 @@ dependencies = [
  "hmac",
  "landlock",
  "libc",
+ "matchit",
  "minijinja",
  "nodejs-semver",
  "opentelemetry",
