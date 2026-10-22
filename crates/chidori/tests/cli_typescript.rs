@@ -5701,3 +5701,283 @@ fn cli_branch_rerun_rejects_invalid_sqlite_before_branch_effect_or_mutation() {
         1,
     );
 }
+
+struct VfsSeedServeProcess(DetachedServeProcess);
+
+impl VfsSeedServeProcess {
+    fn start(
+        project: &Path,
+        app_manifest: &Path,
+        port: u16,
+        backend: &str,
+        db: &Path,
+        seed: &str,
+    ) -> Self {
+        let mut command = Command::new(chidori_bin());
+        let log = project.join(format!("vfs-seed-serve-{port}.log"));
+        let stderr = fs::File::create(&log).expect("create VFS seed serve log");
+        command
+            .args([
+                "serve",
+                "--app",
+                app_manifest.to_str().expect("UTF-8 app manifest path"),
+                "--port",
+                &port.to_string(),
+                "--no-isolate",
+                "--trusted",
+            ])
+            .current_dir(project)
+            .env("CHIDORI_ISOLATE", "off")
+            .env("CHIDORI_POLICY_PROFILE", "trusted")
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_VFS_SEED", seed)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr));
+        if backend == "sqlite" {
+            command.env("CHIDORI_RUN_DB", db);
+        } else {
+            command.env_remove("CHIDORI_RUN_DB");
+        }
+        Self(DetachedServeProcess {
+            child: command.spawn().expect("start VFS seed serve process"),
+            log,
+        })
+    }
+
+    fn wait_ready(&mut self, port: u16) {
+        self.0.wait_ready(port);
+    }
+}
+
+fn wait_detached_http_status(port: u16, name: &str, expected: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let response = serve_http_request(port, "GET", &format!("/agents/detached/{name}"), None);
+        let last = response.body;
+        if response.status == 200 && last["status"] == expected {
+            return last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached agent {name} did not reach {expected}; last status={last}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn detached_snapshot_vfs_text(project: &Path, run_id: &str, path: &str) -> Option<String> {
+    let manifest_path = project
+        .join(".chidori/runs")
+        .join(run_id)
+        .join(chidori::runtime::snapshot::SNAPSHOT_MANIFEST_FILE);
+    let bytes = fs::read(&manifest_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display()));
+    let manifest: chidori::runtime::snapshot::SnapshotManifest = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", manifest_path.display()));
+    manifest.vfs.read_text(path).ok()
+}
+
+fn assert_detached_seed_test_opted_in() {
+    assert_eq!(
+        std::env::var("CHIDORI_TEST_DETACHED_VFS_SEED_SERVE").as_deref(),
+        Ok("1"),
+        "loopback/subprocess test requires CHIDORI_TEST_DETACHED_VFS_SEED_SERVE=1"
+    );
+}
+
+fn send_detached_seed_signal(port: u16, agent: &str, name: &str) -> serde_json::Value {
+    let body = serde_json::json!({ "name": name, "payload": {} }).to_string();
+    let response = serve_http_request(
+        port,
+        "POST",
+        &format!("/agents/detached/{agent}/send"),
+        Some(&body),
+    );
+    assert_eq!(
+        response.status, 200,
+        "detached send response: {}",
+        response.body
+    );
+    response.body
+}
+
+#[test]
+#[ignore = "loopback serve integration; run with CHIDORI_TEST_DETACHED_VFS_SEED_SERVE=1 and --ignored"]
+fn cli_serve_fresh_detached_worker_receives_vfs_seed() {
+    assert_detached_seed_test_opted_in();
+
+    const AGENT: &str = "vfs-seed-fresh";
+    const VFS_PATH: &str = "/seed/decision.txt";
+    const SEEDED_VALUE: &str = "fresh-detached-seed-value";
+    let mut failures = Vec::new();
+
+    for backend in ["fs", "sqlite"] {
+        let project = tempfile::tempdir().expect("create isolated serve project");
+        let project_path = project.path();
+        let app_manifest = project_path.join("chidori.app.yml");
+        let agent_path = project_path.join("vfs-seed-agent.ts");
+        let db = project_path.join("runs.sqlite3");
+        fs::write(
+            &app_manifest,
+            format!(
+                "name: vfs-seed-red\nagents:\n  - name: {AGENT}\n    agent: vfs-seed-agent.ts\n    keep_alive: true\n    restart: never\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &agent_path,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   import fs from "node:fs/promises";
+                   run(async () => {{
+                     const value = await fs.readFile("{VFS_PATH}", "utf8").catch(() => "missing");
+                     await chidori.signal("observe-seed");
+                     return {{ value }};
+                   }});"#
+            ),
+        )
+        .unwrap();
+        let seed = serde_json::json!({ (VFS_PATH): SEEDED_VALUE }).to_string();
+        let port = DetachedServeProcess::port();
+        let mut server =
+            VfsSeedServeProcess::start(project_path, &app_manifest, port, backend, &db, &seed);
+        server.wait_ready(port);
+
+        let hibernating = wait_detached_http_status(port, AGENT, "hibernating");
+        let run_id = hibernating["runId"]
+            .as_str()
+            .expect("hibernating agent status has runId")
+            .to_string();
+        let snapshotted = detached_snapshot_vfs_text(project_path, &run_id, VFS_PATH);
+        let send = send_detached_seed_signal(port, AGENT, "observe-seed");
+        assert_eq!(send["delivered"], true, "seed observation signal accepted");
+        let completed = wait_detached_http_status(port, AGENT, "completed");
+
+        if snapshotted.as_deref() != Some(SEEDED_VALUE) {
+            failures.push(format!(
+                "{backend}: fresh detached snapshot VFS value was {snapshotted:?}, expected {SEEDED_VALUE:?}"
+            ));
+        }
+        if completed["output"]["value"].as_str() != Some(SEEDED_VALUE) {
+            failures.push(format!(
+                "{backend}: fresh detached VFS-derived output was {:?}, expected {SEEDED_VALUE:?}; status={completed}",
+                completed["output"]["value"]
+            ));
+        }
+        drop(server);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "fresh detached CHIDORI_VFS_SEED failures: {failures:#?}"
+    );
+}
+
+#[test]
+#[ignore = "loopback serve integration; run with CHIDORI_TEST_DETACHED_VFS_SEED_SERVE=1 and --ignored"]
+fn cli_serve_resumed_detached_worker_uses_snapshot_over_changed_vfs_seed() {
+    assert_detached_seed_test_opted_in();
+
+    const AGENT: &str = "vfs-seed-resume";
+    const VFS_PATH: &str = "/seed/decision.txt";
+    const SNAPSHOT_VALUE: &str = "snapshot-control-value";
+    const CHANGED_SEED: &str = "changed-environment-seed";
+    let mut failures = Vec::new();
+
+    for backend in ["fs", "sqlite"] {
+        let project = tempfile::tempdir().expect("create isolated serve project");
+        let project_path = project.path();
+        let app_manifest = project_path.join("chidori.app.yml");
+        let agent_path = project_path.join("vfs-resume-agent.ts");
+        let db = project_path.join("runs.sqlite3");
+        fs::write(
+            &app_manifest,
+            format!(
+                "name: vfs-seed-resume-control\nagents:\n  - name: {AGENT}\n    agent: vfs-resume-agent.ts\n    keep_alive: true\n    restart: resume\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &agent_path,
+            format!(
+                r#"import {{ chidori, run }} from "chidori:agent";
+                   import fs from "node:fs/promises";
+                   run(async () => {{
+                     await chidori.signal("prepare-snapshot");
+                     await fs.mkdir("/seed", {{ recursive: true }});
+                     let saved = await fs.readFile("{VFS_PATH}", "utf8").catch(() => null);
+                     if (saved === null) {{
+                       await fs.writeFile("{VFS_PATH}", "{SNAPSHOT_VALUE}");
+                       saved = "{SNAPSHOT_VALUE}";
+                     }}
+                     await chidori.signal("finish-resume");
+                     return {{ value: await fs.readFile("{VFS_PATH}", "utf8"), saved }};
+                   }});"#
+            ),
+        )
+        .unwrap();
+
+        let original_seed =
+            serde_json::json!({ (VFS_PATH): "original-environment-seed" }).to_string();
+        let port = DetachedServeProcess::port();
+        let mut server = VfsSeedServeProcess::start(
+            project_path,
+            &app_manifest,
+            port,
+            backend,
+            &db,
+            &original_seed,
+        );
+        server.wait_ready(port);
+        let first_hibernating = wait_detached_http_status(port, AGENT, "hibernating");
+        let run_id = first_hibernating["runId"]
+            .as_str()
+            .expect("agent status has runId")
+            .to_string();
+        send_detached_seed_signal(port, AGENT, "prepare-snapshot");
+        let second_hibernating = wait_detached_http_status(port, AGENT, "hibernating");
+        assert_eq!(second_hibernating["runId"], run_id);
+        let persisted_value = detached_snapshot_vfs_text(project_path, &run_id, VFS_PATH)
+            .expect("control has a valid VFS snapshot value before restart");
+        drop(server);
+
+        let changed_seed = serde_json::json!({ (VFS_PATH): CHANGED_SEED }).to_string();
+        let resumed_port = DetachedServeProcess::port();
+        let mut resumed_server = VfsSeedServeProcess::start(
+            project_path,
+            &app_manifest,
+            resumed_port,
+            backend,
+            &db,
+            &changed_seed,
+        );
+        resumed_server.wait_ready(resumed_port);
+        let rearmed = wait_detached_http_status(resumed_port, AGENT, "hibernating");
+        assert_eq!(rearmed["runId"], run_id, "serve restart resumes same run");
+        send_detached_seed_signal(resumed_port, AGENT, "finish-resume");
+        let completed = wait_detached_http_status(resumed_port, AGENT, "completed");
+
+        if persisted_value == CHANGED_SEED {
+            failures.push(format!(
+                "{backend}: control setup unexpectedly persisted changed seed {CHANGED_SEED:?}"
+            ));
+        }
+        if completed["output"]["value"].as_str() != Some(persisted_value.as_str()) {
+            failures.push(format!(
+                "{backend}: resumed output {:?} did not match pre-restart snapshot value {persisted_value:?}; status={completed}",
+                completed["output"]["value"]
+            ));
+        }
+        if completed["output"]["value"].as_str() == Some(CHANGED_SEED) {
+            failures.push(format!(
+                "{backend}: resumed run incorrectly applied changed CHIDORI_VFS_SEED"
+            ));
+        }
+        drop(resumed_server);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "changed-seed snapshot authority control failures: {failures:#?}"
+    );
+}
