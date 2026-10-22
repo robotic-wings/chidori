@@ -9411,6 +9411,474 @@ mod tests {
         );
     }
 
+    const DETACHED_VFS_MANIFEST_CHILD: &str = "CHIDORI_TEST_DETACHED_VFS_MANIFEST_CHILD";
+    const DETACHED_VFS_MANIFEST_BASE: &str = "CHIDORI_TEST_DETACHED_VFS_MANIFEST_BASE";
+    const DETACHED_VFS_PATH: &str = "/config/decision";
+    const DETACHED_VFS_SEED_VALUE: &str = "seeded-vfs-decision";
+    const DETACHED_VFS_FRESH_VALUE: &str = "fresh-run-vfs-decision";
+    const DETACHED_VFS_CORRUPT_BYTES: &[u8] = b"{malformed runtime snapshot manifest";
+
+    struct DetachedVfsManifestFixture {
+        parts: AgentRuntimeParts,
+        name: String,
+        run_id: String,
+        store: Arc<dyn RunStore>,
+        observations: Arc<StdMutex<Vec<Value>>>,
+    }
+
+    fn new_detached_vfs_manifest_fixture(
+        base: &Path,
+        case: &str,
+        waits_for_signal: bool,
+    ) -> DetachedVfsManifestFixture {
+        let project = base.join(case);
+        std::fs::create_dir_all(project.join("services")).unwrap();
+        let source = project.join("services/vfs-worker.ts");
+        let source_text = if waits_for_signal {
+            r#"import * as fs from "node:fs";
+            export async function agent() {
+                await chidori.signal("vfs-wake");
+                let value;
+                try { value = fs.readFileSync("/config/decision", "utf8"); }
+                catch (error) { value = `missing:${error.code || "unknown"}`; }
+                await chidori.tool("recordVfsValue", { value });
+                return { value };
+            }"#
+        } else {
+            r#"import * as fs from "node:fs";
+            export async function agent() {
+                fs.mkdirSync("/config", { recursive: true });
+                fs.writeFileSync("/config/decision", "fresh-run-vfs-decision");
+                let value;
+                try { value = fs.readFileSync("/config/decision", "utf8"); }
+                catch (error) { value = `missing:${error.code || "unknown"}`; }
+                await chidori.tool("recordVfsValue", { value });
+                return { value };
+            }"#
+        };
+        std::fs::write(&source, source_text).unwrap();
+
+        let run_base = project.join(".chidori/runs");
+        let observations = Arc::new(StdMutex::new(Vec::new()));
+        let observed = observations.clone();
+        let mut tools = ToolRegistry::new();
+        tools.register_native(
+            "recordVfsValue",
+            "records the value read from the snapshot-resident VFS",
+            Vec::new(),
+            move |args| {
+                observed.lock().unwrap().push(args.clone());
+                Ok(json!({ "recorded": true }))
+            },
+        );
+        let parts = sqlite_test_parts(&project, run_base.clone(), Arc::new(tools));
+        hub().install_parts(parts.clone());
+        let name = unique(&format!("{case}-vfs"));
+        let (snapshot_arrived_rx, snapshot_release_tx, context_published_rx, context_release_tx) =
+            if waits_for_signal {
+                let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+                let (snapshot_release_tx, snapshot_release_rx) = std::sync::mpsc::channel();
+                let (published_tx, published_rx) = std::sync::mpsc::channel();
+                let (context_release_tx, context_release_rx) = std::sync::mpsc::channel();
+                *INBOX_SNAPSHOT_GAP_BARRIERS
+                    .get_or_init(|| StdMutex::new(None))
+                    .lock()
+                    .unwrap() = Some(Arc::new(InboxSnapshotGapBarriers {
+                    agent_name: name.clone(),
+                    snapshot_arrived: arrived_tx,
+                    snapshot_release: StdMutex::new(snapshot_release_rx),
+                    context_published: published_tx,
+                    context_release: StdMutex::new(context_release_rx),
+                    snapshot_claimed: AtomicBool::new(false),
+                    context_claimed: AtomicBool::new(false),
+                }));
+                (
+                    Some(arrived_rx),
+                    Some(snapshot_release_tx),
+                    Some(published_rx),
+                    Some(context_release_tx),
+                )
+            } else {
+                (None, None, None, None)
+            };
+        let spawned = hub()
+            .spawn(
+                &parts,
+                source.to_str().unwrap(),
+                json!({}),
+                &SpawnOptions {
+                    name: Some(name.clone()),
+                    restart: "resume".to_string(),
+                    max_restarts: 0,
+                    backoff_ms: 0,
+                    model: None,
+                },
+                format!("{case}-owner"),
+            )
+            .unwrap();
+        let run_id = spawned["runId"].as_str().unwrap().to_string();
+        let store = RunStoreFactory::shared(&run_base).store_for(&run_id);
+        if waits_for_signal {
+            snapshot_arrived_rx
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("supervisor did not reach inbox snapshot barrier");
+            snapshot_release_tx.unwrap().send(()).unwrap();
+            context_published_rx
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("supervisor did not publish live context");
+            let entry = hub().ensure_entry(&parts, &name).unwrap();
+            let ctx = entry
+                .state
+                .lock()
+                .unwrap()
+                .live_ctx
+                .clone()
+                .expect("published detached context must be live");
+            ctx.vfs_mkdir("/config", true).unwrap();
+            ctx.vfs_write(
+                DETACHED_VFS_PATH,
+                DETACHED_VFS_SEED_VALUE.as_bytes().to_vec(),
+            )
+            .unwrap();
+            context_release_tx.unwrap().send(()).unwrap();
+            *INBOX_SNAPSHOT_GAP_BARRIERS
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = None;
+            let descriptor = wait_for_agent_descriptor(&parts, &name, |descriptor| {
+                descriptor.status == "hibernating"
+                    && descriptor
+                        .listen
+                        .as_ref()
+                        .is_some_and(|listen| listen.names == ["vfs-wake"])
+            });
+            assert_eq!(descriptor.run_id, run_id);
+        }
+        DetachedVfsManifestFixture {
+            parts,
+            name,
+            run_id,
+            store,
+            observations,
+        }
+    }
+
+    fn wait_for_detached_vfs_quiescence(
+        parts: &AgentRuntimeParts,
+        name: &str,
+    ) -> (AgentDescriptor, bool, bool) {
+        let entry = hub().ensure_entry(parts, name).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if !state.thread_live && !state.execution_active {
+                return (
+                    state.descriptor.clone(),
+                    state.thread_live,
+                    state.execution_active,
+                );
+            }
+            let now = std::time::Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for {} to leave execution: descriptor={:?}, thread_live={}, execution_active={}",
+                name,
+                state.descriptor,
+                state.thread_live,
+                state.execution_active,
+            );
+            let (next, _) = entry
+                .signal
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+        }
+    }
+
+    fn detached_vfs_manifest_corruption_child(
+        backend: &str,
+        test_name: &str,
+    ) -> Result<(), String> {
+        let base = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(DETACHED_VFS_MANIFEST_CHILD, "1")
+            .env(DETACHED_VFS_MANIFEST_BASE, base.path())
+            .env("CHIDORI_RUN_STORE", backend)
+            .env("CHIDORI_RUN_DB", base.path().join("runs.sqlite3"))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "detached VFS manifest child backend={backend} exited {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[test]
+    fn detached_wake_does_not_resume_with_empty_vfs_after_manifest_corruption() {
+        const TEST: &str = "runtime::host_agent::tests::detached_wake_does_not_resume_with_empty_vfs_after_manifest_corruption";
+        if std::env::var_os(DETACHED_VFS_MANIFEST_CHILD).is_none() {
+            let failures: Vec<_> = ["fs", "sqlite"]
+                .into_iter()
+                .filter_map(|backend| detached_vfs_manifest_corruption_child(backend, TEST).err())
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "detached VFS corruption Red results:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let base = PathBuf::from(std::env::var_os(DETACHED_VFS_MANIFEST_BASE).unwrap());
+        let fixture = new_detached_vfs_manifest_fixture(&base, "corrupt", true);
+        let manifest_path = fixture
+            .parts
+            .run_base
+            .join(&fixture.run_id)
+            .join("runtime.snapshot.json");
+        let valid_manifest_bytes = fixture
+            .store
+            .get_blob("runtime.snapshot.json")
+            .unwrap()
+            .expect("hibernating detached run must persist its snapshot manifest");
+        let valid_manifest: crate::runtime::snapshot::SnapshotManifest =
+            serde_json::from_slice(&valid_manifest_bytes).unwrap();
+        assert_eq!(
+            valid_manifest.vfs.read_text(DETACHED_VFS_PATH).unwrap(),
+            DETACHED_VFS_SEED_VALUE,
+            "precondition: manifest must contain the unique seeded VFS file"
+        );
+        assert!(
+            manifest_path.is_file(),
+            "precondition: snapshot manifest is persisted at {}",
+            manifest_path.display()
+        );
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            valid_manifest_bytes,
+            "precondition: local snapshot manifest agrees with the configured store"
+        );
+
+        fixture
+            .store
+            .put_blob("runtime.snapshot.json", DETACHED_VFS_CORRUPT_BYTES)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .get_blob("runtime.snapshot.json")
+                .unwrap()
+                .as_deref(),
+            Some(DETACHED_VFS_CORRUPT_BYTES),
+            "test must corrupt only the snapshot manifest before wake"
+        );
+        let send = hub().send(
+            &fixture.parts,
+            &fixture.name,
+            "vfs-wake",
+            json!({ "delivery": "repair-me" }),
+            json!({ "from": "test" }),
+        );
+        assert_eq!(send.unwrap()["delivered"], json!(true));
+        let (descriptor, thread_live, execution_active) =
+            wait_for_detached_vfs_quiescence(&fixture.parts, &fixture.name);
+
+        let observations = fixture.observations.lock().unwrap().clone();
+        let records = fixture.store.load_call_log().unwrap().unwrap_or_default();
+        let inbox_bytes = fixture.store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+        let inbox: Vec<QueuedSignal> = inbox_bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()
+            .unwrap()
+            .unwrap_or_default();
+        let manifest_after = fixture.store.get_blob("runtime.snapshot.json").unwrap();
+        let signal_rows: Vec<_> = records
+            .iter()
+            .filter(|record| record.function == "signal" && record.args["name"] == "vfs-wake")
+            .collect();
+        let mut failures = Vec::new();
+        if !observations.is_empty() {
+            failures.push(format!(
+                "corrupt snapshot resumed user code using an empty VFS; native observations={observations:?}"
+            ));
+        }
+        if !signal_rows.is_empty() {
+            failures.push(format!(
+                "corrupt snapshot consumed the wake frontier before VFS recovery: {signal_rows:?}"
+            ));
+        }
+        if inbox.len() != 1
+            || inbox[0].name != "vfs-wake"
+            || inbox[0].payload != json!({ "delivery": "repair-me" })
+        {
+            failures.push(format!(
+                "corrupt snapshot did not preserve the pending wake for repair: {inbox:?}"
+            ));
+        }
+        if manifest_after.as_deref() != Some(DETACHED_VFS_CORRUPT_BYTES) {
+            failures.push(format!(
+                "corrupt manifest bytes changed during wake: {:?}",
+                manifest_after.as_deref().map(String::from_utf8_lossy)
+            ));
+        }
+        if descriptor.status == "completed" || descriptor.status == "failed" {
+            failures.push(format!(
+                "corrupt snapshot wake settled the agent before repair: {descriptor:?}"
+            ));
+        }
+        if thread_live || execution_active {
+            failures.push(format!(
+                "supervisor did not stand down on corrupt snapshot: thread_live={thread_live}, execution_active={execution_active}"
+            ));
+        }
+
+        // A fail-closed implementation can leave the durable wake queued. Repair
+        // the original manifest and re-drive that exact delivery to prove the
+        // run remains recoverable, without relying on a second acknowledged send.
+        if inbox.len() == 1 && !thread_live && !execution_active {
+            fixture
+                .store
+                .put_blob("runtime.snapshot.json", &valid_manifest_bytes)
+                .unwrap();
+            let rearmed = hub().rearm_from_registry(fixture.parts.clone());
+            if let Err(error) = rearmed {
+                failures.push(format!("re-drive after manifest repair failed: {error}"));
+            } else {
+                let repaired =
+                    wait_for_agent_descriptor(&fixture.parts, &fixture.name, |descriptor| {
+                        matches!(
+                            descriptor.status.as_str(),
+                            "completed" | "failed" | "stopped"
+                        )
+                    });
+                let repaired_observations = fixture.observations.lock().unwrap().clone();
+                let repaired_records = fixture.store.load_call_log().unwrap().unwrap_or_default();
+                let repaired_inbox = fixture.store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+                let recovered_signal_count = repaired_records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal" && record.args["name"] == "vfs-wake"
+                    })
+                    .count();
+                if repaired.status != "completed"
+                    || repaired_observations.len() != 1
+                    || repaired_observations[0]["value"] != DETACHED_VFS_SEED_VALUE
+                    || recovered_signal_count != 1
+                    || repaired_inbox.as_deref() != Some(b"[]".as_slice())
+                {
+                    failures.push(format!(
+                        "repaired wake did not restore the VFS and consume exactly once: descriptor={repaired:?}, observations={repaired_observations:?}, signal_count={recovered_signal_count}, inbox={repaired_inbox:?}"
+                    ));
+                }
+            }
+        }
+
+        hub().entries.lock().unwrap().remove(&fixture.name);
+        assert!(
+            failures.is_empty(),
+            "detached VFS manifest corruption contract failures for backend={} project={} run_id={}:\n{}\nobservations={observations:?}\ndescriptor={descriptor:?}\njournal={records:?}\ninbox={inbox:?}\nmanifest_path={} local_manifest={:?}",
+            std::env::var("CHIDORI_RUN_STORE").unwrap_or_else(|_| "fs".to_string()),
+            fixture.parts.run_base.parent().unwrap().display(),
+            fixture.run_id,
+            failures.join("\n"),
+            manifest_path.display(),
+            std::fs::read(&manifest_path)
+                .ok()
+                .as_deref()
+                .map(String::from_utf8_lossy),
+        );
+    }
+
+    #[test]
+    fn detached_vfs_manifest_restore_and_fresh_run_controls() {
+        const TEST: &str =
+            "runtime::host_agent::tests::detached_vfs_manifest_restore_and_fresh_run_controls";
+        if std::env::var_os(DETACHED_VFS_MANIFEST_CHILD).is_none() {
+            let failures: Vec<_> = ["fs", "sqlite"]
+                .into_iter()
+                .filter_map(|backend| detached_vfs_manifest_corruption_child(backend, TEST).err())
+                .collect();
+            assert!(
+                failures.is_empty(),
+                "detached VFS manifest controls failed:\n{}",
+                failures.join("\n")
+            );
+            return;
+        }
+
+        let base = PathBuf::from(std::env::var_os(DETACHED_VFS_MANIFEST_BASE).unwrap());
+        let fixture = new_detached_vfs_manifest_fixture(&base, "valid-restore", true);
+        let manifest = fixture
+            .store
+            .get_blob("runtime.snapshot.json")
+            .unwrap()
+            .expect("hibernating detached run must persist its snapshot manifest");
+        let parsed: crate::runtime::snapshot::SnapshotManifest =
+            serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            parsed.vfs.read_text(DETACHED_VFS_PATH).unwrap(),
+            DETACHED_VFS_SEED_VALUE,
+            "control precondition: valid snapshot carries the seed"
+        );
+        assert_eq!(
+            hub()
+                .send(
+                    &fixture.parts,
+                    &fixture.name,
+                    "vfs-wake",
+                    json!({ "delivery": "valid-control" }),
+                    json!({ "from": "test" }),
+                )
+                .unwrap()["delivered"],
+            json!(true)
+        );
+        let completed = wait_for_agent_descriptor(&fixture.parts, &fixture.name, |descriptor| {
+            descriptor.status == "completed" || descriptor.status == "failed"
+        });
+        let records = fixture.store.load_call_log().unwrap().unwrap_or_default();
+        let inbox = fixture.store.get_blob(SIGNAL_INBOX_FILE).unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(
+            fixture.observations.lock().unwrap().as_slice(),
+            &[json!({ "value": DETACHED_VFS_SEED_VALUE })]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.function == "signal" && record.args["name"] == "vfs-wake")
+                .count(),
+            1,
+            "valid snapshot control consumes its signal once"
+        );
+        assert_eq!(inbox.as_deref(), Some(b"[]".as_slice()));
+        hub().entries.lock().unwrap().remove(&fixture.name);
+
+        // A genuinely new run starts without any prior snapshot manifest and
+        // seeds the VFS from the child process environment as documented.
+        let fresh = new_detached_vfs_manifest_fixture(&base, "fresh-no-manifest", false);
+        let fresh_descriptor = wait_for_agent_descriptor(&fresh.parts, &fresh.name, |descriptor| {
+            descriptor.status == "completed" || descriptor.status == "failed"
+        });
+        assert_eq!(fresh_descriptor.status, "completed", "{fresh_descriptor:?}");
+        assert_eq!(
+            fresh.observations.lock().unwrap().as_slice(),
+            &[json!({ "value": DETACHED_VFS_FRESH_VALUE })]
+        );
+        hub().entries.lock().unwrap().remove(&fresh.name);
+    }
+
     #[test]
     fn explicit_sqlite_failure_rejects_detached_spawn_rearm_send_and_alarm_wake_before_effects() {
         const CHILD: &str = "CHIDORI_TEST_AGENT_SQLITE_CHILD";
