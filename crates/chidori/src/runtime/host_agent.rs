@@ -1668,7 +1668,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     descriptor.listen.is_none() && replay.is_empty() && descriptor.restarts == 0;
                 let vfs = match snapshot_manifest {
                     Some(manifest) => manifest.vfs,
-                    None if fresh_first_run => crate::runtime::vfs::Vfs::default(),
+                    None if fresh_first_run => crate::runtime::context::vfs_from_seed_env(),
                     None => {
                         return Err(HibernateError::RetryableRead {
                             artifact: "snapshot manifest",
