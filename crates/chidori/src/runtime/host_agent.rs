@@ -1550,10 +1550,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         let inbox = match load_detached_signal_inbox(store.as_ref(), &run_id) {
             Ok(inbox) => inbox,
             Err(err) => {
-                defer_after_inbox_read_error(
+                defer_after_durable_read_error(
                     entry,
                     descriptor.listen.clone(),
                     active_lease.as_ref(),
+                    "signal inbox",
                     &err,
                 );
                 return;
@@ -1592,12 +1593,13 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 match hibernate_run(listen.clone()) {
                     Ok(true) => return,
                     Ok(false) => continue,
-                    Err(HibernateError::InboxRead(err)) => {
-                        defer_after_inbox_read_error(
+                    Err(HibernateError::RetryableRead { artifact, error }) => {
+                        defer_after_durable_read_error(
                             entry,
                             Some(listen),
                             active_lease.as_ref(),
-                            &err,
+                            artifact,
+                            &error,
                         );
                         return;
                     }
@@ -1646,8 +1648,39 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             // state lock across the authoritative read, reconciliation, and
             // context publication so senders use the live context afterwards.
             (|| {
-                let inbox = load_detached_signal_inbox(store.as_ref(), &run_id)
-                    .map_err(HibernateError::InboxRead)?;
+                let inbox =
+                    load_detached_signal_inbox(store.as_ref(), &run_id).map_err(|error| {
+                        HibernateError::RetryableRead {
+                            artifact: "signal inbox",
+                            error,
+                        }
+                    })?;
+                let snapshot_store =
+                    crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone());
+                let snapshot_manifest =
+                    snapshot_store.load_manifest_if_present().map_err(|err| {
+                        HibernateError::RetryableRead {
+                            artifact: "snapshot manifest",
+                            error: format!("loading detached-agent snapshot manifest: {err:#}"),
+                        }
+                    })?;
+                let fresh_first_run =
+                    descriptor.listen.is_none() && replay.is_empty() && descriptor.restarts == 0;
+                let vfs = match snapshot_manifest {
+                    Some(manifest) => manifest.vfs,
+                    None if fresh_first_run => crate::runtime::vfs::Vfs::default(),
+                    None => {
+                        return Err(HibernateError::RetryableRead {
+                            artifact: "snapshot manifest",
+                            error: format!(
+                                "loading detached-agent snapshot manifest: reading {}: not found",
+                                run_dir
+                                    .join(crate::runtime::snapshot::SNAPSHOT_MANIFEST_FILE)
+                                    .display()
+                            ),
+                        })
+                    }
+                };
                 if let Some(listen) = descriptor.listen.as_ref() {
                     let matched = inbox
                         .iter()
@@ -1675,11 +1708,6 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 .map_err(|err| {
                     HibernateError::Other(format!("loading detached-agent host promises: {err:#}"))
                 })?;
-                let vfs =
-                    crate::runtime::snapshot::SnapshotStore::with_store(&run_dir, store.clone())
-                        .load_manifest()
-                        .map(|manifest| manifest.vfs)
-                        .unwrap_or_default();
                 let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
                     replay,
                     host_promises,
@@ -1724,12 +1752,13 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
             Ok(ctx) => ctx,
             Err(err) => {
                 match err {
-                    HibernateError::InboxRead(err) => {
-                        defer_after_inbox_read_error(
+                    HibernateError::RetryableRead { artifact, error } => {
+                        defer_after_durable_read_error(
                             entry,
                             descriptor.listen.clone(),
                             active_lease.as_ref(),
-                            &err,
+                            artifact,
+                            &error,
                         );
                     }
                     HibernateError::Other(err) => settle_run("failed", None, Some(err)),
@@ -1818,12 +1847,13 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 match hibernate_run(listen.clone()) {
                     Ok(true) => return,
                     Ok(false) => continue,
-                    Err(HibernateError::InboxRead(err)) => {
-                        defer_after_inbox_read_error(
+                    Err(HibernateError::RetryableRead { artifact, error }) => {
+                        defer_after_durable_read_error(
                             entry,
                             Some(listen),
                             active_lease.as_ref(),
-                            &err,
+                            artifact,
+                            &error,
                         );
                         return;
                     }
@@ -2149,14 +2179,15 @@ fn release_agent_lease(
     }
 }
 
-/// Keep a worker retryable when its durable inbox cannot be decoded. The
-/// state lock remains held while the descriptor is persisted, preserving the
-/// established state -> store lock order and preventing a sender from
+/// Keep a worker retryable when durable state needed for recovery cannot be
+/// read. The state lock remains held while the descriptor is persisted,
+/// preserving state -> store lock order and preventing a sender from
 /// observing a half-written handoff.
-fn defer_after_inbox_read_error(
+fn defer_after_durable_read_error(
     entry: &Arc<AgentEntry>,
     listen: Option<ListenState>,
     lease: Option<&crate::runtime::store::FencedLease>,
+    artifact: &str,
     error: &str,
 ) {
     let persisted = {
@@ -2174,14 +2205,15 @@ fn defer_after_inbox_read_error(
         tracing::error!(
             agent = %entry.name,
             error = %persist_error,
-            "persisting retryable detached-agent state after inbox read failure"
+            "persisting retryable detached-agent state after durable read failure"
         );
     }
     release_agent_lease(entry, lease);
     tracing::warn!(
         agent = %entry.name,
+        artifact,
         error,
-        "detached-agent inbox is unreadable; leaving the run driverless for retry"
+        "detached-agent durable state is unreadable; leaving the run driverless for retry"
     );
     entry.signal.notify_all();
 }
@@ -2223,8 +2255,12 @@ fn hibernate(
                 "detached-agent lease ownership lost before hibernate: {err}"
             )));
         }
-        let inbox = load_detached_signal_inbox(store.as_ref(), &run_id)
-            .map_err(HibernateError::InboxRead)?;
+        let inbox = load_detached_signal_inbox(store.as_ref(), &run_id).map_err(|error| {
+            HibernateError::RetryableRead {
+                artifact: "signal inbox",
+                error,
+            }
+        })?;
         if inbox
             .iter()
             .any(|queued| listen.names.iter().any(|name| name == &queued.name))
@@ -2271,7 +2307,10 @@ fn hibernate(
 }
 
 enum HibernateError {
-    InboxRead(String),
+    RetryableRead {
+        artifact: &'static str,
+        error: String,
+    },
     Other(String),
 }
 
