@@ -4876,7 +4876,6 @@ async fn stream_timeout_held_lease_remains_retryable_after_release() {
     assert_eq!(paused.run_id.as_deref(), Some(run_id.as_str()));
     let original_deadline = paused
         .pending_signal_deadline
-        .clone()
         .expect("timeout pause persists its deadline");
 
     let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(&run_id);
@@ -4888,7 +4887,7 @@ async fn stream_timeout_held_lease_remains_retryable_after_release() {
     .expect("open SQLite tenure store")
     .expect("the timeout fixture run lease must be free");
     let expired_deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
-    paused.pending_signal_deadline = Some(expired_deadline.clone());
+    paused.pending_signal_deadline = Some(expired_deadline);
     state.session_store.put(&paused).unwrap();
 
     let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
@@ -4907,7 +4906,7 @@ async fn stream_timeout_held_lease_remains_retryable_after_release() {
     let pending_operation: crate::runtime::snapshot::PendingHostOperation =
         serde_json::from_slice(&pending_before).expect("decode pending timeout operation");
     expire_tx
-        .send(expired_deadline.clone())
+        .send(expired_deadline)
         .expect("expire pause deadline");
 
     let attempt = tokio::time::timeout(std::time::Duration::from_secs(5), attempt_rx)

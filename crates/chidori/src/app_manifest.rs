@@ -563,7 +563,7 @@ routes:
             let err = AppManifest::load(&path).unwrap_err();
             let diagnostic = format!("{err:#}");
             assert!(
-                diagnostic.contains(&expected),
+                diagnostic.contains(expected),
                 "expected `{expected}` in diagnostic: {diagnostic}"
             );
         }
