@@ -4,12 +4,36 @@
 
 use super::*;
 use crate::runtime::snapshot::{
-    HostPromiseState, RuntimePolicy, SnapshotAbi, SourceFingerprint, HOST_PROMISE_TABLE_FILE,
-    PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE, SNAPSHOT_MANIFEST_FILE, SnapshotManifest,
+    HostPromiseState, RuntimePolicy, SnapshotAbi, SnapshotManifest, SourceFingerprint,
+    HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE,
+    SNAPSHOT_MANIFEST_FILE,
 };
 use axum::body;
 use axum::extract::{Path, State};
 use std::sync::atomic::Ordering;
+
+struct EnvVarRestore {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.name, previous);
+        } else {
+            std::env::remove_var(self.name);
+        }
+    }
+}
 
 /// A failed session's `error` must carry stack frames in ORIGINAL
 /// TypeScript coordinates for every frame, not just the throwing one —
@@ -277,7 +301,7 @@ async fn serve_bind_rearm_child(case: &str) {
     std::fs::create_dir_all(&root).unwrap();
     std::env::set_var("CHIDORI_RUN_STORE", "fs");
     std::env::remove_var("CHIDORI_RUN_DB");
-    std::env::set_var("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+    let _allow_hosts = EnvVarRestore::set("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
     std::env::remove_var("CHIDORI_API_KEY");
     std::env::remove_var("CHIDORI_ALLOW_UNAUTHENTICATED");
 
@@ -2528,11 +2552,16 @@ async fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_a
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
             .await
             .unwrap();
     });
-    let agent = write_agent(temp.path(), &format!(r#"
+    let agent = write_agent(
+        temp.path(),
+        &format!(
+            r#"
         import fs from "node:fs";
         export async function agent(input, chidori) {{
             fs.writeFileSync("/persisted-sentinel.txt", "preserved-vfs-value");
@@ -2541,7 +2570,9 @@ async fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_a
             await fetch("{effect_url}", {{ method: "POST" }});
             return {{ value }};
         }}
-    "#));
+    "#
+        ),
+    );
     let mut state = signal_test_state(temp.path(), agent);
     // Force the route through persisted replay rather than the parked warm VM.
     state.warm_evict = std::time::Duration::from_millis(1);
@@ -2573,23 +2604,59 @@ async fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_a
         resume_session(
             State(state.clone()),
             Path("corrupt-vfs".to_string()),
-            Json(ResumeRequest { response: "continue".to_string(), allow_source_change: false }),
-        ).await,
-    ).await;
+            Json(ResumeRequest {
+                response: "continue".to_string(),
+                allow_source_change: false,
+            }),
+        )
+        .await,
+    )
+    .await;
     let after = state.session_store.get("corrupt-vfs").unwrap().unwrap();
     let failures = [
-        (status == StatusCode::INTERNAL_SERVER_ERROR, format!("expected 500, got {status}; {body}")),
-        (body["error"].as_str().unwrap_or_default().contains("loading replay snapshot"), format!("missing snapshot-load error: {body}")),
-        (effects.load(Ordering::SeqCst) == 0, "resumed effect was dispatched".to_string()),
-        (serde_json::to_vec(&before).unwrap() == serde_json::to_vec(&after).unwrap(), format!("session advanced: before={before:?} after={after:?}")),
-        (journal_before == snapshot_journal_files(&run_dir), "journal advanced".to_string()),
-        (pending_before == std::fs::read(run_dir.join(PENDING_HOST_OPERATION_FILE)).unwrap_or_default(), "pending operation advanced".to_string()),
-        (promises_before == snapshot_host_promise_events(&run_dir), "host-promise state advanced".to_string()),
-    ].into_iter().filter_map(|(ok, why)| (!ok).then_some(why)).collect::<Vec<_>>();
+        (
+            status == StatusCode::INTERNAL_SERVER_ERROR,
+            format!("expected 500, got {status}; {body}"),
+        ),
+        (
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("loading replay snapshot"),
+            format!("missing snapshot-load error: {body}"),
+        ),
+        (
+            effects.load(Ordering::SeqCst) == 0,
+            "resumed effect was dispatched".to_string(),
+        ),
+        (
+            serde_json::to_vec(&before).unwrap() == serde_json::to_vec(&after).unwrap(),
+            format!("session advanced: before={before:?} after={after:?}"),
+        ),
+        (
+            journal_before == snapshot_journal_files(&run_dir),
+            "journal advanced".to_string(),
+        ),
+        (
+            pending_before
+                == std::fs::read(run_dir.join(PENDING_HOST_OPERATION_FILE)).unwrap_or_default(),
+            "pending operation advanced".to_string(),
+        ),
+        (
+            promises_before == snapshot_host_promise_events(&run_dir),
+            "host-promise state advanced".to_string(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(ok, why)| (!ok).then_some(why))
+    .collect::<Vec<_>>();
     let _ = shutdown_tx.send(());
     server.await.unwrap();
-    std::env::remove_var("CHIDORI_HTTP_ALLOW_HOSTS");
-    assert!(failures.is_empty(), "malformed persisted VFS did not fail closed: {}", failures.join("; "));
+    assert!(
+        failures.is_empty(),
+        "malformed persisted VFS did not fail closed: {}",
+        failures.join("; ")
+    );
 }
 
 #[test]
@@ -2598,12 +2665,32 @@ fn persisted_vfs_controls_accept_valid_manifest_and_only_true_absence_as_empty()
     let run_base = temp.path().join("runs");
     let run_id = "vfs-control";
     let mut vfs = crate::runtime::vfs::Vfs::new();
-    vfs.write("/sentinel.txt", b"persisted".to_vec(), 0).unwrap();
-    let mut manifest = SnapshotManifest::new(run_id, SnapshotAbi::current("chidori-quickjs"), RuntimePolicy::durable_default(run_id), SourceFingerprint::from_source(temp.path().join("agent.ts"), "export {{}}"), Vec::new(), None, 0);
+    vfs.write("/sentinel.txt", b"persisted".to_vec(), 0)
+        .unwrap();
+    let mut manifest = SnapshotManifest::new(
+        run_id,
+        SnapshotAbi::current("chidori-quickjs"),
+        RuntimePolicy::durable_default(run_id),
+        SourceFingerprint::from_source(temp.path().join("agent.ts"), "export {{}}"),
+        Vec::new(),
+        None,
+        0,
+    );
     manifest.vfs = vfs;
-    SnapshotStore::new(run_base.join(run_id)).save(&manifest, b"snapshot", &[]).unwrap();
-    assert_eq!(load_persisted_vfs(&run_base, Some(run_id)).unwrap().read("/sentinel.txt").unwrap(), b"persisted");
-    assert!(load_persisted_vfs(&run_base, Some("truly-absent")).unwrap().read("/sentinel.txt").is_err());
+    SnapshotStore::new(run_base.join(run_id))
+        .save(&manifest, b"snapshot", &[])
+        .unwrap();
+    assert_eq!(
+        load_persisted_vfs(&run_base, Some(run_id))
+            .unwrap()
+            .read("/sentinel.txt")
+            .unwrap(),
+        b"persisted"
+    );
+    assert!(load_persisted_vfs(&run_base, Some("truly-absent"))
+        .unwrap()
+        .read("/sentinel.txt")
+        .is_err());
 }
 
 const CORRUPT_INBOX_EXECUTION_MODE: &str = "CHIDORI_TEST_CORRUPT_INBOX_EXECUTION_MODE";
