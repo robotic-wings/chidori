@@ -144,7 +144,7 @@ impl AppManifest {
         Ok(manifest)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
             if agent.name.is_empty()
