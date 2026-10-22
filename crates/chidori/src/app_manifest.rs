@@ -414,4 +414,67 @@ routes:
             );
         }
     }
+
+    #[test]
+    fn rejects_overlapping_capture_routes_and_names_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "chidori.app.yml",
+            "agents: []\nroutes:\n  - path: /hooks/{id}\n    agent: first\n    signal: first\n  - path: /hooks/{event}\n    agent: second\n    signal: second\n",
+        );
+
+        let result = AppManifest::load(&path);
+        assert!(
+            result.is_err(),
+            "overlapping capture routes must be rejected before router construction"
+        );
+        let diagnostic = format!("{:#}", result.unwrap_err());
+        let normalized = diagnostic.to_ascii_lowercase();
+        assert!(
+            normalized.contains("overlap") || normalized.contains("conflict"),
+            "route diagnostic should identify an overlap/conflict: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("/hooks/{id}") && diagnostic.contains("/hooks/{event}"),
+            "route conflict diagnostic should identify both paths: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn static_route_may_coexist_with_capture_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            "chidori.app.yml",
+            "agents: []\nroutes:\n  - path: /hooks/{id}\n    agent: captured\n    signal: captured\n  - path: /hooks/static\n    agent: static\n    signal: static\n",
+        );
+
+        let manifest = AppManifest::load(&path).unwrap();
+        assert_eq!(manifest.routes.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_and_reserved_route_diagnostics_remain_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        for (routes, expected) in [
+            (
+                "  - path: /hooks/{id}\n    agent: first\n    signal: first\n  - path: /hooks/{id}\n    agent: second\n    signal: second\n",
+                "duplicate route path `/hooks/{id}`",
+            ),
+            (
+                "  - path: /sessions/hooks\n    agent: first\n    signal: first\n",
+                "collides with the server's built-in `/sessions` routes",
+            ),
+        ] {
+            let body = format!("agents: []\nroutes:\n{routes}");
+            let path = write_manifest(dir.path(), "chidori.app.yml", &body);
+            let err = AppManifest::load(&path).unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(
+                diagnostic.contains(&expected),
+                "expected `{expected}` in diagnostic: {diagnostic}"
+            );
+        }
+    }
 }
