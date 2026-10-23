@@ -7,8 +7,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Git([string[]]$Arguments) {
-    $out = & git @Arguments
+$gitExecutablePath = (Get-Command git -CommandType Application).Source
+
+function Invoke-ResolvedGit([string[]]$Arguments) {
+    $out = & $gitExecutablePath @Arguments
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
     return ($out | Out-String).TrimEnd()
 }
@@ -16,7 +18,7 @@ function Git([string[]]$Arguments) {
 function Write-GitOutput([string]$Path, [string[]]$Arguments) {
     # Redirect Git's stdout at the process boundary so patch bytes are preserved
     # without routing them through a PowerShell text pipeline.
-    $process = Start-Process -FilePath git -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
+    $process = Start-Process -FilePath $gitExecutablePath -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
     if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed" }
 }
 
@@ -25,11 +27,11 @@ function Assert-Equal([string]$Actual, [string]$Expected, [string]$What) {
 }
 
 function Blob([string]$Revision, [string]$Path) {
-    return Git @('rev-parse', "$Revision`:$Path")
+    return Invoke-ResolvedGit @('rev-parse', "$Revision`:$Path")
 }
 
 function FileAt([string]$Revision, [string]$Path) {
-    return Git @('show', "$Revision`:$Path")
+    return Invoke-ResolvedGit @('show', "$Revision`:$Path")
 }
 
 # This is deliberately a single-commit input check, never a commit-range check.
@@ -39,27 +41,27 @@ $base = '9e1c295'
 $combinedLockBlob = 'c4b4316368317a342058f77151ab8043afea676b'
 $paths = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
 
-$candidateSha = Git @('rev-parse', "$Candidate^{commit}")
-$headSha = Git @('rev-parse', 'HEAD^{commit}')
+$candidateSha = Invoke-ResolvedGit @('rev-parse', "$Candidate^{commit}")
+$headSha = Invoke-ResolvedGit @('rev-parse', 'HEAD^{commit}')
 Assert-Equal $candidateSha $headSha 'candidate must be the checked-out HEAD'
-$null = Git @('merge-base', '--is-ancestor', $base, $candidateSha)
+$null = Invoke-ResolvedGit @('merge-base', '--is-ancestor', $base, $candidateSha)
 
-$dirtyBefore = Git @('status', '--porcelain', '--untracked-files=no')
+$dirtyBefore = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
 if ($dirtyBefore) { throw "tracked tree is dirty before verification: $dirtyBefore" }
 
-$candidatePaths = Git @('diff', '--name-only', $base, $candidateSha)
+$candidatePaths = Invoke-ResolvedGit @('diff', '--name-only', $base, $candidateSha)
 Assert-Equal $candidatePaths ($paths -join [Environment]::NewLine) 'candidate changed-path set from 9e1c295'
 
 # Compare every base-tracked blob outside the three allowlisted package paths,
 # rather than relying on an ancestry relationship or a summarized diff.
-$baseTrackedPaths = Git @('ls-tree', '-r', '--name-only', $base)
+$baseTrackedPaths = Invoke-ResolvedGit @('ls-tree', '-r', '--name-only', $base)
 foreach ($path in ($baseTrackedPaths -split [Environment]::NewLine)) {
     if ($path -and $paths -notcontains $path) {
         Assert-Equal (Blob $candidateSha $path) (Blob $base $path) "non-allowlisted base blob $path"
     }
 }
 
-$directPaths = Git @('show', '--format=', '--name-only', $packageCommit)
+$directPaths = Invoke-ResolvedGit @('show', '--format=', '--name-only', $packageCommit)
 Assert-Equal $directPaths ($paths -join [Environment]::NewLine) '59ebb109 changed-path set'
 Assert-Equal (Blob "$packageCommit^" 'Cargo.lock') '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9' 'package lock base blob'
 Assert-Equal (Blob $packageCommit 'Cargo.lock') '9e36a2e89363eeedc4215a68dbd51f33dfec3741' 'package lock target blob'
@@ -68,8 +70,8 @@ Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') '3977de82f9795
 Assert-Equal (Blob "$packageCommit^" 'crates/chidori/Cargo.toml') 'cee7ace2bf9f813086176aee084ec0b0867dfa67' 'chidori base blob'
 Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') 'fc56a8752c8cc0ba8fe3a3ba64cb2d841ab881d5' 'chidori target blob'
 
-Assert-Equal (Git @('rev-parse', "$ctutilsCommit^")) (Git @('rev-parse', $base)) '00148aa parent'
-$ctutilsPaths = Git @('show', '--format=', '--name-only', $ctutilsCommit)
+Assert-Equal (Invoke-ResolvedGit @('rev-parse', "$ctutilsCommit^")) (Invoke-ResolvedGit @('rev-parse', $base)) '00148aa parent'
+$ctutilsPaths = Invoke-ResolvedGit @('show', '--format=', '--name-only', $ctutilsCommit)
 Assert-Equal $ctutilsPaths 'Cargo.lock' '00148aa changed-path set'
 Assert-Equal (Blob "$ctutilsCommit^" 'Cargo.lock') '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9' 'ctutils lock base blob'
 Assert-Equal (Blob $ctutilsCommit 'Cargo.lock') 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66' 'ctutils lock target blob'
@@ -87,15 +89,15 @@ try {
     Write-GitOutput $ctutilsPatch @('diff', '--binary', "$ctutilsCommit~1", $ctutilsCommit, '--', 'Cargo.lock')
     Push-Location $temp
     try {
-        & git apply --no-index $packagePatch
+        & $gitExecutablePath apply --no-index $packagePatch
         if ($LASTEXITCODE -ne 0) { throw '59ebb109 direct patch did not apply to base' }
-        & git apply --no-index $ctutilsPatch
+        & $gitExecutablePath apply --no-index $ctutilsPatch
         if ($LASTEXITCODE -ne 0) { throw '00148aa direct ctutils patch did not apply after package patch' }
     } finally {
         Pop-Location
     }
 
-    $constructedLockBlob = Git @('hash-object', (Join-Path $temp 'Cargo.lock'))
+    $constructedLockBlob = Invoke-ResolvedGit @('hash-object', (Join-Path $temp 'Cargo.lock'))
     Assert-Equal $constructedLockBlob $combinedLockBlob 'deterministic combined Cargo.lock blob'
     Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $candidateSha 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
@@ -118,6 +120,6 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo metadata --locked failed' }
 & cargo tree --locked -p chidori | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'cargo tree --locked -p chidori failed' }
 
-$dirtyAfter = Git @('status', '--porcelain', '--untracked-files=no')
+$dirtyAfter = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
 if ($dirtyAfter) { throw "tracked tree is dirty after verification: $dirtyAfter" }
 Write-Host "PASS: candidate $candidateSha is checked-out HEAD and is bound to direct patches 59ebb109 + 00148aa with locked metadata/tree evidence."
