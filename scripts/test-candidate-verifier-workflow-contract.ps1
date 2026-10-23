@@ -24,6 +24,13 @@ function Get-RawImmutableFixtureResult([bool]$ArgumentListAvailable) {
     return [pscustomobject]@{ State = 'READY'; ExitCode = 0 }
 }
 
+function Get-DefaultContractCapabilityResult([bool]$ArgumentListAvailable) {
+    return [pscustomobject]@{
+        ReportPending = -not $ArgumentListAvailable
+        ContinueStaticContracts = $true
+    }
+}
+
 function Git([string]$Repo, [string[]]$Arguments) {
     $out = & git.exe -C $Repo @Arguments 2>$null
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
@@ -99,6 +106,85 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
         }
     }
     Assert ($operationCount -gt 0) "workflow must contain $Name"
+}
+
+function Assert-CandidateScrubAndCargoContract([string]$Text) {
+    $lockedCargoBlock = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Run locked Cargo checks in the candidate worktree[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
+    Assert ($lockedCargoBlock.Count -eq 1) 'workflow must define exactly one Run locked Cargo checks YAML run block'
+    $Text = $lockedCargoBlock[0].Groups['run'].Value
+    Assert ($Text -notmatch '(?im)^\s*#') 'comments cannot satisfy locked Cargo evidence requirements'
+    Assert ($Text -notmatch '(?i)\b(?:Out-Null|Write-Host)\b') 'locked Cargo evidence must capture native output rather than discard it'
+    $captureSha = '(?m)^\s*\$candidateSha\s*=\s*\$env:CANDIDATE_SHA\s*$'
+    $captureWorktree = '(?m)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$'
+    Assert ([regex]::Matches($Text, $captureSha).Count -eq 1) 'workflow must capture candidate SHA exactly once before environment scrub'
+    Assert ([regex]::Matches($Text, $captureWorktree).Count -eq 1) 'workflow must capture canonical candidate worktree before environment scrub'
+    $captureEnd = [regex]::Match($Text, $captureWorktree).Index
+    $firstScrub = [regex]::Match($Text, '(?im)^\s*Remove-Item\s+Env:\*').Index
+    Assert ($firstScrub -ge 0 -and $captureEnd -lt $firstScrub) 'candidate SHA and canonical worktree capture must precede environment scrub'
+
+    $scrubbed = $Text.Substring($firstScrub)
+    Assert ($scrubbed -notmatch '(?i)\$env:(?:RUNNER_TEMP|CANDIDATE_SHA|GITHUB_TOKEN|GH_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN)') 'scrubbed execution must never re-read candidate/runtime or credential environment values'
+    Assert ($scrubbed -notmatch '(?i)\$env:(?:GITHUB_WORKSPACE|GITHUB_SHA)\s*=') 'scrubbed execution must not restore GitHub identity environment values'
+    foreach ($safe in @('PATH', 'HOME', 'CARGO_HOME', 'RUSTUP_HOME')) {
+        Assert ($scrubbed -match ('(?im)^\s*\$env:' + $safe + '\s*=\s*\$')) "scrubbed execution must restore only the captured $safe environment value"
+    }
+    Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME'
+
+    $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
+    $match = [regex]::Match($Text, $scope)
+    Assert $match.Success 'metadata and tree must run in one balanced canonical candidate Push-Location/try/finally/Pop-Location scope'
+    Assert ($match.Groups['body'].Value -notmatch '(?i)(?:Set-Location|Push-Location|Pop-Location|\bcd\b|\bsl\b|\bchdir\b)') 'candidate Cargo scope must not mutate the canonical location'
+
+    $evidenceCommands = @(
+        'git\s+rev-parse\s+HEAD',
+        'git\s+status\s+--porcelain',
+        'git\s+show\s+-s\s+--format=%P\s+\$candidateSha',
+        'cargo\s+metadata\s+--locked',
+        'cargo\s+tree\s+--locked'
+    )
+    foreach ($command in $evidenceCommands) {
+        $commands = [regex]::Matches($Text, '(?im)^\s*(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*$')
+        Assert ($commands.Count -gt 0) "workflow must contain evidence command [$command]"
+        foreach ($native in $commands) {
+            $following = $Text.Substring($native.Index + $native.Length, [Math]::Min(400, $Text.Length - $native.Index - $native.Length))
+            Assert ($following -match '(?is)^\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw\b') "native evidence command [$command] must have an immediately adjacent LASTEXITCODE throw"
+        }
+    }
+
+    Assert ($Text -match '(?im)^\s*\$candidateHead\s*=\s*git\s+rev-parse\s+HEAD') 'locked Cargo block must capture candidate HEAD output'
+    Assert ($Text -match '(?im)^\s*\$candidateStatus\s*=\s*git\s+status\s+--porcelain') 'locked Cargo block must capture candidate status output'
+    Assert ($Text -match '(?im)^\s*\$parents\s*=\s*\(git\s+show\s+-s\s+--format=%P\s+\$candidateSha\)') 'locked Cargo block must capture candidate parent output'
+    Assert ($Text -match '(?im)^\s*\$candidatePaths\s*=\s*git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha') 'locked Cargo block must capture base-to-candidate path scope using captured candidate SHA'
+    Assert ($Text -match '(?is)\$candidateHead\s*-ne\s*\$candidateSha') 'locked Cargo block must compare captured HEAD to captured candidate SHA'
+    Assert ($Text -match '(?is)\$candidateStatus\s*-ne\s*[''"]{2}') 'locked Cargo block must compare captured status for cleanliness'
+    Assert ($Text -match '(?is)\$parents\.Count\s*-ne\s*1.{0,500}\$parents\[0\]\s*-ne\s*[''"]9e1c295b1f3f90ef342021ec81b52ece7363cd6c') 'locked Cargo block must compare captured sole parent to approved base'
+    Assert ([regex]::Matches($Text, '(?im)^\s*\$candidatePathText\s*=\s*\(\$candidatePaths\s+-join\s+["'']`n["'']\)\s*$').Count -ge 3) 'locked Cargo block must normalize each captured path array to an ordered scalar'
+    Assert ([regex]::Matches($Text, '(?is)\$candidatePathText\s*-ne\s*\$approvedCandidatePaths').Count -ge 3) 'locked Cargo block must compare each normalized path scalar to approved paths'
+    Assert ($Text -notmatch '(?is)\$candidatePaths\s*-ne\s*\$approvedCandidatePaths') 'locked Cargo block must not compare a raw path array to an approved scalar'
+    Assert ($Text -notmatch '(?i)\$candidatePaths.{0,100}(?:Sort-Object|\|\s*sort)') 'locked Cargo block must preserve captured path ordering without sorting'
+
+    $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha', 'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha')
+    foreach ($phase in @(
+        @{ Name = 'pre-scrub'; Prefix = '(?is)\$candidateWorktree\s*=.*?'; Suffix = 'Remove-Item\s+Env:\*' },
+        @{ Name = 'post-scrub/pre-Cargo'; Prefix = '(?is)Remove-Item\s+Env:\*.*?'; Suffix = 'cargo\s+metadata\s+--locked' },
+        @{ Name = 'post-Cargo'; Prefix = '(?is)cargo\s+tree\s+--locked.*?'; Suffix = '\}\s*finally\s*\{\s*Pop-Location' }
+    )) {
+        foreach ($command in $phaseCommands) {
+            $bound = $phase.Prefix + '(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $phase.Suffix
+            Assert ($Text -match $bound) "$($phase.Name) phase must bind [$command] with an immediately adjacent LASTEXITCODE throw"
+        }
+        $parentBound = $phase.Prefix + '\$parents\.Count.*?\$parents\[0\].*?' + $phase.Suffix
+        Assert ($Text -match $parentBound) "$($phase.Name) phase must retain sole-parent/base evidence"
+        foreach ($comparison in @(
+            '\$candidateHead\s*-ne\s*\$candidateSha',
+            '\$candidateStatus\s*-ne\s*[''"]{2}',
+            '\$parents\.Count\s*-ne\s*1',
+            '\$parents\[0\]\s*-ne\s*[''"]9e1c295b1f3f90ef342021ec81b52ece7363cd6c',
+            '\$candidatePathText\s*-ne\s*\$approvedCandidatePaths'
+        )) {
+            Assert ($Text -match ($phase.Prefix + $comparison + '.*?' + $phase.Suffix)) "$($phase.Name) phase must compare captured evidence [$comparison] inside its own boundary"
+        }
+    }
 }
 
 function Assert-TrustedVerifierIdentity([string]$Text) {
@@ -340,12 +426,11 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
     Assert-TrustedVerifierIdentity $text
     Assert-SafeCandidateExecution $text 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
-    Assert-SafeCandidateExecution $text 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
-    Assert-SafeCandidateExecution $text 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}cargo\s+(?:metadata|tree)\s+--locked') 'scrubbed candidate environment must bind Cargo invocation'
+    Assert-CandidateScrubAndCargoContract $text
 }
 
 function New-FixtureRepo {
@@ -414,6 +499,103 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
     Assert-SafeCandidateExecution $happy 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert-SafeCandidateExecution $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
+
+    $candidateCargoHappy = @'
+$candidateSha = $env:CANDIDATE_SHA
+$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+$toolPath = $env:PATH
+$homePath = $env:HOME
+$cargoHome = $env:CARGO_HOME
+$rustupHome = $env:RUSTUP_HOME
+$approvedCandidatePaths = "Cargo.lock`ncrates/chidori-js/Cargo.toml`ncrates/chidori/Cargo.toml"
+$candidateHead = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
+$candidateStatus = git status --porcelain
+if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
+$parents = (git show -s --format=%P $candidateSha).Split(' ')
+if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
+if ($candidateHead -ne $candidateSha) { throw 'candidate HEAD mismatch' }
+if ($candidateStatus -ne '') { throw 'candidate dirty' }
+if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
+if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
+$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+if ($LASTEXITCODE -ne 0) { throw 'candidate path evidence failed' }
+$candidatePathText = ($candidatePaths -join "`n")
+if ($candidatePathText -ne $approvedCandidatePaths) { throw 'candidate path scope failed' }
+Remove-Item Env:*
+$env:PATH = $toolPath
+$env:HOME = $homePath
+$env:CARGO_HOME = $cargoHome
+$env:RUSTUP_HOME = $rustupHome
+Push-Location $candidateWorktree
+try {
+    $candidateHead = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
+    $candidateStatus = git status --porcelain
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
+    $parents = (git show -s --format=%P $candidateSha).Split(' ')
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
+    if ($candidateHead -ne $candidateSha) { throw 'post-scrub candidate HEAD mismatch' }
+    if ($candidateStatus -ne '') { throw 'post-scrub candidate dirty' }
+    if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
+    if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
+    $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate path evidence failed' }
+    $candidatePathText = ($candidatePaths -join "`n")
+    if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
+    cargo metadata --locked --format-version 1 --no-deps
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    cargo tree --locked -p chidori
+    if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+    $candidateHead = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
+    $candidateStatus = git status --porcelain
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+    $parents = (git show -s --format=%P $candidateSha).Split(' ')
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
+    if ($candidateHead -ne $candidateSha) { throw 'post-Cargo candidate HEAD mismatch' }
+    if ($candidateStatus -ne '') { throw 'post-Cargo candidate dirty' }
+    if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
+    if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
+    $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate path evidence failed' }
+    $candidatePathText = ($candidatePaths -join "`n")
+    if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-Cargo candidate path scope failed' }
+} finally {
+    Pop-Location
+}
+'@
+    $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
+    Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    $approvedPathLines = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
+    $approvedPathText = ($approvedPathLines -join "`n")
+    Assert ((@('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml') -join "`n") -eq $approvedPathText) 'ordered approved candidate paths must normalize to the expected scalar'
+    foreach ($badPaths in @(@('crates/chidori-js/Cargo.toml', 'Cargo.lock', 'crates/chidori/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml', 'extra'))) {
+        Assert (($badPaths -join "`n") -ne $approvedPathText) 'reordered, missing, or extra candidate paths must fail ordered scalar comparison'
+    }
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-scrub parent evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-Cargo parent evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateSha = $env:CANDIDATE_SHA', '# candidate SHA captured in an earlier step')) } 'workflow-global or earlier-step candidate capture must not satisfy the locked Cargo block'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateHead = git rev-parse HEAD', 'git rev-parse HEAD | Out-Null')) } 'Out-Null evidence must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateHead -ne $candidateSha', '$candidateHead -ne ''hard-coded''')) } 'hard-coded expected identity must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow -replace '\$candidateStatus\s*-ne\s*''''', '$true') } 'captured output must not be unused'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow -replace '(?ms)^\s*\$candidatePaths\s*=.*?^\s*if \(\$candidatePathText -ne \$approvedCandidatePaths\).*?\r?\n', '') } 'missing path comparison must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$candidatePathText -ne ''hard-coded-paths''')) } 'hard-coded path comparison must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$true')) } 'unused normalized path scalar must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText = ($candidatePaths -join "`n")', '$candidatePathText = (($candidatePaths | Sort-Object) -join "`n")')) } 'sorted path normalization must fail'
+    foreach ($phase in @('post-scrub', 'post-Cargo')) {
+        foreach ($comparison in @("if (`$candidateHead -ne `$candidateSha) { throw '$phase candidate HEAD mismatch' }", "if (`$candidateStatus -ne '') { throw '$phase candidate dirty' }", "if (`$parents.Count -ne 1) { throw '$phase candidate parent count failed' }", "if (`$parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw '$phase candidate base failed' }", "if (`$candidatePathText -ne `$approvedCandidatePaths) { throw '$phase candidate path scope failed' }")) {
+            Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, 'Write-Host removed')) } "$phase phase must reject a removed evidence comparison"
+            Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, "if (`$true) { throw 'hard-coded' }")) } "$phase phase must reject a hard-coded evidence comparison"
+        }
+    }
+    $bleed = $candidateCargoWorkflow.Replace('$candidatePaths = git diff', '# removed path capture`n$null = git diff') + "`n  - uses: actions/checkout@v7`n    run: |`n      `$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c `$candidateSha"
+    Assert-Throws { Assert-CandidateScrubAndCargoContract $bleed } 'unnamed sibling step must not bleed evidence into locked Cargo block'
 
     $runnerTempTrusted = $happy.Replace('$env:GITHUB_WORKSPACE', '$env:RUNNER_TEMP')
     Assert-Throws { Assert-TrustedVerifierIdentity $runnerTempTrusted } 'RUNNER_TEMP trusted verifier root must be rejected'
@@ -844,6 +1026,10 @@ $pendingFixtureResult = Get-RawImmutableFixtureResult $false
 Assert ($pendingFixtureResult.State -eq 'PENDING' -and $pendingFixtureResult.ExitCode -eq 2) 'unavailable raw immutable-blob fixture capability must be PENDING with exit 2'
 $readyFixtureResult = Get-RawImmutableFixtureResult $true
 Assert ($readyFixtureResult.State -eq 'READY' -and $readyFixtureResult.ExitCode -eq 0) 'available raw immutable-blob fixture capability must remain executable'
+$defaultPendingResult = Get-DefaultContractCapabilityResult $false
+Assert ($defaultPendingResult.ReportPending -and $defaultPendingResult.ContinueStaticContracts) 'default route must report unavailable raw capture as PENDING and continue static contracts'
+$defaultReadyResult = Get-DefaultContractCapabilityResult $true
+Assert ((-not $defaultReadyResult.ReportPending) -and $defaultReadyResult.ContinueStaticContracts) 'default route must run static contracts when raw capture is executable'
 Invoke-LockCompositionFixtures
 if ($FixturesOnly) {
     if ($script:RawBinaryFixturePending) {
@@ -853,15 +1039,16 @@ if ($FixturesOnly) {
     Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
     exit 0
 }
-if (-not $FixturesOnly) {
-    Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
-    $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
-    Assert-VerifierScriptPortability $verifierScript
-    Assert-VerifierScriptRecursionSafety $verifierScript
-    Assert-LockCompositionContract $verifierScript
-}
+# The default route intentionally evaluates these static contracts even when the
+# local raw-byte fixture is PENDING; only FixturesOnly returns early for that
+# capability state.
+Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
+$verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
+Assert-VerifierScriptPortability $verifierScript
+Assert-VerifierScriptRecursionSafety $verifierScript
+Assert-LockCompositionContract $verifierScript
 if ($script:RawBinaryFixturePending) {
-    Write-Host "PENDING: raw immutable-blob fixture: $script:RawBinaryFixturePendingReason"
+    Write-Host "PENDING: raw immutable-blob fixture after completed static contract evaluation: $script:RawBinaryFixturePendingReason"
     exit 2
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
