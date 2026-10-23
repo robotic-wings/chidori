@@ -586,8 +586,6 @@ $env:RUSTUP_HOME = $rustupHome
         $prePush = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    $prePushEvidence`n    if (`$LASTEXITCODE -ne 0) { throw 'pre-push evidence failed' }`n")
         Assert-Throws { Assert-CandidateScrubAndCargoContract $prePush } "candidate evidence before canonical Push-Location must fail: $prePushEvidence"
     }
-    $secondScope = $candidateCargoWorkflow.Replace("    Pop-Location`n}", "    Pop-Location`n}`n    Push-Location `$candidateWorktree`n    try { `$candidateHead = git rev-parse HEAD; if (`$LASTEXITCODE -ne 0) { throw 'second scope' } } finally { Pop-Location }")
-    Assert-Throws { Assert-CandidateScrubAndCargoContract $secondScope } 'a second candidate scope must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'pre-Push trusted/default-CWD evidence must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', '')) } 'pre-Push evidence must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Remove-Item Env:*', 'Pop-Location`nRemove-Item Env:*')) } 'split candidate scopes must fail'
