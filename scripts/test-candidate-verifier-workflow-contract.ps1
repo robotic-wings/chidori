@@ -145,7 +145,6 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
 
     $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
     Assert ($Text -match ('(?im)&\s*' + $resolved + '\b')) 'trusted verifier wrapper invocations must use the resolved git executable-path variable'
-    Assert ($Text -match ('(?im)Start-Process\s+-FilePath\s+' + $resolved + '\b')) 'trusted verifier byte-safe materialization must use Start-Process -FilePath with the resolved git executable-path variable'
     Assert ($Text -notmatch '(?im)(?:&\s*|Start-Process\s+-FilePath\s+)\$[A-Za-z_][A-Za-z0-9_]*\.(?:Source|Path)\b') 'trusted verifier must not invoke raw ApplicationInfo Source/Path members'
 
     $invocations = [regex]::Matches($Text, '(?im)&\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\b')
@@ -250,6 +249,26 @@ function Assert-NoPatchReplay([string]$Text) {
     }
 }
 
+function Assert-RawBinaryCaptureContract([string]$Text) {
+    $helper = '(?im)^\s*function\s+Write-RawGitOutput\b'
+    Assert ([regex]::Matches($Text, $helper).Count -eq 1) 'trusted verifier must define exactly one raw binary Git capture helper'
+    Assert ($Text -match '(?is)function\s+Write-RawGitOutput.{0,2000}(?:FileName|FilePath)\s*=\s*\$gitExecutablePath') 'raw capture helper must use the resolved Git executable path'
+    Assert ($Text -match '(?is)ProcessStartInfo.{0,2500}UseShellExecute\s*=\s*\$false.{0,2500}RedirectStandardOutput\s*=\s*\$true') 'raw capture helper must configure a non-shell ProcessStartInfo stdout stream'
+    Assert ($Text -match '(?is)FileStream.{0,2000}StandardOutput\.BaseStream\.CopyTo\(.{0,1500}Flush') 'raw capture helper must copy StandardOutput.BaseStream directly into a FileStream and flush it'
+    Assert ($Text -match '(?is)WaitForExit.{0,1000}ExitCode.{0,1000}(?:throw|if)') 'raw capture helper must wait for and fail closed on Git exit status'
+    Assert ($Text -match '(?is)(?:Close|Dispose).{0,1500}(?:Close|Dispose)') 'raw capture helper must close process and file resources'
+    Assert ($Text -notmatch '(?is)Start-Process\b|RedirectStandardOutput\s+\$|\|\s*(?:Out-String|Set-Content|Add-Content)|\b(?:Out-String|Set-Content|Add-Content)\b|>\s*\$|-[Ee]ncoding') 'trusted verifier must not use text, Start-Process, shell-redirection, or encoding-normalized Git capture'
+    foreach ($role in @('packageLock', 'baseLock', 'ctutilsLock', 'candidateLock', 'mergedLock')) {
+        Assert ($Text -match ('(?is)Write-RawGitOutput\s+\$' + $role + '\b')) "trusted verifier must bind raw capture helper to fixed $role output"
+    }
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$packageLock.{0,700}@\([''\"]show[''\"].{0,700}\$packageCommit.*Cargo\.lock') 'raw capture must use the fixed package show snapshot'
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$baseLock.{0,700}@\([''\"]show[''\"].{0,700}\$base.*Cargo\.lock') 'raw capture must use the fixed base show snapshot'
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$ctutilsLock.{0,700}@\([''\"]show[''\"].{0,700}\$ctutilsCommit.*Cargo\.lock') 'raw capture must use the fixed ctutils show snapshot'
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$candidateLock.{0,700}@\([''\"]show[''\"].{0,700}\$candidateSha.*Cargo\.lock') 'raw capture must use the fixed candidate lock snapshot'
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$mergedLock.{0,900}@\([''\"]merge-file[''\"].{0,700}[''\"]-p[''\"].{0,700}\$packageLock.{0,700}\$baseLock.{0,700}\$ctutilsLock') 'raw capture must use fixed package/base/ctutils merge-file -p ordering'
+    Assert ($Text -notmatch '(?is)\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*@\([''\"](?:show|merge-file)[''\"].{0,1000}Write-RawGitOutput') 'raw capture must not choose composition roles/options dynamically'
+}
+
 function Assert-LockCompositionContract([string]$Text) {
     foreach ($required in @(
         '59ebb109', '00148aa', '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9',
@@ -264,17 +283,12 @@ function Assert-LockCompositionContract([string]$Text) {
     Assert ($Text -match '(?is)Assert-Equal\s+\$ctutilsPaths') 'trusted verifier must require the exact ctutils changed-path set'
     Assert ($Text -match '(?is)\$packageCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind package parent lock base'
     Assert ($Text -match '(?is)\$ctutilsCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind ctutils parent lock base'
-    Assert ($Text -match '(?is)Write-GitOutput\s+\$packageLock.{0,500}show.{0,500}\$packageCommit.*Cargo\.lock') 'trusted verifier must materialize the package lock snapshot'
-    Assert ($Text -match '(?is)Write-GitOutput\s+\$baseLock.{0,500}show.{0,500}\$base.*Cargo\.lock') 'trusted verifier must materialize the shared base lock snapshot'
-    Assert ($Text -match '(?is)Write-GitOutput\s+\$ctutilsLock.{0,500}show.{0,500}\$ctutilsCommit.*Cargo\.lock') 'trusted verifier must materialize the ctutils lock snapshot'
     $resolutions = [regex]::Matches($Text, '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Resolve-GitExecutablePath\s*$')
     Assert ($resolutions.Count -eq 1) 'trusted verifier must use exactly one resolved executable path for lock construction'
     $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
-    $mergePattern = '(?is)Start-Process\s+-FilePath\s+' + $resolved + '.{0,1500}merge-file.{0,800}-p.{0,800}\$packageLock.{0,800}\$baseLock.{0,800}\$ctutilsLock.{0,1500}-RedirectStandardOutput\s+\$mergedLock'
-    Assert ([regex]::Matches($Text, $mergePattern).Count -eq 1) 'trusted verifier must use one resolved-executable byte-safe package/base/ctutils merge-file construction'
-    Assert ($Text -match '(?is)\$mergeProcess\.ExitCode\s+-ne\s+0.{0,500}throw') 'trusted verifier must fail closed on a nonzero three-way merge conflict'
     Assert ($Text -match '(?is)hash-object.{0,1000}\$mergedLock.{0,1000}c4b4316368317a342058f77151ab8043afea676b.{0,1000}Blob\s+\$candidateSha.{0,500}Cargo\.lock') 'trusted verifier must hash emitted merge bytes to final lock blob before candidate comparison'
     Assert-NoPatchReplay $Text
+    Assert-RawBinaryCaptureContract $Text
 }
 
 function Assert-WorkflowContract([string]$Workflow) {
@@ -608,9 +622,27 @@ Write-Host "git am is not a command here"
     }
 }
 
-function Write-FixtureGitOutput([string]$Path, [string[]]$Arguments) {
-    $process = Start-Process -FilePath git.exe -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "fixture git $($Arguments -join ' ') failed" }
+function Write-RawGitOutput([string]$Path, [string[]]$Arguments) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:RawCaptureGitExecutable
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = (($Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' ')
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $file = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        Assert $process.Start() 'raw fixture Git process must start'
+        $process.StandardOutput.BaseStream.CopyTo($file)
+        $file.Flush($true)
+        $process.WaitForExit()
+        $stderr = $process.StandardError.ReadToEnd()
+        if ($process.ExitCode -ne 0) { throw "raw fixture git $($Arguments -join ' ') failed: $stderr" }
+    } finally {
+        $file.Close()
+        $process.Close()
+    }
 }
 
 function Get-FixtureGitHash([string]$Path) {
@@ -619,13 +651,8 @@ function Get-FixtureGitHash([string]$Path) {
     return $hash
 }
 
-function Invoke-FixtureThreeWayMerge([string]$Package, [string]$Base, [string]$Ctutils, [string]$Output) {
-    $process = Start-Process -FilePath git.exe -ArgumentList @('merge-file', '-p', '--', $Package, $Base, $Ctutils) -RedirectStandardOutput $Output -NoNewWindow -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw 'fixture three-way merge conflict' }
-}
-
 function Assert-FixtureMergedHash([string]$Package, [string]$Base, [string]$Ctutils, [string]$Output, [string]$ExpectedHash) {
-    Invoke-FixtureThreeWayMerge $Package $Base $Ctutils $Output
+    Write-RawGitOutput $Output @('merge-file', '-p', '--', $Package, $Base, $Ctutils)
     Assert ((Get-FixtureGitHash $Output) -eq $ExpectedHash) 'materialized three-way merge bytes did not match the required final lock blob'
 }
 
@@ -633,29 +660,45 @@ function Invoke-LockCompositionFixtures {
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('chidori-lock-composition-' + [Guid]::NewGuid())
     New-Item -ItemType Directory -Path $temp | Out-Null
     try {
+        $script:RawCaptureGitExecutable = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        Assert (-not [string]::IsNullOrWhiteSpace($script:RawCaptureGitExecutable)) 'fixture must resolve a Git Application executable'
         $baseLock = Join-Path $temp 'base.lock'
         $packageLock = Join-Path $temp 'package.lock'
         $ctutilsLock = Join-Path $temp 'ctutils.lock'
         $mergedLock = Join-Path $temp 'merged.lock'
-        Write-FixtureGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
-        Write-FixtureGitOutput $packageLock @('show', '59ebb109:Cargo.lock')
-        Write-FixtureGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
+        $candidateLock = Join-Path $temp 'candidate.lock'
+        Write-RawGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
+        Write-RawGitOutput $packageLock @('show', '59ebb109:Cargo.lock')
+        Write-RawGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
+        Write-RawGitOutput $candidateLock @('show', 'c4b4316368317a342058f77151ab8043afea676b')
+        Assert ((Get-FixtureGitHash $baseLock) -eq '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'raw base snapshot must retain its source hash'
+        Assert ((Get-FixtureGitHash $packageLock) -eq '9e36a2e89363eeedc4215a68dbd51f33dfec3741') 'raw package snapshot must retain its source hash'
+        Assert ((Get-FixtureGitHash $ctutilsLock) -eq 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66') 'raw ctutils snapshot must retain its source hash'
+        Assert ((Get-FixtureGitHash $candidateLock) -eq 'c4b4316368317a342058f77151ab8043afea676b') 'raw candidate snapshot must retain its source hash'
         Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b'
+        Assert ((Get-FixtureGitHash $mergedLock) -ne 'd5de22a66677f314498279b13e89de1aefec72f6') 'raw merge must reject the text-normalized lock blob'
+        Assert ([System.Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($mergedLock), [IO.File]::ReadAllBytes($candidateLock))) 'raw merge bytes must equal candidate lock bytes before candidate comparison'
+        $normalizedLock = Join-Path $temp 'normalized.lock'
+        $rawText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($mergedLock))
+        [IO.File]::WriteAllText($normalizedLock, ($rawText -replace "`n", "`r`n"), [Text.UTF8Encoding]::new($true))
+        Assert ((Get-FixtureGitHash $normalizedLock) -ne 'c4b4316368317a342058f77151ab8043afea676b') 'CRLF/BOM text normalization must not preserve raw lock bytes'
+        [IO.File]::AppendAllText($normalizedLock, "`n", [Text.UTF8Encoding]::new($false))
+        Assert ((Get-FixtureGitHash $normalizedLock) -ne 'c4b4316368317a342058f77151ab8043afea676b') 'trailing-newline normalization must not preserve raw lock bytes'
         Assert-Throws { Assert-FixtureMergedHash $baseLock $packageLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong package/base/ctutils merge order must fail final-byte identity'
         Assert-Throws { Assert-FixtureMergedHash $packageLock $ctutilsLock $baseLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'swapped base and ctutils snapshots must fail final-byte identity'
-        Write-FixtureGitOutput $baseLock @('show', '59ebb109:Cargo.lock')
+        Write-RawGitOutput $baseLock @('show', '59ebb109:Cargo.lock')
         Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong base snapshot must fail final-byte identity'
-        Write-FixtureGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
-        Write-FixtureGitOutput $ctutilsLock @('show', '9e1c295:Cargo.lock')
+        Write-RawGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
+        Write-RawGitOutput $ctutilsLock @('show', '9e1c295:Cargo.lock')
         Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong ctutils target snapshot must fail final-byte identity'
-        Write-FixtureGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
+        Write-RawGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
         Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock ('0' * 40) } 'wrong expected final lock hash must fail equality'
 
         $overlapBase = Join-Path $temp 'overlap-base.lock'; $overlapPackage = Join-Path $temp 'overlap-package.lock'; $overlapCtutils = Join-Path $temp 'overlap-ctutils.lock'
         [IO.File]::WriteAllText($overlapBase, "same`n")
         [IO.File]::WriteAllText($overlapPackage, "package`n")
         [IO.File]::WriteAllText($overlapCtutils, "ctutils`n")
-        Assert-Throws { Invoke-FixtureThreeWayMerge $overlapPackage $overlapBase $overlapCtutils $mergedLock } 'overlapping materialized snapshots must fail closed'
+        Assert-Throws { Write-RawGitOutput $mergedLock @('merge-file', '-p', '--', $overlapPackage, $overlapBase, $overlapCtutils) } 'overlapping materialized snapshots must fail closed'
     } finally {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
     }
@@ -675,6 +718,29 @@ function Resolve-GitExecutablePath {
 $gitExecutablePath = Resolve-GitExecutablePath
 function Invoke-ResolvedGit([string[]]$Arguments) { $out = & $gitExecutablePath @Arguments }
 '@
+    $rawCaptureHappy = @'
+function Write-RawGitOutput([string]$Path, [string[]]$Arguments) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $gitExecutablePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = (($Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' ')
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $file = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        if (-not $process.Start()) { throw 'start failed' }
+        $process.StandardOutput.BaseStream.CopyTo($file)
+        $file.Flush($true)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw 'capture failed' }
+    } finally {
+        $file.Close()
+        $process.Close()
+    }
+}
+'@
     $compositionHappy = @'
 $packageCommit = '59ebb109'
 $ctutilsCommit = '00148aa'
@@ -686,18 +752,31 @@ Blob "$packageCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
 Blob "$ctutilsCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
 9e36a2e89363eeedc4215a68dbd51f33dfec3741
 fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66
-Write-GitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
-Write-GitOutput $baseLock @('show', "$base`:Cargo.lock")
-Write-GitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
-$mergeProcess = Start-Process -FilePath $gitExecutablePath -ArgumentList @('merge-file', '-p', '--', $packageLock, $baseLock, $ctutilsLock) -RedirectStandardOutput $mergedLock -PassThru -Wait
-if ($mergeProcess.ExitCode -ne 0) { throw 'conflict' }
+Write-RawGitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
+Write-RawGitOutput $baseLock @('show', "$base`:Cargo.lock")
+Write-RawGitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
+Write-RawGitOutput $candidateLock @('show', "$candidateSha`:Cargo.lock")
+Write-RawGitOutput $mergedLock @('merge-file', '-p', '--', $packageLock, $baseLock, $ctutilsLock)
 $constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
 Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b'
 Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock')
 '@
-    $mergeOnlyPortable = $resolverHappy + "`n" + $compositionHappy
+    $mergeOnlyPortable = $resolverHappy + "`n" + $rawCaptureHappy + "`n" + $compositionHappy
     Assert-VerifierScriptRecursionSafety $mergeOnlyPortable
     Assert-LockCompositionContract $mergeOnlyPortable
+    Assert-Throws { Assert-RawBinaryCaptureContract ($mergeOnlyPortable + "`nStart-Process -FilePath `$gitExecutablePath -RedirectStandardOutput `$mergedLock") } 'Start-Process redirect capture must fail the raw binary contract'
+    foreach ($textCapture in @(
+        '$bytes | Out-String | Set-Content $mergedLock',
+        'Add-Content -Path $mergedLock -Value $text',
+        '$text > $mergedLock',
+        'Set-Content -Path $mergedLock -Encoding utf8 -Value $text'
+    )) {
+        Assert-Throws { Assert-RawBinaryCaptureContract ($mergeOnlyPortable + "`n" + $textCapture) } "text or encoding capture must fail the raw binary contract: $textCapture"
+    }
+    $wrongOptions = $mergeOnlyPortable.Replace("@('merge-file', '-p', '--', `$packageLock, `$baseLock, `$ctutilsLock)", "@('merge-file', '--diff3', '--', `$packageLock, `$baseLock, `$ctutilsLock)")
+    Assert-Throws { Assert-RawBinaryCaptureContract $wrongOptions } 'wrong merge options must fail the raw binary contract'
+    $dynamicChoice = $mergeOnlyPortable.Replace("Write-RawGitOutput `$mergedLock @('merge-file', '-p', '--', `$packageLock, `$baseLock, `$ctutilsLock)", "`$mergeArguments = @('merge-file', '-p', '--', `$packageLock, `$baseLock, `$ctutilsLock)`nWrite-RawGitOutput `$mergedLock `$mergeArguments")
+    Assert-Throws { Assert-RawBinaryCaptureContract $dynamicChoice } 'dynamic merge argument choice must fail the raw binary contract'
     foreach ($replay in @(
         '& $gitExecutablePath apply --no-index $packagePatch',
         "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('apply', '--no-index', `$packagePatch)",
