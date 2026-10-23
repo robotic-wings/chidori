@@ -131,7 +131,9 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME'
 
     $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
-    $match = [regex]::Match($Text, $scope)
+    $scopeMatches = [regex]::Matches($Text, $scope)
+    Assert ($scopeMatches.Count -eq 1) 'locked Cargo block must contain exactly one canonical candidate Push-Location/try/finally/Pop-Location scope'
+    $match = $scopeMatches[0]
     Assert $match.Success 'metadata and tree must run in one balanced canonical candidate Push-Location/try/finally/Pop-Location scope'
     Assert ($match.Groups['body'].Value -notmatch '(?i)(?:Set-Location|Push-Location|Pop-Location|\bcd\b|\bsl\b|\bchdir\b)') 'candidate Cargo scope must not mutate the canonical location'
     $preScope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<pre>.*?)Remove-Item\s+Env:\*'
@@ -145,6 +147,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
         'git\s+rev-parse\s+HEAD',
         'git\s+status\s+--porcelain',
         'git\s+show\s+-s\s+--format=%P\s+\$candidateSha',
+        'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha',
         'cargo\s+metadata\s+--locked',
         'cargo\s+tree\s+--locked'
     )
@@ -152,6 +155,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
         $commands = [regex]::Matches($Text, '(?im)^\s*(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*$')
         Assert ($commands.Count -gt 0) "workflow must contain evidence command [$command]"
         foreach ($native in $commands) {
+            Assert ($native.Index -ge $match.Index -and ($native.Index + $native.Length) -le ($match.Index + $match.Length)) "candidate evidence command [$command] must not occur outside the sole canonical candidate scope"
             $following = $Text.Substring($native.Index + $native.Length, [Math]::Min(400, $Text.Length - $native.Index - $native.Length))
             Assert ($following -match '(?is)^\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw\b') "native evidence command [$command] must have an immediately adjacent LASTEXITCODE throw"
         }
@@ -573,6 +577,17 @@ $env:RUSTUP_HOME = $rustupHome
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    foreach ($prePushEvidence in @(
+        '$candidateHead = git rev-parse HEAD',
+        '$candidateStatus = git status --porcelain',
+        '$parents = (git show -s --format=%P $candidateSha).Split('' '')',
+        '$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha'
+    )) {
+        $prePush = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    $prePushEvidence`n    if (`$LASTEXITCODE -ne 0) { throw 'pre-push evidence failed' }`n")
+        Assert-Throws { Assert-CandidateScrubAndCargoContract $prePush } "candidate evidence before canonical Push-Location must fail: $prePushEvidence"
+    }
+    $secondScope = $candidateCargoWorkflow.Replace("    Pop-Location`n}", "    Pop-Location`n}`n    Push-Location `$candidateWorktree`n    try { `$candidateHead = git rev-parse HEAD; if (`$LASTEXITCODE -ne 0) { throw 'second scope' } } finally { Pop-Location }")
+    Assert-Throws { Assert-CandidateScrubAndCargoContract $secondScope } 'a second candidate scope must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'pre-Push trusted/default-CWD evidence must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', '')) } 'pre-Push evidence must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Remove-Item Env:*', 'Pop-Location`nRemove-Item Env:*')) } 'split candidate scopes must fail'
