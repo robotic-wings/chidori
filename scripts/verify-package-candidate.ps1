@@ -24,14 +24,31 @@ $gitExecutablePath = Resolve-GitExecutablePath
 function Invoke-ResolvedGit([string[]]$Arguments) {
     $out = & $gitExecutablePath @Arguments
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
-    return ($out | Out-String).TrimEnd()
+    return ($out -join [Environment]::NewLine).TrimEnd()
 }
 
-function Write-GitOutput([string]$Path, [string[]]$Arguments) {
-    # Redirect Git's stdout at the process boundary so patch bytes are preserved
-    # without routing them through a PowerShell text pipeline.
-    $process = Start-Process -FilePath $gitExecutablePath -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
-    if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed" }
+function Write-RawGitOutput([string]$Path, [string[]]$Arguments) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $gitExecutablePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $file = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        if (-not $process.Start()) { throw "git $($Arguments -join ' ') failed to start" }
+        $process.StandardOutput.BaseStream.CopyTo($file)
+        $file.Flush($true)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed" }
+    } finally {
+        $file.Close()
+        $process.Close()
+    }
 }
 
 function Assert-Equal([string]$Actual, [string]$Expected, [string]$What) {
@@ -88,7 +105,7 @@ Assert-Equal (Blob "$ctutilsCommit^" 'Cargo.lock') '47fbe5113e4b7c18cf2cc96f3a04
 Assert-Equal (Blob $ctutilsCommit 'Cargo.lock') 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66' 'ctutils lock target blob'
 
 # Materialize exact lock snapshots and compose them with an ordered three-way
-# merge in a disposable directory. Hashing its redirected bytes proves all
+# merge in a disposable directory. Hashing its raw bytes proves all
 # non-allowlisted lock stanzas, dependency lists, features, sources, and
 # checksums were preserved.
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("chidori-package-gate-" + [Guid]::NewGuid())
@@ -97,16 +114,22 @@ try {
     $packageLock = Join-Path $temp 'package.Cargo.lock'
     $baseLock = Join-Path $temp 'base.Cargo.lock'
     $ctutilsLock = Join-Path $temp 'ctutils.Cargo.lock'
+    $candidateLock = Join-Path $temp 'candidate.Cargo.lock'
     $mergedLock = Join-Path $temp 'merged.Cargo.lock'
-    Write-GitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
-    Write-GitOutput $baseLock @('show', "$base`:Cargo.lock")
-    Write-GitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
-    $mergeProcess = Start-Process -FilePath $gitExecutablePath -ArgumentList @('merge-file', '-p', $packageLock, $baseLock, $ctutilsLock) -RedirectStandardOutput $mergedLock -NoNewWindow -PassThru -Wait
-    if ($mergeProcess.ExitCode -ne 0) { throw 'ordered package/base/ctutils lock merge failed or conflicted' }
+    Write-RawGitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
+    Assert-Equal (Invoke-ResolvedGit @('hash-object', $packageLock)) '9e36a2e89363eeedc4215a68dbd51f33dfec3741' 'raw package lock source bytes'
+    Write-RawGitOutput $baseLock @('show', "$base`:Cargo.lock")
+    Assert-Equal (Invoke-ResolvedGit @('hash-object', $baseLock)) '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9' 'raw base lock source bytes'
+    Write-RawGitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
+    Assert-Equal (Invoke-ResolvedGit @('hash-object', $ctutilsLock)) 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66' 'raw ctutils lock source bytes'
+    Write-RawGitOutput $candidateLock @('show', "$candidateSha`:Cargo.lock")
+    Assert-Equal (Invoke-ResolvedGit @('hash-object', $candidateLock)) 'c4b4316368317a342058f77151ab8043afea676b' 'raw candidate lock source bytes'
+    Write-RawGitOutput $mergedLock @('merge-file', '-p', '--', $packageLock, $baseLock, $ctutilsLock)
 
     $constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
+    if ($constructedLockBlob -eq 'd5de22a66677f314498279b13e89de1aefec72f6') { throw 'text-normalized combined Cargo.lock blob is forbidden' }
     Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b' 'deterministic combined Cargo.lock blob'
-    Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
+    Assert-Equal $constructedLockBlob (Invoke-ResolvedGit @('hash-object', $candidateLock)) 'candidate Cargo.lock blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $candidateSha 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') (Blob $candidateSha 'crates/chidori/Cargo.toml') 'candidate chidori manifest blob'
 } finally {
