@@ -84,7 +84,8 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
             Assert $match.Success "$Name must execute immediately inside a balanced canonical Push-Location/Pop-Location segment"
             $operation = $match.Groups['operation'].Value
             Assert ($operation -match $Pattern) "$Name must be the operation inside the canonical execution segment"
-            Assert ($operation -notmatch '(?i)(Set-Location|Push-Location|Pop-Location)') "$Name execution segment must not change locations"
+            $locationMutation = '(?i)(?:^|[;|&]\s*)\s*(?:Set-Location|Push-Location|Pop-Location|cd|sl|chdir)\b'
+            Assert ($operation -notmatch $locationMutation) "$Name execution segment must not change locations, including through PowerShell location aliases"
         }
     }
     Assert ($operationCount -gt 0) "workflow must contain $Name"
@@ -248,6 +249,15 @@ Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; Set-Location trust
     Assert-Throws { Assert-SafeCandidateExecution $canonicalThenTrusted 'trusted verifier invocation' 'verify-package-candidate\.ps1' } 'canonical then trusted location must not authorize verifier'
     Assert-Throws { Assert-SafeCandidateExecution $canonicalThenTrusted 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'canonical then trusted location must not authorize metadata'
     Assert-Throws { Assert-SafeCandidateExecution $canonicalThenTrusted 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'canonical then trusted location must not authorize tree'
+
+    foreach ($alias in @('cd', 'CD', 'sl', 'SL', 'chdir', 'ChDiR')) {
+        $aliasMutation = 'Push-Location "' + $script:CanonicalCandidateWorktree + '"; & ' + $alias + ' trusted; powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA; Pop-Location' + "`n" +
+            'Push-Location "' + $script:CanonicalCandidateWorktree + '"; & ' + $alias + ' trusted; cargo metadata --locked; Pop-Location' + "`n" +
+            'Push-Location "' + $script:CanonicalCandidateWorktree + '"; & ' + $alias + ' trusted; cargo tree --locked; Pop-Location'
+        Assert-Throws { Assert-SafeCandidateExecution $aliasMutation 'trusted verifier invocation' 'verify-package-candidate\.ps1' } "$alias location alias must not authorize verifier"
+        Assert-Throws { Assert-SafeCandidateExecution $aliasMutation 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } "$alias location alias must not authorize metadata"
+        Assert-Throws { Assert-SafeCandidateExecution $aliasMutation 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } "$alias location alias must not authorize tree"
+    }
 }
 
 Invoke-Fixtures
