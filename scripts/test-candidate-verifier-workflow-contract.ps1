@@ -54,9 +54,7 @@ function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern
     $operations = [regex]::Matches($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
     Assert ($operations.Count -gt 0) "workflow must contain $Name"
     foreach ($operation in $operations) {
-        $start = [Math]::Max(0, $operation.Index - 1200)
-        $context = $Text.Substring($start, $operation.Index - $start + $operation.Length)
-        Assert ($context -match '\$env:CANDIDATE_SHA') "$Name must be bound to `$env:CANDIDATE_SHA"
+        Assert ($operation.Value -match '\$env:CANDIDATE_SHA') "$Name command/ref must contain literal `$env:CANDIDATE_SHA"
     }
 }
 
@@ -137,7 +135,37 @@ function Invoke-Fixtures {
     }
 }
 
+function Invoke-StaticWorkflowFixtures {
+    $happy = @'
+git fetch origin $env:CANDIDATE_SHA
+git worktree add --detach candidate $env:CANDIDATE_SHA
+powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA
+cargo metadata --locked # candidate $env:CANDIDATE_SHA
+cargo tree --locked # candidate $env:CANDIDATE_SHA
+'@
+    Assert-EnvBoundOperation $happy 'candidate fetch' '^.*git\s+fetch.*$'
+    Assert-EnvBoundOperation $happy 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    Assert-EnvBoundOperation $happy 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
+    Assert-EnvBoundOperation $happy 'candidate Cargo metadata invocation' '^.*cargo\s+metadata\s+--locked.*$'
+    Assert-EnvBoundOperation $happy 'candidate Cargo tree invocation' '^.*cargo\s+tree\s+--locked.*$'
+
+    $inertAlias = @'
+$env:CANDIDATE_SHA
+git fetch origin $candidate_alias
+git worktree add --detach candidate $candidate_alias
+powershell -File scripts/verify-package-candidate.ps1 -Candidate $candidate_alias
+cargo metadata --locked # candidate $candidate_alias
+cargo tree --locked # candidate $candidate_alias
+'@
+    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate fetch' '^.*git\s+fetch.*$' } 'inert earlier env reference must not authorize alias-backed fetch'
+    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$' } 'inert earlier env reference must not authorize alias-backed worktree'
+    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } 'inert earlier env reference must not authorize alias-backed verifier'
+    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate Cargo metadata invocation' '^.*cargo\s+metadata\s+--locked.*$' } 'inert earlier env reference must not authorize alias-backed metadata'
+    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate Cargo tree invocation' '^.*cargo\s+tree\s+--locked.*$' } 'inert earlier env reference must not authorize alias-backed tree'
+}
+
 Invoke-Fixtures
+Invoke-StaticWorkflowFixtures
 if (-not $FixturesOnly) {
     Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
 }
