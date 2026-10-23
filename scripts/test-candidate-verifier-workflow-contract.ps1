@@ -118,9 +118,14 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $captureWorktree = '(?m)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$'
     Assert ([regex]::Matches($Text, $captureSha).Count -eq 1) 'workflow must capture candidate SHA exactly once before environment scrub'
     Assert ([regex]::Matches($Text, $captureWorktree).Count -eq 1) 'workflow must capture canonical candidate worktree before environment scrub'
+    $captureTarget = '(?m)^\s*\$candidateTarget\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+[''"]candidate-target-\$candidateSha[''"]\s*$'
+    Assert ([regex]::Matches($Text, $captureTarget).Count -eq 1) 'workflow must capture exactly one external candidate target before environment scrub'
     $captureEnd = [regex]::Match($Text, $captureWorktree).Index
     $firstScrub = [regex]::Match($Text, '(?im)^\s*Remove-Item\s+Env:\*').Index
     Assert ($firstScrub -ge 0 -and $captureEnd -lt $firstScrub) 'candidate SHA and canonical worktree capture must precede environment scrub'
+    Assert ([regex]::Match($Text, $captureTarget).Index -lt $firstScrub) 'candidate target capture must precede environment scrub'
+    Assert ($Text -match '(?im)^\s*\$candidateTargetCanonical\s*=\s*\[IO\.Path\]::GetFullPath\(\$candidateTarget\)') 'candidate target must be canonicalized before scrub'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical\s*-eq\s*\$candidateWorktreeCanonical') 'candidate target validation must reject the candidate worktree itself'
 
     $scrubbed = $Text.Substring($firstScrub)
     Assert ($scrubbed -notmatch '(?i)\$env:(?:RUNNER_TEMP|CANDIDATE_SHA|GITHUB_TOKEN|GH_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN)') 'scrubbed execution must never re-read candidate/runtime or credential environment values'
@@ -128,7 +133,9 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     foreach ($safe in @('PATH', 'HOME', 'CARGO_HOME', 'RUSTUP_HOME')) {
         Assert ($scrubbed -match ('(?im)^\s*\$env:' + $safe + '\s*=\s*\$')) "scrubbed execution must restore only the captured $safe environment value"
     }
-    Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME'
+    $cargoTargetRestore = '(?m)^\s*\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget\s*$'
+    Assert ([regex]::Matches($scrubbed, $cargoTargetRestore).Count -eq 1) 'scrubbed execution must restore exactly one captured candidate target directory'
+    Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME|CARGO_TARGET_DIR)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME/CARGO_TARGET_DIR'
 
     $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
     $allCandidateScopes = [regex]::Matches($Text, '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{.*?\}\s*finally\s*\{\s*Pop-Location\s*\}')
@@ -138,6 +145,11 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $match = $scopeMatches[0]
     Assert $match.Success 'metadata and tree must run in one balanced canonical candidate Push-Location/try/finally/Pop-Location scope'
     Assert ($match.Groups['body'].Value -notmatch '(?i)(?:Set-Location|Push-Location|Pop-Location|\bcd\b|\bsl\b|\bchdir\b)') 'candidate Cargo scope must not mutate the canonical location'
+    $scopedVerifier = '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget'
+    $verifierInvocations = [regex]::Matches($Text, $scopedVerifier)
+    Assert ($verifierInvocations.Count -eq 1) 'trusted verifier must run exactly once with the captured target'
+    Assert ($verifierInvocations[0].Index -ge $match.Index -and ($verifierInvocations[0].Index + $verifierInvocations[0].Length) -le ($match.Index + $match.Length)) 'trusted verifier must run inside the sole canonical candidate scope'
+    Assert ($match.Value -match ('(?is)Remove-Item\s+Env:\*.*?' + $cargoTargetRestore + '.*?' + $scopedVerifier + '.*?cargo\s+metadata\s+--locked')) 'trusted verifier must follow scrub and exact CARGO_TARGET_DIR restore before Cargo'
     $preScope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<pre>.*?)Remove-Item\s+Env:\*'
     $preMatch = [regex]::Match($Text, $preScope)
     Assert $preMatch.Success 'canonical candidate Push-Location/try scope must begin before pre-scrub evidence'
@@ -475,7 +487,6 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert-CanonicalWorktreeOperation $text 'detached candidate worktree' "^.*$worktreeTarget.*$"
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
     Assert-TrustedVerifierIdentity $text
-    Assert-SafeCandidateExecution $text 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
@@ -554,6 +565,10 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
     $candidateCargoHappy = @'
 $candidateSha = $env:CANDIDATE_SHA
 $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
+$candidateTargetCanonical = [IO.Path]::GetFullPath($candidateTarget)
+$candidateWorktreeCanonical = [IO.Path]::GetFullPath($candidateWorktree)
+if ($candidateTargetCanonical -eq $candidateWorktreeCanonical) { throw 'target equals worktree' }
 $toolPath = $env:PATH
 $homePath = $env:HOME
 $cargoHome = $env:CARGO_HOME
@@ -580,6 +595,9 @@ $env:PATH = $toolPath
 $env:HOME = $homePath
 $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
+$env:CARGO_TARGET_DIR = $candidateTarget
+& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'trusted verifier failed' }
     $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
     $candidateStatus = git status --porcelain
@@ -713,6 +731,14 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     }
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', '$env:ARBITRARY = $candidateTarget')) } 'arbitrary scrubbed environment restore must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', '$env:CARGO_TARGET_DIR = (Join-Path $env:RUNNER_TEMP "derived-target")')) } 'derived target restore must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', '$env:CARGO_TARGET_DIR = $candidateWorktree')) } 'alternate target restore must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', "`$env:CARGO_TARGET_DIR = `$candidateTarget`n    `$env:CARGO_TARGET_DIR = `$candidateTarget")) } 'duplicate target restore must fail'
+    $postScrubTargetDerivation = 'Remove-Item Env:*' + "`n    " + '$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"', '').Replace('Remove-Item Env:*', $postScrubTargetDerivation)) } 'post-scrub target derivation must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget`nPush-Location $candidateWorktree')) } 'verifier outside the canonical candidate scope must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow + "`n    Push-Location `$candidateWorktree`n    try { & pwsh -NoProfile -ExecutionPolicy Bypass -File `$trustedVerifier -Target `$candidateTarget } finally { Pop-Location }") } 'second verifier candidate scope must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
