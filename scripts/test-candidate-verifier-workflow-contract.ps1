@@ -104,7 +104,7 @@ function Assert-TrustedVerifierIdentity([string]$Text) {
     Assert ([regex]::Matches($Text, $verifierAssignment).Count -eq 1) 'trusted verifier must be derived from the canonical trusted root'
     Assert ($Text -notmatch '(?im)^\s*\$trusted(?:Root|Verifier)\s*=.*\$env:RUNNER_TEMP') 'trusted verifier must not be rooted in RUNNER_TEMP'
 
-    $failClosedGuard = '(?is)if\s*\(\s*-not\s*\(\s*Test-Path\s+-LiteralPath\s+\$trustedVerifier\s*\)\s*\)\s*\{\s*(?:throw\b|exit\b)'
+    $failClosedGuard = '(?is)if\s*\(\s*-not\s*\(\s*Test-Path\s+-LiteralPath\s+\$trustedVerifier\s*\)\s*\)\s*\{\s*(?:throw\b|exit\s+(?:-[1-9]\d*|[1-9]\d*)\b)'
     Assert ([regex]::Matches($Text, $failClosedGuard).Count -eq 1) 'trusted verifier must have exactly one fail-closed Test-Path guard through its canonical variable'
     $invocation = '(?im)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert ([regex]::Matches($Text, $invocation).Count -eq 1) 'trusted verifier must be invoked exactly once through the canonical variable with pwsh -File'
@@ -227,6 +227,12 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
 
     $bareVerifierCheck = $happy.Replace("if (-not (Test-Path -LiteralPath `$trustedVerifier)) { throw 'missing trusted verifier' }", 'Test-Path -LiteralPath $trustedVerifier')
     Assert-Throws { Assert-TrustedVerifierIdentity $bareVerifierCheck } 'bare/no-op trusted verifier Test-Path must be rejected'
+
+    $bareExitGuard = $happy.Replace("throw 'missing trusted verifier'", 'exit')
+    Assert-Throws { Assert-TrustedVerifierIdentity $bareExitGuard } 'bare exit trusted verifier guard must be rejected'
+
+    $zeroExitGuard = $happy.Replace("throw 'missing trusted verifier'", 'exit 0')
+    Assert-Throws { Assert-TrustedVerifierIdentity $zeroExitGuard } 'exit 0 trusted verifier guard must be rejected'
 
     $directVerifierPath = $happy.Replace('-File $trustedVerifier', "-File (Join-Path `$trustedRoot 'scripts/verify-package-candidate.ps1')")
     Assert-Throws { Assert-TrustedVerifierIdentity $directVerifierPath } 'direct trusted verifier path must not bypass the canonical variable'
