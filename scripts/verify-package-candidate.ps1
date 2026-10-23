@@ -31,10 +31,25 @@ $ctutilsCommit = '00148aa'
 $base = '9e1c295'
 $paths = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
 
-$null = Git @('merge-base', '--is-ancestor', $base, $Candidate)
+$candidateSha = Git @('rev-parse', "$Candidate^{commit}")
+$headSha = Git @('rev-parse', 'HEAD^{commit}')
+Assert-Equal $candidateSha $headSha 'candidate must be the checked-out HEAD'
+$null = Git @('merge-base', '--is-ancestor', $base, $candidateSha)
 
 $dirtyBefore = Git @('status', '--porcelain', '--untracked-files=no')
 if ($dirtyBefore) { throw "tracked tree is dirty before verification: $dirtyBefore" }
+
+$candidatePaths = Git @('diff', '--name-only', $base, $candidateSha)
+Assert-Equal $candidatePaths ($paths -join [Environment]::NewLine) 'candidate changed-path set from 9e1c295'
+
+# Compare every base-tracked blob outside the three allowlisted package paths,
+# rather than relying on an ancestry relationship or a summarized diff.
+$baseTrackedPaths = Git @('ls-tree', '-r', '--name-only', $base)
+foreach ($path in ($baseTrackedPaths -split [Environment]::NewLine)) {
+    if ($path -and $paths -notcontains $path) {
+        Assert-Equal (Blob $candidateSha $path) (Blob $base $path) "non-allowlisted base blob $path"
+    }
+}
 
 $directPaths = Git @('show', '--format=', '--name-only', $packageCommit)
 Assert-Equal $directPaths ($paths -join [Environment]::NewLine) '59ebb109 changed-path set'
@@ -71,21 +86,21 @@ try {
         Pop-Location
     }
 
-    Assert-Equal (Git @('hash-object', (Join-Path $temp 'Cargo.lock'))) (Blob $Candidate 'Cargo.lock') 'candidate Cargo.lock blob'
-    Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $Candidate 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
-    Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') (Blob $Candidate 'crates/chidori/Cargo.toml') 'candidate chidori manifest blob'
+    Assert-Equal (Git @('hash-object', (Join-Path $temp 'Cargo.lock'))) (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
+    Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $candidateSha 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
+    Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') (Blob $candidateSha 'crates/chidori/Cargo.toml') 'candidate chidori manifest blob'
 } finally {
     if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
 }
 
-$lock = FileAt $Candidate 'Cargo.lock'
+$lock = FileAt $candidateSha 'Cargo.lock'
 if ($lock -notmatch '(?s)name = "ctutils"\s*version = "0\.4\.4"\s*source = "registry\+https://github\.com/rust-lang/crates\.io-index"\s*checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"') {
     throw 'candidate Cargo.lock lacks the exact ctutils 0.4.4 checksum stanza'
 }
-$jsManifest = FileAt $Candidate 'crates/chidori-js/Cargo.toml'
-$chidoriManifest = FileAt $Candidate 'crates/chidori/Cargo.toml'
+$jsManifest = FileAt $candidateSha 'crates/chidori-js/Cargo.toml'
+$chidoriManifest = FileAt $candidateSha 'crates/chidori/Cargo.toml'
 if ($jsManifest -notmatch '(?m)^version = "0\.4\.1"$') { throw 'chidori-js manifest is not exactly version 0.4.1' }
-if ($chidoriManifest -notmatch '(?m)^chidori-js = \{ path = "\.\./chidori-js", version = "=0\.4\.1" \}$') { throw 'chidori path dependency is not exact chidori-js 0.4.1' }
+if ($chidoriManifest -notmatch '(?m)^chidori-js = \{ path = "\.\./chidori-js", version = "0\.4\.1" \}$') { throw 'chidori path dependency is not exact chidori-js 0.4.1' }
 
 & cargo metadata --locked --format-version 1 --no-deps | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'cargo metadata --locked failed' }
@@ -94,4 +109,4 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo tree --locked -p chidori failed' }
 
 $dirtyAfter = Git @('status', '--porcelain', '--untracked-files=no')
 if ($dirtyAfter) { throw "tracked tree is dirty after verification: $dirtyAfter" }
-Write-Host "PASS: candidate $Candidate is bound to direct patches 59ebb109 + 00148aa with locked metadata/tree evidence."
+Write-Host "PASS: candidate $candidateSha is checked-out HEAD and is bound to direct patches 59ebb109 + 00148aa with locked metadata/tree evidence."
