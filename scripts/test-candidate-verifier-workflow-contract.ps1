@@ -146,7 +146,6 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
     $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
     Assert ($Text -match ('(?im)&\s*' + $resolved + '\b')) 'trusted verifier wrapper invocations must use the resolved git executable-path variable'
     Assert ($Text -match ('(?im)Start-Process\s+-FilePath\s+' + $resolved + '\b')) 'trusted verifier byte-safe materialization must use Start-Process -FilePath with the resolved git executable-path variable'
-    Assert ($Text -match ('(?im)&\s*' + $resolved + '\s+apply\b')) 'trusted verifier direct apply operations must use the resolved git executable-path variable'
     Assert ($Text -notmatch '(?im)(?:&\s*|Start-Process\s+-FilePath\s+)\$[A-Za-z_][A-Za-z0-9_]*\.(?:Source|Path)\b') 'trusted verifier must not invoke raw ApplicationInfo Source/Path members'
 
     $invocations = [regex]::Matches($Text, '(?im)&\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\b')
@@ -167,6 +166,29 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
     Assert ($executableText -notmatch '(?im)Start-Process\s+-FilePath\s+(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier Start-Process must not bypass the resolved git Application variable'
 }
 
+function Assert-NoPatchReplay([string]$Text) {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    Assert ($errors.Count -eq 0) 'trusted verifier replay analysis requires parseable PowerShell'
+    $replayVerb = '(?:apply|patch|am)'
+    $diffBinary = 'diff[''\"]?(?:\s*,?\s*[''\"]?--binary[''\"]?)'
+    $commands = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+    foreach ($command in $commands) {
+        $name = $command.GetCommandName()
+        $source = $command.Extent.Text
+        $isResolvedDirect = $source -match '(?is)^\s*&\s*\$[A-Za-z_][A-Za-z0-9_]*\b'
+        $isResolvedWrapper = $name -eq 'Invoke-ResolvedGit'
+        $isResolvedStartProcess = $name -eq 'Start-Process' -and $source -match '(?is)-FilePath\s+\$[A-Za-z_][A-Za-z0-9_]*\b'
+        if (-not ($isResolvedDirect -or $isResolvedWrapper -or $isResolvedStartProcess)) { continue }
+
+        $directReplay = '(?is)^\s*&\s*\$[A-Za-z_][A-Za-z0-9_]*\s+(?:[''\"]?' + $replayVerb + '[''\"]?\b|[''\"]?' + $diffBinary + ')'
+        $wrapperReplay = '(?is)^\s*Invoke-ResolvedGit\s+@\(\s*[''\"]?(?:' + $replayVerb + '|' + $diffBinary + ')'
+        $startReplay = '(?is)^\s*Start-Process\b.*?-ArgumentList\s+@\(\s*[''\"]?(?:' + $replayVerb + '|' + $diffBinary + ')'
+        Assert ($source -notmatch $directReplay -and $source -notmatch $wrapperReplay -and $source -notmatch $startReplay) 'trusted verifier must not replay lock changes through apply, patch, am, or diff --binary'
+    }
+}
+
 function Assert-LockCompositionContract([string]$Text) {
     foreach ($required in @(
         '59ebb109', '00148aa', '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9',
@@ -184,11 +206,14 @@ function Assert-LockCompositionContract([string]$Text) {
     Assert ($Text -match '(?is)Write-GitOutput\s+\$packageLock.{0,500}show.{0,500}\$packageCommit.*Cargo\.lock') 'trusted verifier must materialize the package lock snapshot'
     Assert ($Text -match '(?is)Write-GitOutput\s+\$baseLock.{0,500}show.{0,500}\$base.*Cargo\.lock') 'trusted verifier must materialize the shared base lock snapshot'
     Assert ($Text -match '(?is)Write-GitOutput\s+\$ctutilsLock.{0,500}show.{0,500}\$ctutilsCommit.*Cargo\.lock') 'trusted verifier must materialize the ctutils lock snapshot'
-    $mergePattern = '(?is)Start-Process\s+-FilePath\s+\$gitExecutablePath.{0,1500}merge-file.{0,800}-p.{0,800}\$packageLock.{0,800}\$baseLock.{0,800}\$ctutilsLock.{0,1500}-RedirectStandardOutput\s+\$mergedLock'
-    Assert ($Text -match $mergePattern) 'trusted verifier must byte-safely emit package/base/ctutils ordered three-way merge bytes'
+    $resolutions = [regex]::Matches($Text, '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Resolve-GitExecutablePath\s*$')
+    Assert ($resolutions.Count -eq 1) 'trusted verifier must use exactly one resolved executable path for lock construction'
+    $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
+    $mergePattern = '(?is)Start-Process\s+-FilePath\s+' + $resolved + '.{0,1500}merge-file.{0,800}-p.{0,800}\$packageLock.{0,800}\$baseLock.{0,800}\$ctutilsLock.{0,1500}-RedirectStandardOutput\s+\$mergedLock'
+    Assert ([regex]::Matches($Text, $mergePattern).Count -eq 1) 'trusted verifier must use one resolved-executable byte-safe package/base/ctutils merge-file construction'
     Assert ($Text -match '(?is)\$mergeProcess\.ExitCode\s+-ne\s+0.{0,500}throw') 'trusted verifier must fail closed on a nonzero three-way merge conflict'
     Assert ($Text -match '(?is)hash-object.{0,1000}\$mergedLock.{0,1000}c4b4316368317a342058f77151ab8043afea676b.{0,1000}Blob\s+\$candidateSha.{0,500}Cargo\.lock') 'trusted verifier must hash emitted merge bytes to final lock blob before candidate comparison'
-    Assert ($Text -notmatch '(?is)(?:git\s+)?diff\s+--binary|apply\s+--no-index') 'trusted verifier must not reconstruct the lock with diff/apply patch application'
+    Assert-NoPatchReplay $Text
 }
 
 function Assert-WorkflowContract([string]$Workflow) {
@@ -421,7 +446,7 @@ function Invoke-ResolvedGit([string[]]$Arguments) {
     $out = & $gitExecutablePath @Arguments
 }
 $process = Start-Process -FilePath $gitExecutablePath -ArgumentList @('show', 'HEAD:Cargo.lock') -RedirectStandardOutput lock -NoNewWindow -PassThru -Wait
-& $gitExecutablePath apply --no-index patch
+$mergeProcess = Start-Process -FilePath $gitExecutablePath -ArgumentList @('merge-file', '-p', '--', 'package', 'base', 'ctutils') -RedirectStandardOutput merged -NoNewWindow -PassThru -Wait
 '@
     Assert-VerifierScriptPortability $portable
     Assert-VerifierScriptRecursionSafety $portable
@@ -481,8 +506,7 @@ $process = Start-Process -FilePath $gitExecutablePath -ArgumentList @('show', 'H
         "function Git { & `$gitExecutablePath status }",
         "function gIt { & `$gitExecutablePath status }",
         '& git status',
-        'Start-Process -FilePath git -ArgumentList @(''status'')',
-        '& git apply --no-index patch'
+        'Start-Process -FilePath git -ArgumentList @(''status'')'
     )) {
         Assert-Throws { Assert-VerifierScriptRecursionSafety ($portable + "`n" + $recursionUnsafe) } "recursion-unsafe verifier form must be rejected: $recursionUnsafe"
     }
@@ -497,6 +521,22 @@ $gitApplication = Get-Command git -CommandType Application
 Start-Process -FilePath $gitApplication -ArgumentList @('status')
 '@
     Assert-Throws { Assert-VerifierScriptRecursionSafety $rawApplicationStartProcess } 'raw ApplicationInfo Start-Process must be rejected'
+
+    $replayCommentsAndStrings = $portable + "`n" + @'
+# & $gitExecutablePath apply --no-index patch
+$description = 'git diff --binary is forbidden only when executed'
+Write-Host "git am is not a command here"
+'@
+    Assert-NoPatchReplay $replayCommentsAndStrings
+    foreach ($replay in @(
+        '& $gitExecutablePath apply --no-index patch',
+        "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('apply', '--no-index', 'patch')",
+        "Invoke-ResolvedGit @('patch', 'patchfile')",
+        "Invoke-ResolvedGit @('am', 'mailbox')",
+        "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('diff', '--binary')"
+    )) {
+        Assert-Throws { Assert-NoPatchReplay ($portable + "`n" + $replay) } "replay command must be rejected: $replay"
+    }
 }
 
 function Write-FixtureGitOutput([string]$Path, [string[]]$Arguments) {
@@ -551,11 +591,26 @@ function Invoke-LockCompositionFixtures {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
     }
 
+    $resolverHappy = @'
+function Resolve-GitExecutablePath {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in (Get-Command git -All -CommandType Application)) {
+        $raw = if (-not [string]::IsNullOrWhiteSpace($candidate.Source)) { $candidate.Source } else { $candidate.Path }
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) { continue }
+        $canonical = (Resolve-Path -LiteralPath ([IO.Path]::GetFullPath($raw))).Path
+        if ($seen.Add($canonical)) { return $canonical }
+    }
+    throw 'no valid git Application executable path'
+}
+$gitExecutablePath = Resolve-GitExecutablePath
+function Invoke-ResolvedGit([string[]]$Arguments) { $out = & $gitExecutablePath @Arguments }
+'@
     $compositionHappy = @'
 $packageCommit = '59ebb109'
 $ctutilsCommit = '00148aa'
-git show --format= --name-only $packageCommit Cargo.lock
-git show --format= --name-only $ctutilsCommit Cargo.lock
+$directPaths = Invoke-ResolvedGit @('show', '--format=', '--name-only', $packageCommit, 'Cargo.lock')
+$ctutilsPaths = Invoke-ResolvedGit @('show', '--format=', '--name-only', $ctutilsCommit, 'Cargo.lock')
 Assert-Equal $directPaths $paths
 Assert-Equal $ctutilsPaths Cargo.lock
 Blob "$packageCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
@@ -571,8 +626,18 @@ $constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
 Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b'
 Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock')
 '@
-    Assert-LockCompositionContract $compositionHappy
-    Assert-Throws { Assert-LockCompositionContract ($compositionHappy + "`n& `$gitExecutablePath apply --no-index `$packagePatch") } 'direct patch application must fail the composition contract'
+    $mergeOnlyPortable = $resolverHappy + "`n" + $compositionHappy
+    Assert-VerifierScriptRecursionSafety $mergeOnlyPortable
+    Assert-LockCompositionContract $mergeOnlyPortable
+    foreach ($replay in @(
+        '& $gitExecutablePath apply --no-index $packagePatch',
+        "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('apply', '--no-index', `$packagePatch)",
+        "Invoke-ResolvedGit @('patch', `$packagePatch)",
+        "Invoke-ResolvedGit @('am', `$packagePatch)",
+        "Invoke-ResolvedGit @('diff', '--binary', 'HEAD')"
+    )) {
+        Assert-Throws { Assert-LockCompositionContract ($mergeOnlyPortable + "`n" + $replay) } "lock replay must fail the composition contract: $replay"
+    }
 }
 
 Invoke-Fixtures
