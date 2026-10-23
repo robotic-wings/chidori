@@ -4,6 +4,7 @@ param([switch]$FixturesOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $script:CanonicalCandidateWorktree = '$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA'
+$script:CanonicalTrustedRoot = '$env:GITHUB_WORKSPACE/trusted'
 
 function Assert([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -91,6 +92,28 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
     Assert ($operationCount -gt 0) "workflow must contain $Name"
 }
 
+function Assert-TrustedVerifierIdentity([string]$Text) {
+    $trustedCheckout = '(?ms)^\s*-\s*uses:\s*actions/checkout[^\r\n]*\r?\n(?<block>.*?)(?=^\s*-\s|\z)'
+    $checkout = [regex]::Match($Text, $trustedCheckout)
+    Assert $checkout.Success 'workflow must check out the trusted verifier'
+    Assert ($checkout.Groups['block'].Value -match '(?m)^\s*path:\s*trusted\s*$') 'trusted checkout must use path trusted'
+
+    $rootAssignment = '(?m)^\s*\$trustedRoot\s*=\s*Join-Path\s+\$env:GITHUB_WORKSPACE\s+[''\"]trusted[''\"]\s*$'
+    Assert ([regex]::Matches($Text, $rootAssignment).Count -eq 1) 'trusted root must be derived exactly once from GITHUB_WORKSPACE and checkout path trusted'
+    $verifierAssignment = '(?m)^\s*\$trustedVerifier\s*=\s*Join-Path\s+\$trustedRoot\s+[''\"]scripts[/\\]verify-package-candidate\.ps1[''\"]\s*$'
+    Assert ([regex]::Matches($Text, $verifierAssignment).Count -eq 1) 'trusted verifier must be derived from the canonical trusted root'
+    Assert ($Text -notmatch '(?im)^\s*\$trusted(?:Root|Verifier)\s*=.*\$env:RUNNER_TEMP') 'trusted verifier must not be rooted in RUNNER_TEMP'
+
+    $failClosedGuard = '(?is)if\s*\(\s*-not\s*\(\s*Test-Path\s+-LiteralPath\s+\$trustedVerifier\s*\)\s*\)\s*\{\s*(?:throw\b|exit\s+(?:-[1-9]\d*|[1-9]\d*)\b)'
+    Assert ([regex]::Matches($Text, $failClosedGuard).Count -eq 1) 'trusted verifier must have exactly one fail-closed Test-Path guard through its canonical variable'
+    $invocation = '(?im)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
+    Assert ([regex]::Matches($Text, $invocation).Count -eq 1) 'trusted verifier must be invoked exactly once through the canonical variable with pwsh -File'
+    Assert ($Text -notmatch '(?im)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+(?!\$trustedVerifier\b)') 'trusted verifier invocation must not bypass the canonical variable'
+
+    $ordered = $failClosedGuard + '(?s:.{0,4000}?)Remove-Item\s+Env:.*?' + [regex]::Escape('& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier')
+    Assert ($Text -match $ordered) 'trusted verifier fail-closed guard must precede environment scrub and invocation'
+}
+
 function Assert-WorkflowContract([string]$Workflow) {
     Assert (Test-Path -LiteralPath $Workflow) 'missing .github/workflows/candidate-verifier.yml'
     $text = [IO.File]::ReadAllText($Workflow)
@@ -116,7 +139,8 @@ function Assert-WorkflowContract([string]$Workflow) {
     $worktreeTarget = 'git\s+worktree\s+add\s+--detach\s+(?:"|'')?' + [regex]::Escape($script:CanonicalCandidateWorktree)
     Assert-CanonicalWorktreeOperation $text 'detached candidate worktree' "^.*$worktreeTarget.*$"
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
-    Assert-SafeCandidateExecution $text 'trusted verifier invocation' 'verify-package-candidate\.ps1'
+    Assert-TrustedVerifierIdentity $text
+    Assert-SafeCandidateExecution $text 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert-SafeCandidateExecution $text 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $text 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
@@ -173,17 +197,45 @@ function Invoke-Fixtures {
 
 function Invoke-StaticWorkflowFixtures {
     $happy = @'
+- uses: actions/checkout@v7
+  with:
+    path: trusted
+$trustedRoot = Join-Path $env:GITHUB_WORKSPACE 'trusted'
+$trustedVerifier = Join-Path $trustedRoot 'scripts/verify-package-candidate.ps1'
+if (-not (Test-Path -LiteralPath $trustedVerifier)) { throw 'missing trusted verifier' }
 git fetch origin $env:CANDIDATE_SHA
 git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
-Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA; Pop-Location
+Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; Remove-Item Env:*; & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $env:CANDIDATE_SHA; Pop-Location
 Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo metadata --locked; Pop-Location
 Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --locked; Pop-Location
 '@
+    Assert-TrustedVerifierIdentity $happy
     Assert-EnvBoundOperation $happy 'candidate fetch' '^.*git\s+fetch.*$'
     Assert-CanonicalWorktreeOperation $happy 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
-    Assert-SafeCandidateExecution $happy 'trusted verifier invocation' 'verify-package-candidate\.ps1'
+    Assert-SafeCandidateExecution $happy 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert-SafeCandidateExecution $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
+
+    $runnerTempTrusted = $happy.Replace('$env:GITHUB_WORKSPACE', '$env:RUNNER_TEMP')
+    Assert-Throws { Assert-TrustedVerifierIdentity $runnerTempTrusted } 'RUNNER_TEMP trusted verifier root must be rejected'
+
+    $checkoutRootMismatch = $happy.Replace("Join-Path `$env:GITHUB_WORKSPACE 'trusted'", "Join-Path `$env:GITHUB_WORKSPACE 'other'")
+    Assert-Throws { Assert-TrustedVerifierIdentity $checkoutRootMismatch } 'trusted checkout and trusted root mismatch must be rejected'
+
+    $missingVerifierCheck = [regex]::Replace($happy, '(?m)^if \(-not \(Test-Path -LiteralPath \$trustedVerifier\)\) \{ throw ''missing trusted verifier'' \}\r?\n?', '')
+    Assert-Throws { Assert-TrustedVerifierIdentity $missingVerifierCheck } 'trusted verifier invocation without Test-Path must be rejected'
+
+    $bareVerifierCheck = $happy.Replace("if (-not (Test-Path -LiteralPath `$trustedVerifier)) { throw 'missing trusted verifier' }", 'Test-Path -LiteralPath $trustedVerifier')
+    Assert-Throws { Assert-TrustedVerifierIdentity $bareVerifierCheck } 'bare/no-op trusted verifier Test-Path must be rejected'
+
+    $bareExitGuard = $happy.Replace("throw 'missing trusted verifier'", 'exit')
+    Assert-Throws { Assert-TrustedVerifierIdentity $bareExitGuard } 'bare exit trusted verifier guard must be rejected'
+
+    $zeroExitGuard = $happy.Replace("throw 'missing trusted verifier'", 'exit 0')
+    Assert-Throws { Assert-TrustedVerifierIdentity $zeroExitGuard } 'exit 0 trusted verifier guard must be rejected'
+
+    $directVerifierPath = $happy.Replace('-File $trustedVerifier', "-File (Join-Path `$trustedRoot 'scripts/verify-package-candidate.ps1')")
+    Assert-Throws { Assert-TrustedVerifierIdentity $directVerifierPath } 'direct trusted verifier path must not bypass the canonical variable'
 
     $inertAlias = @'
 $env:CANDIDATE_SHA
@@ -195,7 +247,7 @@ Set-Location "candidate-$candidate_alias"; cargo tree --locked
 '@
     Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate fetch' '^.*git\s+fetch.*$' } 'inert earlier env reference must not authorize alias-backed fetch'
     Assert-Throws { Assert-CanonicalWorktreeOperation $inertAlias 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$' } 'inert earlier env reference must not authorize alias-backed worktree'
-    Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'trusted verifier invocation' 'verify-package-candidate\.ps1' } 'inert earlier env reference must not authorize alias-backed verifier'
+    Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b' } 'inert earlier env reference must not authorize alias-backed verifier'
     Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'inert earlier env reference must not authorize alias-backed metadata'
     Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'inert earlier env reference must not authorize alias-backed tree'
 
