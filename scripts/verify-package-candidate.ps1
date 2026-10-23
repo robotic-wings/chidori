@@ -88,29 +88,25 @@ Assert-Equal $ctutilsPaths 'Cargo.lock' '00148aa changed-path set'
 Assert-Equal (Blob "$ctutilsCommit^" 'Cargo.lock') '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9' 'ctutils lock base blob'
 Assert-Equal (Blob $ctutilsCommit 'Cargo.lock') 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66' 'ctutils lock target blob'
 
-# Materialize the exact combination from the two direct patches in a disposable
-# directory. Exact byte equality below proves all non-allowlisted lock stanzas,
-# dependency lists, features, sources, and checksums were preserved.
+# Materialize exact lock snapshots and compose them with an ordered three-way
+# merge in a disposable directory. Hashing its redirected bytes proves all
+# non-allowlisted lock stanzas, dependency lists, features, sources, and
+# checksums were preserved.
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("chidori-package-gate-" + [Guid]::NewGuid())
 try {
     New-Item -ItemType Directory -Path $temp | Out-Null
-    $packagePatch = Join-Path $temp 'package.patch'
-    $ctutilsPatch = Join-Path $temp 'ctutils.patch'
-    Write-GitOutput (Join-Path $temp 'Cargo.lock') @('show', "$base`:Cargo.lock")
-    Write-GitOutput $packagePatch @('diff', '--binary', "$packageCommit~1", $packageCommit, '--', 'Cargo.lock')
-    Write-GitOutput $ctutilsPatch @('diff', '--binary', "$ctutilsCommit~1", $ctutilsCommit, '--', 'Cargo.lock')
-    Push-Location $temp
-    try {
-        & $gitExecutablePath apply --no-index $packagePatch
-        if ($LASTEXITCODE -ne 0) { throw '59ebb109 direct patch did not apply to base' }
-        & $gitExecutablePath apply --no-index $ctutilsPatch
-        if ($LASTEXITCODE -ne 0) { throw '00148aa direct ctutils patch did not apply after package patch' }
-    } finally {
-        Pop-Location
-    }
+    $packageLock = Join-Path $temp 'package.Cargo.lock'
+    $baseLock = Join-Path $temp 'base.Cargo.lock'
+    $ctutilsLock = Join-Path $temp 'ctutils.Cargo.lock'
+    $mergedLock = Join-Path $temp 'merged.Cargo.lock'
+    Write-GitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
+    Write-GitOutput $baseLock @('show', "$base`:Cargo.lock")
+    Write-GitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
+    $mergeProcess = Start-Process -FilePath $gitExecutablePath -ArgumentList @('merge-file', '-p', $packageLock, $baseLock, $ctutilsLock) -RedirectStandardOutput $mergedLock -NoNewWindow -PassThru -Wait
+    if ($mergeProcess.ExitCode -ne 0) { throw 'ordered package/base/ctutils lock merge failed or conflicted' }
 
-    $constructedLockBlob = Invoke-ResolvedGit @('hash-object', (Join-Path $temp 'Cargo.lock'))
-    Assert-Equal $constructedLockBlob $combinedLockBlob 'deterministic combined Cargo.lock blob'
+    $constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
+    Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b' 'deterministic combined Cargo.lock blob'
     Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $candidateSha 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') (Blob $candidateSha 'crates/chidori/Cargo.toml') 'candidate chidori manifest blob'
