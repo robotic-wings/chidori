@@ -254,6 +254,8 @@ function Assert-RawBinaryCaptureContract([string]$Text) {
     Assert ([regex]::Matches($Text, $helper).Count -eq 1) 'trusted verifier must define exactly one raw binary Git capture helper'
     Assert ($Text -match '(?is)function\s+Write-RawGitOutput.{0,2000}(?:FileName|FilePath)\s*=\s*\$gitExecutablePath') 'raw capture helper must use the resolved Git executable path'
     Assert ($Text -match '(?is)ProcessStartInfo.{0,2500}UseShellExecute\s*=\s*\$false.{0,2500}RedirectStandardOutput\s*=\s*\$true') 'raw capture helper must configure a non-shell ProcessStartInfo stdout stream'
+    Assert ($Text -match '(?is)function\s+Write-RawGitOutput.{0,2500}ArgumentList\.Add\(') 'raw capture helper must add each Git argument through ProcessStartInfo.ArgumentList'
+    Assert ($Text -notmatch '(?is)function\s+Write-RawGitOutput.{0,2500}\.Arguments\s*=') 'raw capture helper must not construct a text Arguments command line'
     Assert ($Text -match '(?is)FileStream.{0,2000}StandardOutput\.BaseStream\.CopyTo\(.{0,1500}Flush') 'raw capture helper must copy StandardOutput.BaseStream directly into a FileStream and flush it'
     Assert ($Text -match '(?is)WaitForExit.{0,1000}ExitCode.{0,1000}(?:throw|if)') 'raw capture helper must wait for and fail closed on Git exit status'
     Assert ($Text -match '(?is)(?:Close|Dispose).{0,1500}(?:Close|Dispose)') 'raw capture helper must close process and file resources'
@@ -266,6 +268,17 @@ function Assert-RawBinaryCaptureContract([string]$Text) {
     Assert ($Text -match '(?is)Write-RawGitOutput\s+\$ctutilsLock.{0,700}@\([''\"]show[''\"].{0,700}\$ctutilsCommit.*Cargo\.lock') 'raw capture must use the fixed ctutils show snapshot'
     Assert ($Text -match '(?is)Write-RawGitOutput\s+\$candidateLock.{0,700}@\([''\"]show[''\"].{0,700}\$candidateSha.*Cargo\.lock') 'raw capture must use the fixed candidate lock snapshot'
     Assert ($Text -match '(?is)Write-RawGitOutput\s+\$mergedLock.{0,900}@\([''\"]merge-file[''\"].{0,700}[''\"]-p[''\"].{0,700}\$packageLock.{0,700}\$baseLock.{0,700}\$ctutilsLock') 'raw capture must use fixed package/base/ctutils merge-file -p ordering'
+    $sourceHashes = @{
+        packageLock = '9e36a2e89363eeedc4215a68dbd51f33dfec3741'
+        baseLock = '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9'
+        ctutilsLock = 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66'
+        candidateLock = 'c4b4316368317a342058f77151ab8043afea676b'
+    }
+    foreach ($role in $sourceHashes.Keys) {
+        $hash = $sourceHashes[$role]
+        Assert ($Text -match ("(?is)Write-RawGitOutput\\s+\\$" + $role + "\\b.{0,1400}hash-object.{0,700}\\$" + $role + ".{0,700}" + $hash)) "raw $role capture must be source-byte hash-bound before composition"
+    }
+    Assert ($Text -match '(?is)Write-RawGitOutput\s+\$mergedLock.{0,1400}hash-object.{0,700}\$mergedLock.{0,700}c4b4316368317a342058f77151ab8043afea676b.{0,700}(?:ReadAllBytes|candidateLock|Blob\s+\$candidateSha)') 'raw emitted merge bytes must be hash-bound before candidate byte comparison'
     Assert ($Text -notmatch '(?is)\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*@\([''\"](?:show|merge-file)[''\"].{0,1000}Write-RawGitOutput') 'raw capture must not choose composition roles/options dynamically'
 }
 
@@ -628,7 +641,9 @@ function Write-RawGitOutput([string]$Path, [string[]]$Arguments) {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.Arguments = (($Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' ')
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $file = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -657,6 +672,11 @@ function Assert-FixtureMergedHash([string]$Package, [string]$Base, [string]$Ctut
 }
 
 function Invoke-LockCompositionFixtures {
+    if ($null -eq [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
+        $script:RawBinaryFixtureBlocker = 'ProcessStartInfo.ArgumentList is unavailable in Windows PowerShell; pwsh/.NET Core is required to execute raw immutable-blob capture fixtures.'
+        Write-Warning $script:RawBinaryFixtureBlocker
+        return
+    }
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('chidori-lock-composition-' + [Guid]::NewGuid())
     New-Item -ItemType Directory -Path $temp | Out-Null
     try {
@@ -725,7 +745,9 @@ function Write-RawGitOutput([string]$Path, [string[]]$Arguments) {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.Arguments = (($Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' ')
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $file = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -756,14 +778,30 @@ Write-RawGitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
 Write-RawGitOutput $baseLock @('show', "$base`:Cargo.lock")
 Write-RawGitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
 Write-RawGitOutput $candidateLock @('show', "$candidateSha`:Cargo.lock")
+Assert-Equal (Invoke-ResolvedGit @('hash-object', $packageLock)) '9e36a2e89363eeedc4215a68dbd51f33dfec3741'
+Assert-Equal (Invoke-ResolvedGit @('hash-object', $baseLock)) '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9'
+Assert-Equal (Invoke-ResolvedGit @('hash-object', $ctutilsLock)) 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66'
+Assert-Equal (Invoke-ResolvedGit @('hash-object', $candidateLock)) 'c4b4316368317a342058f77151ab8043afea676b'
 Write-RawGitOutput $mergedLock @('merge-file', '-p', '--', $packageLock, $baseLock, $ctutilsLock)
 $constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
 Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b'
-Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock')
+Assert-Equal $constructedLockBlob (Invoke-ResolvedGit @('hash-object', $candidateLock))
 '@
     $mergeOnlyPortable = $resolverHappy + "`n" + $rawCaptureHappy + "`n" + $compositionHappy
     Assert-VerifierScriptRecursionSafety $mergeOnlyPortable
     Assert-LockCompositionContract $mergeOnlyPortable
+    foreach ($missingSourceHash in @(
+        "Assert-Equal (Invoke-ResolvedGit @('hash-object', `$packageLock)) '9e36a2e89363eeedc4215a68dbd51f33dfec3741'",
+        "Assert-Equal (Invoke-ResolvedGit @('hash-object', `$baseLock)) '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9'",
+        "Assert-Equal (Invoke-ResolvedGit @('hash-object', `$ctutilsLock)) 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66'",
+        "Assert-Equal (Invoke-ResolvedGit @('hash-object', `$candidateLock)) 'c4b4316368317a342058f77151ab8043afea676b'"
+    )) {
+        Assert-Throws { Assert-RawBinaryCaptureContract ($mergeOnlyPortable.Replace($missingSourceHash, '')) } "raw capture without its source-byte hash must fail: $missingSourceHash"
+    }
+    $noMergedHash = $mergeOnlyPortable.Replace("Assert-Equal `$constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b'", '')
+    Assert-Throws { Assert-RawBinaryCaptureContract $noMergedHash } 'raw emitted merge bytes without final hash binding must fail'
+    $textArguments = $mergeOnlyPortable.Replace('[void]$startInfo.ArgumentList.Add($argument)', '$startInfo.Arguments = $argument')
+    Assert-Throws { Assert-RawBinaryCaptureContract $textArguments } 'raw capture helper must reject hand-built text Arguments command lines'
     Assert-Throws { Assert-RawBinaryCaptureContract ($mergeOnlyPortable + "`nStart-Process -FilePath `$gitExecutablePath -RedirectStandardOutput `$mergedLock") } 'Start-Process redirect capture must fail the raw binary contract'
     foreach ($textCapture in @(
         '$bytes | Out-String | Set-Content $mergedLock',
