@@ -216,10 +216,10 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)\$candidateTargetCanonical.*?(?:StartsWith|like).*?(?:\$separator|\$alternateSeparator|DirectorySeparatorChar|AltDirectorySeparatorChar)') 'candidate target boundary must reject only separator-bound descendants while allowing siblings'
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
-    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$candidateTarget') 'scrubbed verifier must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget') 'scrubbed verifier must receive exactly captured external target through the trusted pwsh invocation'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+metadata.*?\$candidateTarget') 'scrubbed metadata must receive exactly captured external target'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+tree.*?\$candidateTarget') 'scrubbed tree must receive exactly captured external target'
-    Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive the exact captured target value'
+    Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive the exact captured target value through the required pwsh invocation'
     Assert ($Text -match '(?im)^\s*cargo\s+metadata\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'metadata must receive the exact captured target value'
     Assert ($Text -match '(?im)^\s*cargo\s+tree\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'tree must receive the exact captured target value'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
@@ -228,11 +228,11 @@ function Assert-ExternalTargetContract([string]$Text) {
         $variable = '$' + $phase + 'Porcelain'
         Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\).*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, immediately exit-check, compare, and report its own output"
     }
-    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
-    Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh|cargo\s+metadata)') 'verified external target directory must be created before use'
-    Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
+    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
+    Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
+    Assert ($Text -match '(?is)(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
     Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
-    foreach ($operation in @('&\s+pwsh.*?\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
+    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
         Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
     }
 }
@@ -634,7 +634,7 @@ if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcel
 if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
 Remove-Item Env:*
 $env:CARGO_TARGET_DIR = $candidateTarget
-& pwsh -File $trustedVerifier -Target $candidateTarget
+& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
 $verifierPostPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
