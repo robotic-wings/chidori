@@ -8,9 +8,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 function Git([string[]]$Arguments) {
-    $out = & git.exe @Arguments
+    $out = & git @Arguments
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
     return ($out | Out-String).TrimEnd()
+}
+
+function Write-GitOutput([string]$Path, [string[]]$Arguments) {
+    # Redirect Git's stdout at the process boundary so patch bytes are preserved
+    # without routing them through a PowerShell text pipeline.
+    $process = Start-Process -FilePath git -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
+    if ($process.ExitCode -ne 0) { throw "git $($Arguments -join ' ') failed" }
 }
 
 function Assert-Equal([string]$Actual, [string]$Expected, [string]$What) {
@@ -75,19 +82,14 @@ try {
     New-Item -ItemType Directory -Path $temp | Out-Null
     $packagePatch = Join-Path $temp 'package.patch'
     $ctutilsPatch = Join-Path $temp 'ctutils.patch'
-    # cmd.exe redirection is intentional: Windows PowerShell text pipelines
-    # alter Git's raw bytes. These files must retain Git blob bytes exactly.
-    & cmd.exe /d /s /c "git show $base`:Cargo.lock > `"$temp\Cargo.lock`""
-    if ($LASTEXITCODE -ne 0) { throw 'base Cargo.lock materialization failed' }
-    & cmd.exe /d /s /c "git diff --binary $packageCommit~1 $packageCommit -- Cargo.lock > `"$packagePatch`""
-    if ($LASTEXITCODE -ne 0) { throw 'package patch materialization failed' }
-    & cmd.exe /d /s /c "git diff --binary $ctutilsCommit~1 $ctutilsCommit -- Cargo.lock > `"$ctutilsPatch`""
-    if ($LASTEXITCODE -ne 0) { throw 'ctutils patch materialization failed' }
+    Write-GitOutput (Join-Path $temp 'Cargo.lock') @('show', "$base`:Cargo.lock")
+    Write-GitOutput $packagePatch @('diff', '--binary', "$packageCommit~1", $packageCommit, '--', 'Cargo.lock')
+    Write-GitOutput $ctutilsPatch @('diff', '--binary', "$ctutilsCommit~1", $ctutilsCommit, '--', 'Cargo.lock')
     Push-Location $temp
     try {
-        & git.exe apply --no-index $packagePatch
+        & git apply --no-index $packagePatch
         if ($LASTEXITCODE -ne 0) { throw '59ebb109 direct patch did not apply to base' }
-        & git.exe apply --no-index $ctutilsPatch
+        & git apply --no-index $ctutilsPatch
         if ($LASTEXITCODE -ne 0) { throw '00148aa direct ctutils patch did not apply after package patch' }
     } finally {
         Pop-Location
