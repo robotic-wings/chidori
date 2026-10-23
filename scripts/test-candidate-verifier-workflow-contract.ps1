@@ -135,6 +135,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     }
     $cargoTargetRestore = '(?m)^\s*\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget\s*$'
     Assert ([regex]::Matches($scrubbed, $cargoTargetRestore).Count -eq 1) 'scrubbed execution must restore exactly one captured candidate target directory'
+    Assert ([regex]::Matches($scrubbed, '(?im)^\s*\$env:CARGO_TARGET_DIR\s*=').Count -eq 1) 'all scrubbed CARGO_TARGET_DIR assignments must be the one exact captured target restore'
     Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME|CARGO_TARGET_DIR)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME/CARGO_TARGET_DIR'
 
     $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
@@ -735,6 +736,8 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', '$env:CARGO_TARGET_DIR = (Join-Path $env:RUNNER_TEMP "derived-target")')) } 'derived target restore must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', '$env:CARGO_TARGET_DIR = $candidateWorktree')) } 'alternate target restore must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', "`$env:CARGO_TARGET_DIR = `$candidateTarget`n    `$env:CARGO_TARGET_DIR = `$candidateTarget")) } 'duplicate target restore must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', "`$env:CARGO_TARGET_DIR = `$candidateTarget`n    `$env:CARGO_TARGET_DIR = `$candidateWorktree")) } 'second arbitrary target restore after the valid restore must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:CARGO_TARGET_DIR = $candidateTarget', "`$env:CARGO_TARGET_DIR = `$candidateTarget`n    `$env:CARGO_TARGET_DIR = (Join-Path `$env:RUNNER_TEMP 'derived-target')")) } 'second derived target restore after the valid restore must fail'
     $postScrubTargetDerivation = 'Remove-Item Env:*' + "`n    " + '$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"', '').Replace('Remove-Item Env:*', $postScrubTargetDerivation)) } 'post-scrub target derivation must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget`nPush-Location $candidateWorktree')) } 'verifier outside the canonical candidate scope must fail'
