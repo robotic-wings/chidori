@@ -117,11 +117,17 @@ function Assert-TrustedVerifierIdentity([string]$Text) {
 function Assert-VerifierScriptPortability([string]$Text) {
     # Only executable text is relevant: comments must not make a portable script
     # fail, and must not be used to satisfy the bare-git requirement.
-    $commands = foreach ($line in ($Text -split "\r?\n")) { $line -replace '\s+#.*$', '' }
+    $commands = foreach ($line in ($Text -split "\r?\n")) {
+        $withoutWholeLineComment = $line -replace '^\s*#.*$', ''
+        $withoutWholeLineComment -replace '\s+#.*$', ''
+    }
     $executableText = $commands -join "`n"
-    Assert ($executableText -match '(?im)(?:^|[;|&]\s*)&?\s*git\b(?!\.exe)') 'trusted verifier must invoke PATH-resolved bare git'
-    Assert ($executableText -notmatch '(?im)(?:^|[;|&]\s*)&?\s*git\.exe\b') 'trusted verifier must not invoke git.exe, including mixed-case or ampersand forms'
-    Assert ($executableText -notmatch '(?im)(?:^|[;|&]\s*)&?\s*cmd(?:\.exe)?\b') 'trusted verifier must not invoke cmd or cmd.exe, including mixed-case or ampersand forms'
+    $bareGit = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?git(?!\.exe\b)(?:[''\"])?(?=$|[\s;|&])'
+    $gitExe = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?git\.exe(?:[''\"])?(?=$|[\s;|&])'
+    $cmd = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?cmd(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])'
+    Assert ($executableText -match $bareGit) 'trusted verifier must invoke PATH-resolved bare git'
+    Assert ($executableText -notmatch $gitExe) 'trusted verifier must not invoke git.exe, including quoted, mixed-case, or ampersand forms'
+    Assert ($executableText -notmatch $cmd) 'trusted verifier must not invoke cmd or cmd.exe, including quoted, mixed-case, or ampersand forms'
 }
 
 function Assert-WorkflowContract([string]$Workflow) {
@@ -339,14 +345,33 @@ git status --porcelain
         'GIT.ExE status',
         '& git.exe status',
         '& GIT.EXE status',
+        "& 'git.exe' status",
+        "& 'GIT.ExE' status",
         'cmd /c git status',
         'cmd.exe /c git status',
         'CMD.ExE /c git status',
         '& cmd /c git status',
-        '& CMD.EXE /c git status'
+        '& CMD.EXE /c git status',
+        "& 'cmd' /c git status",
+        "& 'cmd.exe' /c git status",
+        "& 'CMD.ExE' /c git status"
     )) {
         Assert-Throws { Assert-VerifierScriptPortability ($portable + "`n" + $nonPortable) } "non-portable verifier invocation must be rejected: $nonPortable"
     }
+
+    $commentOnlyBareGit = @'
+# git status --porcelain
+  # & git apply --no-index patch
+'@
+    Assert-Throws { Assert-VerifierScriptPortability $commentOnlyBareGit } 'comment-only bare git must not satisfy executable bare-git requirement'
+
+    $portableWithWindowsComments = $portable + @'
+
+# git.exe status
+# cmd /c git status
+  # & 'cmd.exe' /c git status
+'@
+    Assert-VerifierScriptPortability $portableWithWindowsComments
 }
 
 Invoke-Fixtures
