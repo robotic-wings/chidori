@@ -69,9 +69,66 @@ jobs:
       - name: Run locked Cargo checks in the candidate worktree
         shell: pwsh
         run: |
+          $candidateSha = $env:CANDIDATE_SHA
+          $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
           $toolPath = $env:PATH
           $homePath = $env:HOME
           $cargoHome = $env:CARGO_HOME
           $rustupHome = $env:RUSTUP_HOME
-          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; cargo metadata --locked --format-version 1 --no-deps; Pop-Location
-          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; cargo tree --locked -p chidori; Pop-Location
+          $approvedCandidatePaths = "Cargo.lock`ncrates/chidori-js/Cargo.toml`ncrates/chidori/Cargo.toml"
+          Push-Location $candidateWorktree
+          try {
+            $candidateHead = git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
+            $candidateStatus = git status --porcelain
+            if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
+            $parents = (git show -s --format=%P $candidateSha).Split(' ')
+            if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
+            if ($candidateHead -ne $candidateSha) { throw 'candidate HEAD mismatch' }
+            if ($candidateStatus -ne '') { throw 'candidate dirty' }
+            if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
+            if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
+            $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+            if ($LASTEXITCODE -ne 0) { throw 'candidate path evidence failed' }
+            $candidatePathText = ($candidatePaths -join "`n")
+            if ($candidatePathText -ne $approvedCandidatePaths) { throw 'candidate path scope failed' }
+            Remove-Item Env:*
+            $env:PATH = $toolPath
+            $env:HOME = $homePath
+            $env:CARGO_HOME = $cargoHome
+            $env:RUSTUP_HOME = $rustupHome
+            $candidateHead = git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
+            $candidateStatus = git status --porcelain
+            if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
+            $parents = (git show -s --format=%P $candidateSha).Split(' ')
+            if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
+            if ($candidateHead -ne $candidateSha) { throw 'post-scrub candidate HEAD mismatch' }
+            if ($candidateStatus -ne '') { throw 'post-scrub candidate dirty' }
+            if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
+            if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
+            $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+            if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate path evidence failed' }
+            $candidatePathText = ($candidatePaths -join "`n")
+            if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
+            cargo metadata --locked --format-version 1 --no-deps
+            if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+            cargo tree --locked -p chidori
+            if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+            $candidateHead = git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
+            $candidateStatus = git status --porcelain
+            if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+            $parents = (git show -s --format=%P $candidateSha).Split(' ')
+            if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
+            if ($candidateHead -ne $candidateSha) { throw 'post-Cargo candidate HEAD mismatch' }
+            if ($candidateStatus -ne '') { throw 'post-Cargo candidate dirty' }
+            if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
+            if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
+            $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
+            if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate path evidence failed' }
+            $candidatePathText = ($candidatePaths -join "`n")
+            if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-Cargo candidate path scope failed' }
+          } finally {
+            Pop-Location
+          }
