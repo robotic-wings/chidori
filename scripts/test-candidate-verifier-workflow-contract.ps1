@@ -138,6 +138,20 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
             Assert ($following -match '(?is)^\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw\b') "native evidence command [$command] must have an immediately adjacent LASTEXITCODE throw"
         }
     }
+
+    $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha')
+    foreach ($phase in @(
+        @{ Name = 'pre-scrub'; Prefix = '(?is)\$candidateWorktree\s*=.*?'; Suffix = 'Remove-Item\s+Env:\*' },
+        @{ Name = 'post-scrub/pre-Cargo'; Prefix = '(?is)Remove-Item\s+Env:\*.*?'; Suffix = 'cargo\s+metadata\s+--locked' },
+        @{ Name = 'post-Cargo'; Prefix = '(?is)cargo\s+tree\s+--locked.*?'; Suffix = '\}\s*finally\s*\{\s*Pop-Location' }
+    )) {
+        foreach ($command in $phaseCommands) {
+            $bound = $phase.Prefix + $command + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $phase.Suffix
+            Assert ($Text -match $bound) "$($phase.Name) phase must bind [$command] with an immediately adjacent LASTEXITCODE throw"
+        }
+        $parentBound = $phase.Prefix + '\$parents\.Count.*?\$parents\[0\].*?' + $phase.Suffix
+        Assert ($Text -match $parentBound) "$($phase.Name) phase must retain sole-parent/base evidence"
+    }
 }
 
 function Assert-TrustedVerifierIdentity([string]$Text) {
@@ -379,8 +393,6 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
     Assert-TrustedVerifierIdentity $text
     Assert-SafeCandidateExecution $text 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
-    Assert-SafeCandidateExecution $text 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
-    Assert-SafeCandidateExecution $text 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
@@ -468,6 +480,9 @@ git status --porcelain | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
 git show -s --format=%P $candidateSha | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
+$parents = @('approved-base')
+if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
+if ($parents[0] -ne 'approved-base') { throw 'candidate base failed' }
 Remove-Item Env:*
 $env:PATH = $toolPath
 $env:HOME = $homePath
@@ -475,6 +490,15 @@ $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
 Push-Location $candidateWorktree
 try {
+    git rev-parse HEAD | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
+    git status --porcelain | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
+    git show -s --format=%P $candidateSha | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
+    $parents = @('approved-base')
+    if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
+    if ($parents[0] -ne 'approved-base') { throw 'post-scrub candidate base failed' }
     cargo metadata --locked --format-version 1 --no-deps
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     cargo tree --locked -p chidori
@@ -483,6 +507,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
     git status --porcelain | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+    git show -s --format=%P $candidateSha | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
+    $parents = @('approved-base')
+    if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
+    if ($parents[0] -ne 'approved-base') { throw 'post-Cargo candidate base failed' }
 } finally {
     Pop-Location
 }
@@ -493,6 +522,8 @@ try {
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-scrub parent evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-Cargo parent evidence failure check must fail'
 
     $runnerTempTrusted = $happy.Replace('$env:GITHUB_WORKSPACE', '$env:RUNNER_TEMP')
     Assert-Throws { Assert-TrustedVerifierIdentity $runnerTempTrusted } 'RUNNER_TEMP trusted verifier root must be rejected'
