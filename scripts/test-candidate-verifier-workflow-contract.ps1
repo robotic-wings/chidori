@@ -167,6 +167,40 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
     Assert ($executableText -notmatch '(?im)Start-Process\s+-FilePath\s+(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier Start-Process must not bypass the resolved git Application variable'
 }
 
+function Assert-LockCompositionContract([string]$Text) {
+    foreach ($required in @(
+        '59ebb109', '00148aa', '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9',
+        '9e36a2e89363eeedc4215a68dbd51f33dfec3741', 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66',
+        'c4b4316368317a342058f77151ab8043afea676b'
+    )) { Assert ($Text -match [regex]::Escape($required)) "trusted verifier must bind lock composition provenance [$required]" }
+    Assert ($Text -match '(?is)\$packageCommit\s*=\s*[''\"]59ebb109[''\"]') 'trusted verifier must name the package direct commit'
+    Assert ($Text -match '(?is)\$ctutilsCommit\s*=\s*[''\"]00148aa[''\"]') 'trusted verifier must name the ctutils direct commit'
+    Assert ($Text -match '(?is)show.{0,300}--name-only.{0,500}\$packageCommit') 'trusted verifier must inspect package direct changed paths'
+    Assert ($Text -match '(?is)show.{0,300}--name-only.{0,500}\$ctutilsCommit') 'trusted verifier must inspect ctutils direct changed paths'
+    Assert ($Text -match '(?is)Assert-Equal\s+\$directPaths') 'trusted verifier must require the exact package changed-path set'
+    Assert ($Text -match '(?is)Assert-Equal\s+\$ctutilsPaths') 'trusted verifier must require the exact ctutils changed-path set'
+    Assert ($Text -match '(?is)\$packageCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind package parent lock base'
+    Assert ($Text -match '(?is)\$ctutilsCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind ctutils parent lock base'
+    Assert ($Text -match '(?is)(merge-file|three-way|three way|Merge-LockSnapshots)') 'trusted verifier must use deterministic conflict-failing three-way lock composition'
+    Assert ($Text -match '(?is)(conflict|throw).{0,2000}(hash-object|constructedLockBlob).{0,1000}c4b431') 'trusted verifier must fail conflicts before final lock hash and candidate comparison'
+    Assert ($Text -notmatch '(?is)apply\s+--no-index\s+\$packagePatch.{0,1000}apply\s+--no-index\s+\$ctutilsPatch') 'trusted verifier must not sequentially apply incompatible direct lock patches'
+}
+
+function Compose-LockSnapshots([hashtable]$Base, [hashtable]$Package, [hashtable]$Ctutils, [string]$ExpectedFinalHash) {
+    Assert ($Package.Base -eq $Base.Hash -and $Ctutils.Base -eq $Base.Hash) 'independent lock snapshots must share the exact base'
+    Assert ($Package.Kind -eq 'package' -and $Package.Target -eq '9e36a2e89363eeedc4215a68dbd51f33dfec3741') 'package snapshot must retain its exact target provenance'
+    Assert ($Ctutils.Kind -eq 'ctutils' -and $Ctutils.Target -eq 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66') 'ctutils snapshot must retain its exact target provenance'
+    $combined = @{} + $Base.Lines
+    foreach ($change in @($Package.Changes, $Ctutils.Changes)) {
+        foreach ($key in $change.Keys) {
+            if ($combined.ContainsKey($key) -and $Base.Lines.ContainsKey($key) -and $combined[$key] -ne $Base.Lines[$key]) { throw "three-way lock composition conflict at $key" }
+            $combined[$key] = $change[$key]
+        }
+    }
+    Assert ($ExpectedFinalHash -eq $Base.FinalHash) 'final deterministic combined lock hash must match expected provenance'
+    return $combined
+}
+
 function Assert-WorkflowContract([string]$Workflow) {
     Assert (Test-Path -LiteralPath $Workflow) 'missing .github/workflows/candidate-verifier.yml'
     $text = [IO.File]::ReadAllText($Workflow)
@@ -475,13 +509,46 @@ Start-Process -FilePath $gitApplication -ArgumentList @('status')
     Assert-Throws { Assert-VerifierScriptRecursionSafety $rawApplicationStartProcess } 'raw ApplicationInfo Start-Process must be rejected'
 }
 
+function Invoke-LockCompositionFixtures {
+    $finalHash = 'c4b4316368317a342058f77151ab8043afea676b'
+    $base = @{ Hash = '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9'; FinalHash = $finalHash; Lines = @{ package = 'base'; ctutils = 'base' } }
+    $package = @{ Kind = 'package'; Base = $base.Hash; Target = '9e36a2e89363eeedc4215a68dbd51f33dfec3741'; Changes = @{ package = 'package-target' } }
+    $ctutils = @{ Kind = 'ctutils'; Base = $base.Hash; Target = 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66'; Changes = @{ ctutils = 'ctutils-target' } }
+    $combined = Compose-LockSnapshots $base $package $ctutils $finalHash
+    Assert ($combined.package -eq 'package-target' -and $combined.ctutils -eq 'ctutils-target') 'disjoint independent snapshots must compose deterministically'
+    Assert-Throws { Compose-LockSnapshots $base (@{ Kind = 'package'; Base = 'wrong'; Target = $package.Target; Changes = $package.Changes }) $ctutils $finalHash } 'wrong package base must fail'
+    Assert-Throws { Compose-LockSnapshots $base (@{ Kind = 'package'; Base = $base.Hash; Target = $ctutils.Target; Changes = $package.Changes }) $ctutils $finalHash } 'wrong package target must fail'
+    Assert-Throws { Compose-LockSnapshots $base $ctutils $package $finalHash } 'swapped snapshot order must fail provenance fixture'
+    Assert-Throws { Compose-LockSnapshots $base $package $ctutils ('0' * 40) } 'wrong final lock hash must fail'
+    Assert-Throws { Compose-LockSnapshots $base $package (@{ Kind = 'ctutils'; Base = $base.Hash; Target = $ctutils.Target; Changes = @{ package = 'overlap' } }) $finalHash } 'overlapping three-way lock changes must conflict'
+
+    $compositionHappy = @'
+$packageCommit = '59ebb109'
+$ctutilsCommit = '00148aa'
+git show --format= --name-only $packageCommit Cargo.lock
+git show --format= --name-only $ctutilsCommit Cargo.lock
+Assert-Equal $directPaths $paths
+Assert-Equal $ctutilsPaths Cargo.lock
+Blob "$packageCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
+Blob "$ctutilsCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
+9e36a2e89363eeedc4215a68dbd51f33dfec3741
+fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66
+three-way conflict throw hash-object constructedLockBlob c4b4316368317a342058f77151ab8043afea676b
+'@
+    Assert-LockCompositionContract $compositionHappy
+    $sequentialDirectApply = "$compositionHappy`n& `$gitExecutablePath apply --no-index `$packagePatch`n& `$gitExecutablePath apply --no-index `$ctutilsPatch"
+    Assert-Throws { Assert-LockCompositionContract $sequentialDirectApply } 'sequential direct patch application must fail the composition contract'
+}
+
 Invoke-Fixtures
 Invoke-StaticWorkflowFixtures
 Invoke-VerifierPortabilityFixtures
+Invoke-LockCompositionFixtures
 if (-not $FixturesOnly) {
     Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
     $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
     Assert-VerifierScriptPortability $verifierScript
     Assert-VerifierScriptRecursionSafety $verifierScript
+    Assert-LockCompositionContract $verifierScript
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
