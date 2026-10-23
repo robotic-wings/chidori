@@ -4937,6 +4937,15 @@ mod tests {
         let inbox_path = run_base.join(&predecessor_run_id).join(SIGNAL_INBOX_FILE);
         std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
         std::fs::write(&inbox_path, &inbox).unwrap();
+        let persisted_inbox = std::fs::read(&inbox_path).unwrap();
+        assert_eq!(
+            persisted_inbox, inbox,
+            "seed must persist exact FS-primary bytes"
+        );
+        assert_must_survive_seed_inbox(
+            &persisted_inbox,
+            &format!("{backend} seeded predecessor={predecessor_run_id}"),
+        );
 
         if backend == "sqlite" {
             let db_path = root.join("runs.sqlite3");
@@ -4964,6 +4973,42 @@ mod tests {
                 .unwrap();
         }
         (predecessor_run_id, inbox)
+    }
+
+    fn assert_must_survive_seed_inbox(inbox: &[u8], context: &str) {
+        let queued: Vec<QueuedSignal> = serde_json::from_slice(inbox).unwrap_or_else(|error| {
+            panic!(
+                "{context}: seeded inbox must remain decodable (bytes={}): {error}",
+                inbox.len()
+            )
+        });
+        assert_eq!(
+            queued.len(),
+            1,
+            "{context}: expected one seeded delivery (bytes={}, signals={queued:?})",
+            inbox.len()
+        );
+        let signal = &queued[0];
+        assert_eq!(signal.name, "go", "{context}: seeded signal name");
+        assert_eq!(
+            signal.payload,
+            json!({ "id": "must-survive" }),
+            "{context}: seeded signal payload"
+        );
+        assert_eq!(
+            signal.from,
+            json!({ "kind": "test", "id": "predecessor-migration" }),
+            "{context}: seeded signal sender"
+        );
+        assert_eq!(
+            signal.delivery_seq, 17,
+            "{context}: seeded signal delivery sequence"
+        );
+        eprintln!(
+            "SAME_NAME_SPAWN_SEED context={context} bytes={} enqueued_at={}",
+            inbox.len(),
+            signal.enqueued_at
+        );
     }
 
     fn same_name_spawn_child_command(
@@ -5965,6 +6010,59 @@ mod tests {
         }
     }
 
+    fn accept_same_name_spawn_event_or_child_exit(
+        listener: &std::net::TcpListener,
+        child: &mut std::process::Child,
+        label: &str,
+        report_path: &Path,
+    ) -> (Value, std::net::TcpStream) {
+        use std::io::BufRead;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let event = serde_json::from_str(&line).unwrap_or_else(|error| {
+                        panic!("invalid same-name spawn event {line:?}: {error}")
+                    });
+                    return (event, stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        use std::io::Read;
+                        let mut stdout = String::new();
+                        let mut stderr = String::new();
+                        if let Some(pipe) = child.stdout.as_mut() {
+                            pipe.read_to_string(&mut stdout).unwrap();
+                        }
+                        if let Some(pipe) = child.stderr.as_mut() {
+                            pipe.read_to_string(&mut stderr).unwrap();
+                        }
+                        let report = std::fs::read_to_string(report_path)
+                            .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+                        panic!(
+                            "{label} child exited before reporting lock event: status={status} stdout={} stderr={} report={report}",
+                            stdout, stderr
+                        );
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for {label} lock event; child still running"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accepting same-name spawn event failed: {error}"),
+            }
+        }
+    }
+
     fn stale_name_cache_event(phase: &str, details: Value, wait_for_release: bool) {
         use std::io::{Read, Write};
         let address: std::net::SocketAddr = std::env::var(STALE_NAME_CACHE_GATE_ENV)
@@ -6544,12 +6642,11 @@ mod tests {
             let name = format!("same-name-race-{backend}-{trial}");
             let (predecessor_run_id, predecessor_inbox) =
                 seed_same_name_spawn_race(&root, backend, &name);
-            assert_eq!(predecessor_inbox.len(), 232);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let gate_address = listener.local_addr().unwrap().to_string();
             listener.set_nonblocking(true).unwrap();
 
-            let winner = same_name_spawn_child_command(
+            let mut winner = same_name_spawn_child_command(
                 &root,
                 backend,
                 &name,
@@ -6559,14 +6656,25 @@ mod tests {
             )
             .spawn()
             .unwrap();
-            let (winner_attempt, _) = accept_same_name_spawn_event(&listener);
+            let (winner_attempt, _) = accept_same_name_spawn_event_or_child_exit(
+                &listener,
+                &mut winner,
+                "winner",
+                &root.join("child-0-report.json"),
+            );
             assert_eq!(winner_attempt["phase"], "lock-attempt");
             assert_eq!(winner_attempt["child_index"], "0");
-            let (winner_locked, mut winner_lock_stream) = accept_same_name_spawn_event(&listener);
+            let (winner_locked, mut winner_lock_stream) =
+                accept_same_name_spawn_event_or_child_exit(
+                    &listener,
+                    &mut winner,
+                    "winner",
+                    &root.join("child-0-report.json"),
+                );
             assert_eq!(winner_locked["phase"], "lock-acquired");
             assert_eq!(winner_locked["child_index"], "0");
 
-            let contender = same_name_spawn_child_command(
+            let mut contender = same_name_spawn_child_command(
                 &root,
                 backend,
                 &name,
@@ -6576,16 +6684,31 @@ mod tests {
             )
             .spawn()
             .unwrap();
-            let (contender_attempt, _) = accept_same_name_spawn_event(&listener);
+            let (contender_attempt, _) = accept_same_name_spawn_event_or_child_exit(
+                &listener,
+                &mut contender,
+                "contender",
+                &root.join("child-1-report.json"),
+            );
             assert_eq!(contender_attempt["phase"], "lock-attempt");
             assert_eq!(contender_attempt["child_index"], "1");
-            let (contender_waiting, _) = accept_same_name_spawn_event(&listener);
+            let (contender_waiting, _) = accept_same_name_spawn_event_or_child_exit(
+                &listener,
+                &mut contender,
+                "contender",
+                &root.join("child-1-report.json"),
+            );
             assert_eq!(contender_waiting["phase"], "lock-waiting");
             assert_eq!(contender_waiting["child_index"], "1");
 
             winner_lock_stream.write_all(b"R").unwrap();
             winner_lock_stream.flush().unwrap();
-            let (winner_live, mut winner_live_stream) = accept_same_name_spawn_event(&listener);
+            let (winner_live, mut winner_live_stream) = accept_same_name_spawn_event_or_child_exit(
+                &listener,
+                &mut winner,
+                "winner",
+                &root.join("child-0-report.json"),
+            );
             assert_eq!(winner_live["phase"], "winner-effect-active");
             let winner_registry_path = root
                 .join("project/.chidori/runs/agents")
@@ -6632,22 +6755,142 @@ mod tests {
             assert_eq!(winner_report["matching_signal_rows"], 1);
             assert_eq!(winner_report["effect_count"], 1);
             assert!(winner_report["inbox"] == "[]" || winner_report["inbox"] == "");
+            assert_eq!(contender_report["matching_signal_rows"], 0);
+            assert_eq!(contender_report["effect_count"], 0);
 
             let run_base = root.join("project/.chidori/runs");
+            let factory = RunStoreFactory::shared(&run_base);
+            let winner_store = factory.store_for(&winner_run_id);
+            let winner_records = winner_store.load_call_log().unwrap().unwrap_or_default();
+            let winner_signal_rows = winner_records
+                .iter()
+                .filter(|record| {
+                    record.function == "signal"
+                        && record.result["name"] == "go"
+                        && record.result["payload"] == json!({ "id": "must-survive" })
+                })
+                .count();
+            assert_eq!(
+                winner_signal_rows, 1,
+                "{backend}: final winner must journal the seeded delivery exactly once"
+            );
+            let winner_inbox = winner_store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .unwrap_or_default();
+            let winner_queued: Vec<QueuedSignal> = serde_json::from_slice(&winner_inbox).unwrap();
+            assert!(
+                winner_queued.is_empty(),
+                "{backend}: final winner left queued delivery {winner_queued:?}"
+            );
+            assert_ne!(
+                winner_inbox, predecessor_inbox,
+                "{backend}: winner inbox must not retain original seed bytes"
+            );
+            let predecessor_store = factory.store_for(&predecessor_run_id);
+            let predecessor_records = predecessor_store
+                .load_call_log()
+                .unwrap()
+                .unwrap_or_default();
+            assert_eq!(
+                predecessor_records
+                    .iter()
+                    .filter(|record| {
+                        record.function == "signal"
+                            && record.result["payload"] == json!({ "id": "must-survive" })
+                    })
+                    .count(),
+                0,
+                "{backend}: predecessor must not retain a consumed signal journal row"
+            );
+            let predecessor_remaining = predecessor_store
+                .get_blob(SIGNAL_INBOX_FILE)
+                .unwrap()
+                .unwrap_or_default();
+            let predecessor_queued: Vec<QueuedSignal> =
+                serde_json::from_slice(&predecessor_remaining).unwrap();
+            assert!(
+                predecessor_queued.is_empty(),
+                "{backend}: predecessor stranded queued delivery {predecessor_queued:?}"
+            );
+            assert_ne!(
+                predecessor_remaining, predecessor_inbox,
+                "{backend}: predecessor inbox must not retain original seed bytes"
+            );
             let registry_path = run_base.join("agents").join(format!("{name}.json"));
             let registry: Value =
                 serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
             assert_eq!(registry["run_id"], winner_run_id);
+            assert_eq!(registry["descriptor"]["status"], "completed");
             if backend == "sqlite" {
                 let connection = rusqlite::Connection::open(root.join("runs.sqlite3")).unwrap();
-                let mirror_winner: String = connection
+                let (mirror_winner, mirror_registry_data): (String, String) = connection
                     .query_row(
-                        "SELECT run_id FROM run_registry WHERE name = ?1",
+                        "SELECT run_id, data FROM run_registry WHERE name = ?1",
                         [&name],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .unwrap();
                 assert_eq!(mirror_winner, winner_run_id);
+                let mirror_registry: Value = serde_json::from_str(&mirror_registry_data).unwrap();
+                assert_eq!(mirror_registry["run_id"], winner_run_id);
+                assert_eq!(mirror_registry["descriptor"]["status"], "completed");
+
+                let load_mirror_records = |run_id: &str| {
+                    let mut statement = connection
+                        .prepare("SELECT data FROM run_records WHERE run_id = ?1 ORDER BY pos, seq")
+                        .unwrap();
+                    statement
+                        .query_map([run_id], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(|row| {
+                            serde_json::from_str::<crate::runtime::call_log::CallRecord>(
+                                &row.unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let load_mirror_inbox = |run_id: &str| {
+                    connection
+                        .query_row(
+                            "SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                            rusqlite::params![run_id, SIGNAL_INBOX_FILE],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .unwrap()
+                };
+                let mirror_winner_records = load_mirror_records(&winner_run_id);
+                assert_eq!(
+                    mirror_winner_records
+                        .iter()
+                        .filter(|record| {
+                            record.function == "signal"
+                                && record.result["name"] == "go"
+                                && record.result["payload"] == json!({ "id": "must-survive" })
+                        })
+                        .count(),
+                    1,
+                    "sqlite mirror winner must retain exactly one migrated signal record"
+                );
+                let mirror_winner_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&load_mirror_inbox(&winner_run_id)).unwrap();
+                assert!(mirror_winner_inbox.is_empty());
+                let mirror_predecessor_records = load_mirror_records(&predecessor_run_id);
+                assert_eq!(
+                    mirror_predecessor_records
+                        .iter()
+                        .filter(|record| {
+                            record.function == "signal"
+                                && record.result["payload"] == json!({ "id": "must-survive" })
+                        })
+                        .count(),
+                    0,
+                    "sqlite mirror predecessor must not retain migrated signal record"
+                );
+                let mirror_predecessor_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&load_mirror_inbox(&predecessor_run_id)).unwrap();
+                assert!(mirror_predecessor_inbox.is_empty());
             }
 
             eprintln!(
@@ -6770,7 +7013,29 @@ mod tests {
                 assert_eq!(control_report["matching_signal_rows"], 1);
                 assert_eq!(control_report["effect_count"], 1);
                 assert!(control_report["inbox"] == "[]" || control_report["inbox"] == "");
-                assert_eq!(control_inbox.len(), 232);
+                let control_predecessor_bytes = std::fs::read(
+                    control_root
+                        .join("project/.chidori/runs")
+                        .join(&control_predecessor)
+                        .join(SIGNAL_INBOX_FILE),
+                )
+                .unwrap();
+                assert_ne!(control_predecessor_bytes, control_inbox);
+                let control_predecessor_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&control_predecessor_bytes).unwrap();
+                assert!(control_predecessor_inbox.is_empty());
+                let control_winner_id = control_report["run_id"].as_str().unwrap();
+                let control_winner_bytes = std::fs::read(
+                    control_root
+                        .join("project/.chidori/runs")
+                        .join(control_winner_id)
+                        .join(SIGNAL_INBOX_FILE),
+                )
+                .unwrap();
+                assert_ne!(control_winner_bytes, control_inbox);
+                let control_winner_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&control_winner_bytes).unwrap();
+                assert!(control_winner_inbox.is_empty());
                 assert!(!control_predecessor.is_empty());
                 eprintln!(
                     "SAME_NAME_SPAWN_SINGLE_CONTROL backend={backend} report={control_report}"

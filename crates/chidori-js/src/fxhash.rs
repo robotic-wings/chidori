@@ -46,12 +46,10 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            // unwrap: chunks_exact(8) yields exactly 8 bytes.
-            self.add_to_hash(u64::from_le_bytes(c.try_into().unwrap()));
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.add_to_hash(u64::from_le_bytes(*chunk));
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             let mut buf = [0u8; 8];
             buf[..rem.len()].copy_from_slice(rem);
@@ -108,6 +106,30 @@ mod tests {
     fn distinguishes_padding() {
         assert_ne!(hash_of(b"ab"), hash_of(b"ab\0"));
         assert_ne!(hash_of(b""), hash_of(b"\0"));
+    }
+
+    #[test]
+    fn preserves_legacy_block_and_tail_hashes() {
+        // Frozen outputs from the prior chunks_exact implementation. These
+        // cover every tail length, an exact block, a block plus tail, and
+        // multiple complete blocks before a tail.
+        let vectors: &[(&[u8], u64)] = &[
+            (b"", 0x0000_0000_0000_0000),
+            (b"a", 0x8ec8_a4ae_acc3_f7e0),
+            (b"ab", 0x4567_06cf_2a37_219f),
+            (b"abc", 0xddbe_6742_1ab4_170a),
+            (b"abcd", 0x5d7d_f889_c41a_36c9),
+            (b"abcde", 0x7c6f_639b_9cf8_2c34),
+            (b"abcdef", 0x011d_06c1_125e_4bf3),
+            (b"abcdefg", 0xf193_4509_eb3c_415e),
+            (b"12345678", 0xe871_2e7a_8344_2085),
+            (b"12345678x", 0xe8b0_8e16_138d_6a14),
+            (b"12345678abcdefghXYZ", 0xce88_35ad_7a28_867b),
+        ];
+
+        for &(bytes, expected) in vectors {
+            assert_eq!(hash_of(bytes), expected, "bytes: {bytes:?}");
+        }
     }
 
     #[test]
