@@ -4937,6 +4937,15 @@ mod tests {
         let inbox_path = run_base.join(&predecessor_run_id).join(SIGNAL_INBOX_FILE);
         std::fs::create_dir_all(inbox_path.parent().unwrap()).unwrap();
         std::fs::write(&inbox_path, &inbox).unwrap();
+        let persisted_inbox = std::fs::read(&inbox_path).unwrap();
+        assert_eq!(
+            persisted_inbox, inbox,
+            "seed must persist exact FS-primary bytes"
+        );
+        assert_must_survive_seed_inbox(
+            &persisted_inbox,
+            &format!("{backend} seeded predecessor={predecessor_run_id}"),
+        );
 
         if backend == "sqlite" {
             let db_path = root.join("runs.sqlite3");
@@ -6633,17 +6642,6 @@ mod tests {
             let name = format!("same-name-race-{backend}-{trial}");
             let (predecessor_run_id, predecessor_inbox) =
                 seed_same_name_spawn_race(&root, backend, &name);
-            let persisted_predecessor_inbox = std::fs::read(
-                root.join("project/.chidori/runs")
-                    .join(&predecessor_run_id)
-                    .join(SIGNAL_INBOX_FILE),
-            )
-            .unwrap();
-            assert_eq!(persisted_predecessor_inbox, predecessor_inbox);
-            assert_must_survive_seed_inbox(
-                &persisted_predecessor_inbox,
-                &format!("{backend} trial={trial} predecessor={predecessor_run_id}"),
-            );
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let gate_address = listener.local_addr().unwrap().to_string();
             listener.set_nonblocking(true).unwrap();
@@ -6785,6 +6783,10 @@ mod tests {
                 winner_queued.is_empty(),
                 "{backend}: final winner left queued delivery {winner_queued:?}"
             );
+            assert_ne!(
+                winner_inbox, predecessor_inbox,
+                "{backend}: winner inbox must not retain original seed bytes"
+            );
             let predecessor_store = factory.store_for(&predecessor_run_id);
             let predecessor_records = predecessor_store
                 .load_call_log()
@@ -6811,20 +6813,84 @@ mod tests {
                 predecessor_queued.is_empty(),
                 "{backend}: predecessor stranded queued delivery {predecessor_queued:?}"
             );
+            assert_ne!(
+                predecessor_remaining, predecessor_inbox,
+                "{backend}: predecessor inbox must not retain original seed bytes"
+            );
             let registry_path = run_base.join("agents").join(format!("{name}.json"));
             let registry: Value =
                 serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
             assert_eq!(registry["run_id"], winner_run_id);
+            assert_eq!(registry["descriptor"]["status"], "completed");
             if backend == "sqlite" {
                 let connection = rusqlite::Connection::open(root.join("runs.sqlite3")).unwrap();
-                let mirror_winner: String = connection
+                let (mirror_winner, mirror_registry_data): (String, String) = connection
                     .query_row(
-                        "SELECT run_id FROM run_registry WHERE name = ?1",
+                        "SELECT run_id, data FROM run_registry WHERE name = ?1",
                         [&name],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .unwrap();
                 assert_eq!(mirror_winner, winner_run_id);
+                let mirror_registry: Value = serde_json::from_str(&mirror_registry_data).unwrap();
+                assert_eq!(mirror_registry["run_id"], winner_run_id);
+                assert_eq!(mirror_registry["descriptor"]["status"], "completed");
+
+                let load_mirror_records = |run_id: &str| {
+                    let mut statement = connection
+                        .prepare("SELECT data FROM run_records WHERE run_id = ?1 ORDER BY pos, seq")
+                        .unwrap();
+                    statement
+                        .query_map([run_id], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(|row| {
+                            serde_json::from_str::<crate::runtime::call_log::CallRecord>(
+                                &row.unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let load_mirror_inbox = |run_id: &str| {
+                    connection
+                        .query_row(
+                            "SELECT data FROM run_blobs WHERE run_id = ?1 AND key = ?2",
+                            rusqlite::params![run_id, SIGNAL_INBOX_FILE],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .unwrap()
+                };
+                let mirror_winner_records = load_mirror_records(&winner_run_id);
+                assert_eq!(
+                    mirror_winner_records
+                        .iter()
+                        .filter(|record| {
+                            record.function == "signal"
+                                && record.result["name"] == "go"
+                                && record.result["payload"] == json!({ "id": "must-survive" })
+                        })
+                        .count(),
+                    1,
+                    "sqlite mirror winner must retain exactly one migrated signal record"
+                );
+                let mirror_winner_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&load_mirror_inbox(&winner_run_id)).unwrap();
+                assert!(mirror_winner_inbox.is_empty());
+                let mirror_predecessor_records = load_mirror_records(&predecessor_run_id);
+                assert_eq!(
+                    mirror_predecessor_records
+                        .iter()
+                        .filter(|record| {
+                            record.function == "signal"
+                                && record.result["payload"] == json!({ "id": "must-survive" })
+                        })
+                        .count(),
+                    0,
+                    "sqlite mirror predecessor must not retain migrated signal record"
+                );
+                let mirror_predecessor_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&load_mirror_inbox(&predecessor_run_id)).unwrap();
+                assert!(mirror_predecessor_inbox.is_empty());
             }
 
             eprintln!(
@@ -6947,18 +7013,29 @@ mod tests {
                 assert_eq!(control_report["matching_signal_rows"], 1);
                 assert_eq!(control_report["effect_count"], 1);
                 assert!(control_report["inbox"] == "[]" || control_report["inbox"] == "");
-                let persisted_control_inbox = std::fs::read(
+                let control_predecessor_bytes = std::fs::read(
                     control_root
                         .join("project/.chidori/runs")
                         .join(&control_predecessor)
                         .join(SIGNAL_INBOX_FILE),
                 )
                 .unwrap();
-                assert_eq!(persisted_control_inbox, control_inbox);
-                assert_must_survive_seed_inbox(
-                    &persisted_control_inbox,
-                    &format!("{backend} uncontended predecessor={control_predecessor}"),
-                );
+                assert_ne!(control_predecessor_bytes, control_inbox);
+                let control_predecessor_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&control_predecessor_bytes).unwrap();
+                assert!(control_predecessor_inbox.is_empty());
+                let control_winner_id = control_report["run_id"].as_str().unwrap();
+                let control_winner_bytes = std::fs::read(
+                    control_root
+                        .join("project/.chidori/runs")
+                        .join(control_winner_id)
+                        .join(SIGNAL_INBOX_FILE),
+                )
+                .unwrap();
+                assert_ne!(control_winner_bytes, control_inbox);
+                let control_winner_inbox: Vec<QueuedSignal> =
+                    serde_json::from_slice(&control_winner_bytes).unwrap();
+                assert!(control_winner_inbox.is_empty());
                 assert!(!control_predecessor.is_empty());
                 eprintln!(
                     "SAME_NAME_SPAWN_SINGLE_CONTROL backend={backend} report={control_report}"
