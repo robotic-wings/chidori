@@ -62,7 +62,7 @@ function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern
 function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name, [string]$Pattern) {
     $operations = [regex]::Matches($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
     Assert ($operations.Count -gt 0) "workflow must contain $Name"
-    $canonicalPattern = [regex]::Escape($script:CanonicalCandidateWorktree) + '(?=$|[\s;"''/\\])'
+    $canonicalPattern = [regex]::Escape($script:CanonicalCandidateWorktree) + '(?=$|[\s;"''])'
     foreach ($operation in $operations) {
         Assert ($operation.Value -match $canonicalPattern) "$Name must use canonical candidate worktree expression with a token/path boundary"
     }
@@ -71,7 +71,7 @@ function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name, [string
 function Assert-CandidateCargoOperation([string]$Text, [string]$Name, [string]$Pattern) {
     $lines = $Text -split "\r?\n"
     $operationCount = 0
-    $canonicalPattern = [regex]::Escape($script:CanonicalCandidateWorktree) + '(?=$|[\s;"''/\\])'
+    $canonicalPattern = [regex]::Escape($script:CanonicalCandidateWorktree) + '(?=$|[\s;"''])'
     foreach ($line in $lines) {
         # Comments cannot establish an execution context.
         $command = $line -replace '\s+#.*$', ''
@@ -224,6 +224,16 @@ Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA-other"; cargo tree -
     Assert-Throws { Assert-CanonicalWorktreeOperation $suffixLookalike 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } 'suffix lookalike must not authorize verifier worktree'
     Assert-Throws { Assert-CandidateCargoOperation $suffixLookalike 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'suffix lookalike must not authorize metadata worktree'
     Assert-Throws { Assert-CandidateCargoOperation $suffixLookalike 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'suffix lookalike must not authorize tree worktree'
+
+    foreach ($suffix in @('/child', '/../trusted', '\child', '\..\trusted')) {
+        $badWorktree = $script:CanonicalCandidateWorktree + $suffix
+        $childOrTraversal = 'Set-Location "' + $badWorktree + '"; powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA' + "`n" +
+            'Set-Location "' + $badWorktree + '"; cargo metadata --locked' + "`n" +
+            'Set-Location "' + $badWorktree + '"; cargo tree --locked'
+        Assert-Throws { Assert-CanonicalWorktreeOperation $childOrTraversal 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } "child/traversal suffix [$suffix] must not authorize verifier worktree"
+        Assert-Throws { Assert-CandidateCargoOperation $childOrTraversal 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } "child/traversal suffix [$suffix] must not authorize metadata worktree"
+        Assert-Throws { Assert-CandidateCargoOperation $childOrTraversal 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } "child/traversal suffix [$suffix] must not authorize tree worktree"
+    }
 }
 
 Invoke-Fixtures
