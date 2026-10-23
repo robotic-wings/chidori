@@ -104,14 +104,14 @@ function Assert-TrustedVerifierIdentity([string]$Text) {
     Assert ([regex]::Matches($Text, $verifierAssignment).Count -eq 1) 'trusted verifier must be derived from the canonical trusted root'
     Assert ($Text -notmatch '(?im)^\s*\$trusted(?:Root|Verifier)\s*=.*\$env:RUNNER_TEMP') 'trusted verifier must not be rooted in RUNNER_TEMP'
 
-    $testPath = '(?i)Test-Path\s+-LiteralPath\s+\$trustedVerifier\b'
-    Assert ($Text -match $testPath) 'trusted verifier must be existence-checked through its canonical variable'
+    $failClosedGuard = '(?is)if\s*\(\s*-not\s*\(\s*Test-Path\s+-LiteralPath\s+\$trustedVerifier\s*\)\s*\)\s*\{\s*(?:throw\b|exit\b)'
+    Assert ([regex]::Matches($Text, $failClosedGuard).Count -eq 1) 'trusted verifier must have exactly one fail-closed Test-Path guard through its canonical variable'
     $invocation = '(?im)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert ([regex]::Matches($Text, $invocation).Count -eq 1) 'trusted verifier must be invoked exactly once through the canonical variable with pwsh -File'
     Assert ($Text -notmatch '(?im)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+(?!\$trustedVerifier\b)') 'trusted verifier invocation must not bypass the canonical variable'
 
-    $ordered = [regex]::Escape('Test-Path -LiteralPath $trustedVerifier') + '(?s:.{0,4000}?)Remove-Item\s+Env:.*?' + [regex]::Escape('& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier')
-    Assert ($Text -match $ordered) 'trusted verifier must be existence-checked before environment scrub and invocation'
+    $ordered = $failClosedGuard + '(?s:.{0,4000}?)Remove-Item\s+Env:.*?' + [regex]::Escape('& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier')
+    Assert ($Text -match $ordered) 'trusted verifier fail-closed guard must precede environment scrub and invocation'
 }
 
 function Assert-WorkflowContract([string]$Workflow) {
@@ -224,6 +224,9 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
 
     $missingVerifierCheck = [regex]::Replace($happy, '(?m)^if \(-not \(Test-Path -LiteralPath \$trustedVerifier\)\) \{ throw ''missing trusted verifier'' \}\r?\n?', '')
     Assert-Throws { Assert-TrustedVerifierIdentity $missingVerifierCheck } 'trusted verifier invocation without Test-Path must be rejected'
+
+    $bareVerifierCheck = $happy.Replace("if (-not (Test-Path -LiteralPath `$trustedVerifier)) { throw 'missing trusted verifier' }", 'Test-Path -LiteralPath $trustedVerifier')
+    Assert-Throws { Assert-TrustedVerifierIdentity $bareVerifierCheck } 'bare/no-op trusted verifier Test-Path must be rejected'
 
     $directVerifierPath = $happy.Replace('-File $trustedVerifier', "-File (Join-Path `$trustedRoot 'scripts/verify-package-candidate.ps1')")
     Assert-Throws { Assert-TrustedVerifierIdentity $directVerifierPath } 'direct trusted verifier path must not bypass the canonical variable'
