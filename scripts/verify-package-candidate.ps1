@@ -7,7 +7,19 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$gitExecutablePath = (Get-Command git -CommandType Application).Source
+function Resolve-GitExecutablePath {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in (Get-Command git -All -CommandType Application)) {
+        $raw = if (-not [string]::IsNullOrWhiteSpace($candidate.Source)) { $candidate.Source } else { $candidate.Path }
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        if (-not (Test-Path -LiteralPath $raw -PathType Leaf)) { continue }
+        $canonical = (Resolve-Path -LiteralPath ([IO.Path]::GetFullPath($raw))).Path
+        if ($seen.Add($canonical)) { return $canonical }
+    }
+    throw 'no valid git Application executable path'
+}
+
+$gitExecutablePath = Resolve-GitExecutablePath
 
 function Invoke-ResolvedGit([string[]]$Arguments) {
     $out = & $gitExecutablePath @Arguments
