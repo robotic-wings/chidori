@@ -129,15 +129,25 @@ function Assert-VerifierScriptPortability([string]$Text) {
 }
 
 function Assert-VerifierScriptRecursionSafety([string]$Text) {
-    $resolutionPattern = '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Get-Command\s+git\s+-CommandType\s+Application\b'
+    $resolutionPattern = '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(\s*Get-Command\s+git\s+-CommandType\s+Application\s*\)\.(?:Source|Path)\s*$'
     $resolutions = [regex]::Matches($Text, $resolutionPattern)
-    Assert ($resolutions.Count -eq 1) 'trusted verifier must resolve exactly one PATH Application identity for git'
+    Assert ($resolutions.Count -eq 1) 'trusted verifier must resolve exactly one PATH Application executable path for git'
     Assert ($Text -notmatch '(?im)^\s*function\s+git\b') 'trusted verifier must not declare a Git helper or function that can recurse'
 
-    $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value) + '(?:\.Source)?'
-    Assert ($Text -match ('(?im)&\s*' + $resolved + '\b')) 'trusted verifier wrapper invocations must use the resolved git Application variable'
-    Assert ($Text -match ('(?im)Start-Process\s+-FilePath\s+' + $resolved + '\b')) 'trusted verifier byte-safe materialization must use Start-Process -FilePath with the resolved git variable'
-    Assert ($Text -match ('(?im)&\s*' + $resolved + '\s+apply\b')) 'trusted verifier direct apply operations must use the resolved git variable'
+    $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
+    Assert ($Text -match ('(?im)&\s*' + $resolved + '\b')) 'trusted verifier wrapper invocations must use the resolved git executable-path variable'
+    Assert ($Text -match ('(?im)Start-Process\s+-FilePath\s+' + $resolved + '\b')) 'trusted verifier byte-safe materialization must use Start-Process -FilePath with the resolved git executable-path variable'
+    Assert ($Text -match ('(?im)&\s*' + $resolved + '\s+apply\b')) 'trusted verifier direct apply operations must use the resolved git executable-path variable'
+    Assert ($Text -notmatch '(?im)(?:&\s*|Start-Process\s+-FilePath\s+)\$[A-Za-z_][A-Za-z0-9_]*\.(?:Source|Path)\b') 'trusted verifier must not invoke raw ApplicationInfo Source/Path members'
+
+    $invocations = [regex]::Matches($Text, '(?im)&\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\b')
+    foreach ($invocation in $invocations) {
+        Assert ($invocation.Groups['variable'].Value -ceq $resolutions[0].Groups['variable'].Value) 'trusted verifier wrapper invocation must not use a git alias or raw ApplicationInfo variable'
+    }
+    $startProcesses = [regex]::Matches($Text, '(?im)Start-Process\s+-FilePath\s+(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\b')
+    foreach ($startProcess in $startProcesses) {
+        Assert ($startProcess.Groups['variable'].Value -ceq $resolutions[0].Groups['variable'].Value) 'trusted verifier Start-Process must not use a git alias or raw ApplicationInfo variable'
+    }
 
     $commands = foreach ($line in ($Text -split "\r?\n")) {
         $withoutWholeLineComment = $line -replace '^\s*#.*$', ''
@@ -350,12 +360,12 @@ Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; Set-Location trust
 
 function Invoke-VerifierPortabilityFixtures {
     $portable = @'
-$gitApplication = Get-Command git -CommandType Application
+$gitExecutablePath = (Get-Command git -CommandType Application).Source
 function Invoke-ResolvedGit([string[]]$Arguments) {
-    $out = & $gitApplication.Source @Arguments
+    $out = & $gitExecutablePath @Arguments
 }
-$process = Start-Process -FilePath $gitApplication.Source -ArgumentList @('show', 'HEAD:Cargo.lock') -RedirectStandardOutput lock -NoNewWindow -PassThru -Wait
-& $gitApplication.Source apply --no-index patch
+$process = Start-Process -FilePath $gitExecutablePath -ArgumentList @('show', 'HEAD:Cargo.lock') -RedirectStandardOutput lock -NoNewWindow -PassThru -Wait
+& $gitExecutablePath apply --no-index patch
 '@
     Assert-VerifierScriptPortability $portable
     Assert-VerifierScriptRecursionSafety $portable
@@ -394,14 +404,25 @@ $process = Start-Process -FilePath $gitApplication.Source -ArgumentList @('show'
     Assert-VerifierScriptPortability $portableWithWindowsComments
 
     foreach ($recursionUnsafe in @(
-        "function Git { & `$gitApplication.Source status }",
-        "function gIt { & `$gitApplication.Source status }",
+        "function Git { & `$gitExecutablePath status }",
+        "function gIt { & `$gitExecutablePath status }",
         '& git status',
         'Start-Process -FilePath git -ArgumentList @(''status'')',
         '& git apply --no-index patch'
     )) {
         Assert-Throws { Assert-VerifierScriptRecursionSafety ($portable + "`n" + $recursionUnsafe) } "recursion-unsafe verifier form must be rejected: $recursionUnsafe"
     }
+
+    $rawApplicationInvocation = @'
+$gitApplication = Get-Command git -CommandType Application
+& $gitApplication status
+'@
+    Assert-Throws { Assert-VerifierScriptRecursionSafety $rawApplicationInvocation } 'raw ApplicationInfo invocation must be rejected'
+    $rawApplicationStartProcess = @'
+$gitApplication = Get-Command git -CommandType Application
+Start-Process -FilePath $gitApplication -ArgumentList @('status')
+'@
+    Assert-Throws { Assert-VerifierScriptRecursionSafety $rawApplicationStartProcess } 'raw ApplicationInfo Start-Process must be rejected'
 }
 
 Invoke-Fixtures
