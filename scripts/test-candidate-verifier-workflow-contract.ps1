@@ -3,6 +3,7 @@ param([switch]$FixturesOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$script:CanonicalCandidateWorktree = '$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA'
 
 function Assert([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -58,6 +59,14 @@ function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern
     }
 }
 
+function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name, [string]$Pattern) {
+    $operations = [regex]::Matches($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
+    Assert ($operations.Count -gt 0) "workflow must contain $Name"
+    foreach ($operation in $operations) {
+        Assert ($operation.Value -match [regex]::Escape($script:CanonicalCandidateWorktree)) "$Name must use canonical candidate worktree expression"
+    }
+}
+
 function Assert-CandidateCargoOperation([string]$Text, [string]$Name, [string]$Pattern) {
     $lines = $Text -split "\r?\n"
     $operationCount = 0
@@ -67,7 +76,7 @@ function Assert-CandidateCargoOperation([string]$Text, [string]$Name, [string]$P
         if ($command -match $Pattern) {
             $operationCount++
             Assert ($command -match '(?i)(Set-Location|Push-Location|working-directory|worktree)') "$Name must select a worktree in executable command text"
-            Assert ($command -match '(?i)candidate[-_/\\]+\$env:CANDIDATE_SHA') "$Name must select a candidate worktree derived from `$env:CANDIDATE_SHA"
+            Assert ($command -match [regex]::Escape($script:CanonicalCandidateWorktree)) "$Name must use canonical candidate worktree expression"
             Assert ($command -match '\$env:CANDIDATE_SHA') "$Name worktree must derive from literal `$env:CANDIDATE_SHA"
         }
     }
@@ -96,9 +105,10 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match '\$env:CANDIDATE_SHA') 'workflow shell and ref use must flow through CANDIDATE_SHA environment only'
     Assert ($text -match '\^\[0-9a-f\]\{40\}\$') 'workflow must validate exact lowercase 40-hex SHA before use'
     Assert-EnvBoundOperation $text 'candidate fetch' '^.*git\s+fetch.*$'
-    Assert-EnvBoundOperation $text 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    $worktreeTarget = 'git\s+worktree\s+add\s+--detach\s+(?:"|'')?' + [regex]::Escape($script:CanonicalCandidateWorktree)
+    Assert-CanonicalWorktreeOperation $text 'detached candidate worktree' "^.*$worktreeTarget.*$"
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
-    Assert-EnvBoundOperation $text 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
+    Assert-CanonicalWorktreeOperation $text 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
     Assert-CandidateCargoOperation $text 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-CandidateCargoOperation $text 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
@@ -154,14 +164,14 @@ function Invoke-Fixtures {
 function Invoke-StaticWorkflowFixtures {
     $happy = @'
 git fetch origin $env:CANDIDATE_SHA
-git worktree add --detach candidate $env:CANDIDATE_SHA
-powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA
-Set-Location "candidate-$env:CANDIDATE_SHA"; cargo metadata --locked
-Set-Location "candidate-$env:CANDIDATE_SHA"; cargo tree --locked
+git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA
+Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo metadata --locked
+Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --locked
 '@
     Assert-EnvBoundOperation $happy 'candidate fetch' '^.*git\s+fetch.*$'
-    Assert-EnvBoundOperation $happy 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
-    Assert-EnvBoundOperation $happy 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
+    Assert-CanonicalWorktreeOperation $happy 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    Assert-CanonicalWorktreeOperation $happy 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
     Assert-CandidateCargoOperation $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-CandidateCargoOperation $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
 
@@ -174,8 +184,8 @@ Set-Location "candidate-$candidate_alias"; cargo metadata --locked
 Set-Location "candidate-$candidate_alias"; cargo tree --locked
 '@
     Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate fetch' '^.*git\s+fetch.*$' } 'inert earlier env reference must not authorize alias-backed fetch'
-    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$' } 'inert earlier env reference must not authorize alias-backed worktree'
-    Assert-Throws { Assert-EnvBoundOperation $inertAlias 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } 'inert earlier env reference must not authorize alias-backed verifier'
+    Assert-Throws { Assert-CanonicalWorktreeOperation $inertAlias 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$' } 'inert earlier env reference must not authorize alias-backed worktree'
+    Assert-Throws { Assert-CanonicalWorktreeOperation $inertAlias 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } 'inert earlier env reference must not authorize alias-backed verifier'
     Assert-Throws { Assert-CandidateCargoOperation $inertAlias 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'inert earlier env reference must not authorize alias-backed metadata'
     Assert-Throws { Assert-CandidateCargoOperation $inertAlias 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'inert earlier env reference must not authorize alias-backed tree'
 
@@ -192,6 +202,17 @@ Set-Location "trusted-$env:CANDIDATE_SHA"; cargo tree --locked
 '@
     Assert-Throws { Assert-CandidateCargoOperation $wrongWorktree 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'wrong worktree must not authorize metadata'
     Assert-Throws { Assert-CandidateCargoOperation $wrongWorktree 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'wrong worktree must not authorize tree'
+
+    $mismatchedWorktree = @'
+git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; powershell -File scripts/verify-package-candidate.ps1 -Candidate $env:CANDIDATE_SHA
+Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; cargo metadata --locked
+Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; cargo tree --locked
+'@
+    Assert-CanonicalWorktreeOperation $mismatchedWorktree 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    Assert-Throws { Assert-CanonicalWorktreeOperation $mismatchedWorktree 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$' } 'verifier must use worktree creation target exactly'
+    Assert-Throws { Assert-CandidateCargoOperation $mismatchedWorktree 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'metadata must use worktree creation target exactly'
+    Assert-Throws { Assert-CandidateCargoOperation $mismatchedWorktree 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'tree must use worktree creation target exactly'
 }
 
 Invoke-Fixtures
