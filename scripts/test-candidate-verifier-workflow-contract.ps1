@@ -158,7 +158,10 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     Assert ($Text -match '(?is)\$candidateHead\s*-ne\s*\$candidateSha') 'locked Cargo block must compare captured HEAD to captured candidate SHA'
     Assert ($Text -match '(?is)\$candidateStatus\s*-ne\s*[''"]{2}') 'locked Cargo block must compare captured status for cleanliness'
     Assert ($Text -match '(?is)\$parents\.Count\s*-ne\s*1.{0,500}\$parents\[0\]\s*-ne\s*[''"]9e1c295b1f3f90ef342021ec81b52ece7363cd6c') 'locked Cargo block must compare captured sole parent to approved base'
-    Assert ($Text -match '(?is)\$candidatePaths\s*-ne\s*\$approvedCandidatePaths') 'locked Cargo block must compare captured path scope to approved paths'
+    Assert ([regex]::Matches($Text, '(?im)^\s*\$candidatePathText\s*=\s*\(\$candidatePaths\s+-join\s+["'']`n["'']\)\s*$').Count -ge 3) 'locked Cargo block must normalize each captured path array to an ordered scalar'
+    Assert ([regex]::Matches($Text, '(?is)\$candidatePathText\s*-ne\s*\$approvedCandidatePaths').Count -ge 3) 'locked Cargo block must compare each normalized path scalar to approved paths'
+    Assert ($Text -notmatch '(?is)\$candidatePaths\s*-ne\s*\$approvedCandidatePaths') 'locked Cargo block must not compare a raw path array to an approved scalar'
+    Assert ($Text -notmatch '(?i)\$candidatePaths.{0,100}(?:Sort-Object|\|\s*sort)') 'locked Cargo block must preserve captured path ordering without sorting'
 
     $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha', 'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha')
     foreach ($phase in @(
@@ -508,7 +511,8 @@ if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
 if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
 $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
 if ($LASTEXITCODE -ne 0) { throw 'candidate path evidence failed' }
-if ($candidatePaths -ne $approvedCandidatePaths) { throw 'candidate path scope failed' }
+$candidatePathText = ($candidatePaths -join "`n")
+if ($candidatePathText -ne $approvedCandidatePaths) { throw 'candidate path scope failed' }
 Remove-Item Env:*
 $env:PATH = $toolPath
 $env:HOME = $homePath
@@ -528,7 +532,8 @@ try {
     if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
     $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate path evidence failed' }
-    if ($candidatePaths -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
+    $candidatePathText = ($candidatePaths -join "`n")
+    if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
     cargo metadata --locked --format-version 1 --no-deps
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     cargo tree --locked -p chidori
@@ -545,13 +550,20 @@ try {
     if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
     $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate path evidence failed' }
-    if ($candidatePaths -ne $approvedCandidatePaths) { throw 'post-Cargo candidate path scope failed' }
+    $candidatePathText = ($candidatePaths -join "`n")
+    if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-Cargo candidate path scope failed' }
 } finally {
     Pop-Location
 }
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    $approvedPathLines = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
+    $approvedPathText = ($approvedPathLines -join "`n")
+    Assert ((@('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml') -join "`n") -eq $approvedPathText) 'ordered approved candidate paths must normalize to the expected scalar'
+    foreach ($badPaths in @(@('crates/chidori-js/Cargo.toml', 'Cargo.lock', 'crates/chidori/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml', 'extra'))) {
+        Assert (($badPaths -join "`n") -ne $approvedPathText) 'reordered, missing, or extra candidate paths must fail ordered scalar comparison'
+    }
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
@@ -563,8 +575,10 @@ try {
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateHead = git rev-parse HEAD', 'git rev-parse HEAD | Out-Null')) } 'Out-Null evidence must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateHead -ne $candidateSha', '$candidateHead -ne ''hard-coded''')) } 'hard-coded expected identity must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow -replace '\$candidateStatus\s*-ne\s*''''', '$true') } 'captured output must not be unused'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow -replace '(?ms)^\s*\$candidatePaths\s*=.*?^\s*if \(\$candidatePaths -ne \$approvedCandidatePaths\).*?\r?\n', '') } 'missing path comparison must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePaths -ne $approvedCandidatePaths', '$candidatePaths -ne ''hard-coded-paths''')) } 'hard-coded path comparison must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow -replace '(?ms)^\s*\$candidatePaths\s*=.*?^\s*if \(\$candidatePathText -ne \$approvedCandidatePaths\).*?\r?\n', '') } 'missing path comparison must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$candidatePathText -ne ''hard-coded-paths''')) } 'hard-coded path comparison must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$true')) } 'unused normalized path scalar must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText = ($candidatePaths -join "`n")', '$candidatePathText = (($candidatePaths | Sort-Object) -join "`n")')) } 'sorted path normalization must fail'
     $bleed = $candidateCargoWorkflow.Replace('$candidatePaths = git diff', '# removed path capture`n$null = git diff') + "`n  - uses: actions/checkout@v7`n    run: |`n      `$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c `$candidateSha"
     Assert-Throws { Assert-CandidateScrubAndCargoContract $bleed } 'unnamed sibling step must not bleed evidence into locked Cargo block'
 
