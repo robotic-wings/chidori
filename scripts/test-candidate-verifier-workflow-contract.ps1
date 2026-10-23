@@ -204,8 +204,10 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ([regex]::Matches($Text, '(?im)^\s*\$candidateTarget\s*=').Count -eq 1) 'workflow must capture candidate target exactly once'
     Assert ($Text -notmatch '(?im)^\s*\$candidateTarget\s*=.*\$candidateWorktree') 'candidate target must be strictly external to canonical worktree'
     Assert ($Text -notmatch '(?i)candidate-target-\$candidateSha(?:[/\\]|-|\.\.)') 'candidate target must reject child, suffix, or traversal forms'
-    Assert ($Text -match '(?is)Resolve-Path\s+-LiteralPath\s+\$candidateTarget') 'candidate target must be canonicalized before use'
-    Assert ($Text -match '(?is)\$candidateTargetCanonical.*?\$candidateWorktreeCanonical.*?(?:-like|StartsWith|IsPathRooted)') 'candidate target must have a strict canonical path-boundary check against candidate worktree'
+    Assert ($Text -match '(?is)(?:GetFullPath|Resolve-Path).*\$candidateTarget') 'candidate target must be canonicalized before use'
+    Assert ($Text -match '(?is)DirectorySeparatorChar.*?AltDirectorySeparatorChar') 'candidate target boundary must be separator-aware'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical\s*-eq\s*\$candidateWorktreeCanonical') 'candidate target boundary must reject equality with candidate worktree'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical.*?(?:StartsWith|like).*?(?:\$separator|\$alternateSeparator|DirectorySeparatorChar|AltDirectorySeparatorChar)') 'candidate target boundary must reject only separator-bound descendants while allowing siblings'
     Assert ($Text -match '(?im)^\s*\$candidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all') 'candidate clean boundary must capture full porcelain including untracked files'
     Assert ($Text -match '(?is)\$candidatePorcelain.*?\$LASTEXITCODE.*?\$candidatePorcelain\s*-ne\s*[''"]{2}.*?\$candidatePorcelain') 'candidate status failure must report exact captured porcelain output'
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
@@ -216,6 +218,9 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
     Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
     Assert ([regex]::Matches($Text, '(?im)^\s*\$candidatePorcelain\s*=').Count -ge 5) 'full candidate porcelain evidence is required at every clean boundary'
+    foreach ($operation in @('&\s+pwsh.*?\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
+        Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
+    }
 }
 
 function Assert-TrustedVerifierIdentity([string]$Text) {
@@ -603,17 +608,23 @@ $env:RUSTUP_HOME = $rustupHome
 $candidateSha = $env:CANDIDATE_SHA
 $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
 $candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
-$candidateTargetCanonical = Resolve-Path -LiteralPath $candidateTarget
-$candidateWorktreeCanonical = Resolve-Path -LiteralPath $candidateWorktree
-if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical)) { throw 'target inside worktree' }
+$candidateTargetCanonical = [IO.Path]::GetFullPath($candidateTarget)
+$candidateWorktreeCanonical = [IO.Path]::GetFullPath($candidateWorktree)
+$separator = [IO.Path]::DirectorySeparatorChar
+$alternateSeparator = [IO.Path]::AltDirectorySeparatorChar
+if ($candidateTargetCanonical -eq $candidateWorktreeCanonical) { throw 'target equals worktree' }
+if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $separator) -or $candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $alternateSeparator)) { throw 'target inside worktree' }
 $candidatePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
 if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
 Remove-Item Env:*
 $env:CARGO_TARGET_DIR = $candidateTarget
 & pwsh -File $trustedVerifier -Target $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
 cargo metadata --locked --target-dir $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'metadata failed' }
 cargo tree --locked --target-dir $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'tree failed' }
 $candidatePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
 if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
