@@ -50,6 +50,16 @@ function Assert-CandidateCheckout(
     Assert ($parents[0] -eq $BaseSha) 'candidate parent must equal approved base'
 }
 
+function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern) {
+    $operations = [regex]::Matches($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
+    Assert ($operations.Count -gt 0) "workflow must contain $Name"
+    foreach ($operation in $operations) {
+        $start = [Math]::Max(0, $operation.Index - 1200)
+        $context = $Text.Substring($start, $operation.Index - $start + $operation.Length)
+        Assert ($context -match '\$env:CANDIDATE_SHA') "$Name must be bound to `$env:CANDIDATE_SHA"
+    }
+}
+
 function Assert-WorkflowContract([string]$Workflow) {
     Assert (Test-Path -LiteralPath $Workflow) 'missing .github/workflows/candidate-verifier.yml'
     $text = [IO.File]::ReadAllText($Workflow)
@@ -57,21 +67,28 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -notmatch '(?m)^\s*(pull_request|push|schedule):') 'workflow must not have automatic triggers'
     Assert ($text -match 'github\.ref\s*==\s*[''\"]refs/heads/main[''\"]') 'workflow must guard main ref'
     Assert ($text -match '(?ms)^permissions:\s*\r?\n\s*contents:\s*read\s*$') 'workflow must grant only contents: read'
-    Assert ($text -match 'persist-credentials:\s*false') 'checkout must disable persisted credentials'
-    Assert ($text -notmatch '(?i)(secrets\.|github\.token|GH_TOKEN)') 'workflow must not expose secrets or token variables'
+    $checkouts = [regex]::Matches($text, '(?ms)^\s*-\s*uses:\s*actions/checkout[^\r\n]*\r?\n(?<block>.*?)(?=^\s*-\s|\z)')
+    Assert ($checkouts.Count -gt 0) 'workflow must use checkout'
+    foreach ($checkout in $checkouts) {
+        Assert ($checkout.Groups['block'].Value -match '(?m)^\s*with:\s*\r?\n(?:\s+.*\r?\n)*?\s*persist-credentials:\s*false\s*$') 'every actions/checkout block must set persist-credentials: false'
+    }
+    Assert ($text -notmatch '(?i)(GITHUB_TOKEN|GH_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN|secrets\.|github\.token|credential(?:\.|\s)|http\.[^\s]*extraheader|https?://[^/\s]*@|git\s+config[^\r\n]*(?:credential|extraheader)|persist-credentials:\s*true)') 'workflow must not expose tokens, credentials, credential config, or credential URLs'
     Assert ($text -match 'CANDIDATE_SHA') 'workflow must assign candidate SHA to CANDIDATE_SHA'
     $trustedInputAssignment = '(?m)^\s*CANDIDATE_SHA:\s*\$\{\{\s*inputs\.candidate_sha\s*\}\}\s*$'
     $trustedAssignments = [regex]::Matches($text, $trustedInputAssignment)
     Assert ($trustedAssignments.Count -eq 1) 'workflow must contain exactly one trusted CANDIDATE_SHA input assignment'
     $withoutTrustedAssignment = [regex]::Replace($text, $trustedInputAssignment, '')
-    Assert ($withoutTrustedAssignment -notmatch '\$\{\{\s*inputs\.candidate_sha\s*\}\}') 'workflow must not interpolate input SHA into shell or refs'
+    Assert ($withoutTrustedAssignment -notmatch '(?i)(inputs\.candidate_sha|github\.event\.inputs\.candidate_sha|\$\{?CANDIDATE_SHA\}?|\$\{\{\s*env\.CANDIDATE_SHA)') 'workflow must not use alternate candidate SHA shell or ref flows'
     Assert ($text -match '\$env:CANDIDATE_SHA') 'workflow shell and ref use must flow through CANDIDATE_SHA environment only'
     Assert ($text -match '\^\[0-9a-f\]\{40\}\$') 'workflow must validate exact lowercase 40-hex SHA before use'
-    Assert ($text -match 'git worktree add --detach') 'workflow must use detached candidate checkout'
+    Assert-EnvBoundOperation $text 'candidate fetch' '^.*git\s+fetch.*$'
+    Assert-EnvBoundOperation $text 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
-    Assert ($text -match 'verify-package-candidate\.ps1') 'workflow must invoke trusted verifier script'
-    Assert ($text -match 'cargo metadata --locked') 'workflow must require candidate locked metadata evidence'
-    Assert ($text -match '(?i)(env -i|Remove-Item Env:|GIT_CONFIG_NOSYSTEM)') 'workflow must scrub candidate execution environment'
+    Assert-EnvBoundOperation $text 'trusted verifier invocation' '^.*verify-package-candidate\.ps1.*$'
+    Assert-EnvBoundOperation $text 'candidate Cargo metadata invocation' '^.*cargo\s+metadata\s+--locked.*$'
+    Assert-EnvBoundOperation $text 'candidate Cargo tree invocation' '^.*cargo\s+tree\s+--locked.*$'
+    Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
+    Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}cargo\s+(?:metadata|tree)\s+--locked') 'scrubbed candidate environment must bind Cargo invocation'
 }
 
 function New-FixtureRepo {
