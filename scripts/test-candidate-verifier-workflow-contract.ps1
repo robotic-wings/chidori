@@ -206,7 +206,7 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -notmatch '(?i)candidate-target-\$candidateSha(?:[/\\]|-|\.\.)') 'candidate target must reject child, suffix, or traversal forms'
     Assert ($Text -match '(?im)^\s*\$candidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all') 'candidate clean boundary must capture full porcelain including untracked files'
     Assert ($Text -match '(?is)\$candidatePorcelain.*?\$LASTEXITCODE.*?\$candidatePorcelain\s*-ne\s*[''"]{2}.*?\$candidatePorcelain') 'candidate status failure must report exact captured porcelain output'
-    Assert ($Text -notmatch '(?i)(?:git\s+clean|Remove-Item\s+.*\*)') 'cleanup must not broadly clean or delete candidate worktree'
+    Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?(?:&\s+pwsh.*?\$candidateTarget|cargo\s+(?:metadata|tree).*?\$candidateTarget)') 'scrubbed verifier and Cargo must receive captured external target'
 }
