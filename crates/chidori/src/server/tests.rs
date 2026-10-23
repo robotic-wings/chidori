@@ -2578,6 +2578,12 @@ async fn malformed_persisted_vfs_resume_child() {
         SnapshotStore::new(&run_dir).load_manifest().is_err(),
         "fixture must have an existing malformed manifest"
     );
+    let direct_load = load_persisted_vfs(&state.run_base, Some(&run_id));
+    assert!(
+        direct_load.is_err(),
+        "direct persisted VFS load unexpectedly succeeded after corrupting {}: {direct_load:?}",
+        manifest_path.display()
+    );
 
     let (status, body) = response_json(
         resume_session(
