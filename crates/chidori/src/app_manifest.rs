@@ -373,6 +373,20 @@ routes:
     }
 
     #[test]
+    fn loads_valid_manifest_from_both_yaml_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_agent(dir.path(), "worker.ts");
+        let body = "agents:\n  - name: worker\n    agent: worker.ts\n";
+
+        for name in ["chidori.app.yml", "chidori.app.yaml"] {
+            let path = write_manifest(dir.path(), name, body);
+            let manifest = AppManifest::load(&path).unwrap();
+            assert_eq!(manifest.agents.len(), 1, "manifest {name}");
+            assert_eq!(manifest.agents[0].name, "worker", "manifest {name}");
+        }
+    }
+
+    #[test]
     fn find_in_probes_the_standard_names() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(AppManifest::find_in(dir.path()), None);

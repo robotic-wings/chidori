@@ -72,3 +72,33 @@ impl Recipe {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yaml_and_json_recipes_preserve_fields_and_cron() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("digest.yaml");
+        let json = dir.path().join("digest.json");
+        std::fs::write(
+            &yaml,
+            "name: digest\nagent: agents/digest.ts\nschedule: '0 9 * * 1-5'\ninputs:\n  channel: '#general'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &json,
+            r##"{"name":"digest-json","agent":"agents/digest.ts","schedule":"0 9 * * 1-5","inputs":{"channel":"#general"}}"##,
+        )
+        .unwrap();
+
+        let yaml_recipe = Recipe::load(&yaml).unwrap();
+        let json_recipe = Recipe::load(&json).unwrap();
+        for recipe in [&yaml_recipe, &json_recipe] {
+            assert_eq!(recipe.agent, PathBuf::from("agents/digest.ts"));
+            assert_eq!(recipe.schedule.as_deref(), Some("0 9 * * 1-5"));
+            assert_eq!(recipe.inputs["channel"], "#general");
+        }
+    }
+}

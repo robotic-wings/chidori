@@ -1282,6 +1282,50 @@ fn parse_meta(source: &str) -> Result<Meta, String> {
     serde_yaml::from_str(yaml).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn args() -> Args {
+        Args {
+            root: PathBuf::new(),
+            paths: Vec::new(),
+            filter: None,
+            max: None,
+            json: None,
+            verbose: false,
+            modules: true,
+            intl: false,
+            temporal: false,
+            repeat: 1,
+            state: None,
+            baseline: None,
+        }
+    }
+
+    #[test]
+    fn yaml_frontmatter_preserves_test262_metadata_and_variants() {
+        let meta = parse_meta(
+            "/*---\nflags: [onlyStrict]\nincludes:\n  - compareArray.js\nnegative:\n  phase: parse\n  type: SyntaxError\nfeatures: [Promise]\n---*/\n",
+        )
+        .unwrap();
+
+        assert_eq!(meta.flags, ["onlyStrict"]);
+        assert_eq!(meta.includes, ["compareArray.js"]);
+        assert_eq!(meta.features, ["Promise"]);
+        let negative = meta.negative.as_ref().unwrap();
+        assert_eq!(negative.phase, "parse");
+        assert_eq!(negative.type_, "SyntaxError");
+        assert_eq!(select_variants(&meta, &args()), vec![Variant::Strict]);
+    }
+
+    #[test]
+    fn yaml_frontmatter_module_flag_selects_module_variant() {
+        let meta = parse_meta("/*---\nflags: [module]\n---*/\n").unwrap();
+        assert_eq!(select_variants(&meta, &args()), vec![Variant::Module]);
+    }
+}
+
 /// Recursively collect runnable `.js` test files, skipping fixtures.
 fn collect_tests(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_file() {
