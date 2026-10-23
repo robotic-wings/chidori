@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $script:CanonicalCandidateWorktree = '$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA'
 $script:CanonicalTrustedRoot = '$env:GITHUB_WORKSPACE/trusted'
+$script:RawBinaryFixturePending = $false
+$script:RawBinaryFixturePendingReason = $null
 
 function Assert([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -13,6 +15,13 @@ function Assert([bool]$Condition, [string]$Message) {
 function Assert-Throws([scriptblock]$Action, [string]$Message) {
     try { & $Action } catch { return }
     throw $Message
+}
+
+function Get-RawImmutableFixtureResult([bool]$ArgumentListAvailable) {
+    if (-not $ArgumentListAvailable) {
+        return [pscustomobject]@{ State = 'PENDING'; ExitCode = 2 }
+    }
+    return [pscustomobject]@{ State = 'READY'; ExitCode = 0 }
 }
 
 function Git([string]$Repo, [string[]]$Arguments) {
@@ -276,7 +285,7 @@ function Assert-RawBinaryCaptureContract([string]$Text) {
     }
     foreach ($role in $sourceHashes.Keys) {
         $hash = $sourceHashes[$role]
-        Assert ($Text -match ("(?is)Write-RawGitOutput\\s+\\$" + $role + "\\b.{0,1400}hash-object.{0,700}\\$" + $role + ".{0,700}" + $hash)) "raw $role capture must be source-byte hash-bound before composition"
+        Assert ($Text -match ("(?is)Write-RawGitOutput\s+\$" + $role + "\b.{0,1400}hash-object.{0,700}\$" + $role + ".{0,700}" + $hash)) "raw $role capture must be source-byte hash-bound before composition"
     }
     Assert ($Text -match '(?is)Write-RawGitOutput\s+\$mergedLock.{0,1400}hash-object.{0,700}\$mergedLock.{0,700}c4b4316368317a342058f77151ab8043afea676b.{0,700}(?:ReadAllBytes|candidateLock|Blob\s+\$candidateSha)') 'raw emitted merge bytes must be hash-bound before candidate byte comparison'
     Assert ($Text -notmatch '(?is)\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*@\([''\"](?:show|merge-file)[''\"].{0,1000}Write-RawGitOutput') 'raw capture must not choose composition roles/options dynamically'
@@ -299,7 +308,7 @@ function Assert-LockCompositionContract([string]$Text) {
     $resolutions = [regex]::Matches($Text, '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Resolve-GitExecutablePath\s*$')
     Assert ($resolutions.Count -eq 1) 'trusted verifier must use exactly one resolved executable path for lock construction'
     $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
-    Assert ($Text -match '(?is)hash-object.{0,1000}\$mergedLock.{0,1000}c4b4316368317a342058f77151ab8043afea676b.{0,1000}Blob\s+\$candidateSha.{0,500}Cargo\.lock') 'trusted verifier must hash emitted merge bytes to final lock blob before candidate comparison'
+    Assert ($Text -match '(?is)hash-object.{0,1000}\$mergedLock.{0,1000}c4b4316368317a342058f77151ab8043afea676b.{0,1000}(?:Blob\s+\$candidateSha.{0,500}Cargo\.lock|hash-object.{0,500}\$candidateLock)') 'trusted verifier must hash emitted merge bytes to final lock blob before candidate comparison'
     Assert-NoPatchReplay $Text
     Assert-RawBinaryCaptureContract $Text
 }
@@ -672,14 +681,15 @@ function Assert-FixtureMergedHash([string]$Package, [string]$Base, [string]$Ctut
 }
 
 function Invoke-LockCompositionFixtures {
-    if ($null -eq [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
-        $script:RawBinaryFixtureBlocker = 'ProcessStartInfo.ArgumentList is unavailable in Windows PowerShell; pwsh/.NET Core is required to execute raw immutable-blob capture fixtures.'
-        Write-Warning $script:RawBinaryFixtureBlocker
-        return
-    }
-    $temp = Join-Path ([IO.Path]::GetTempPath()) ('chidori-lock-composition-' + [Guid]::NewGuid())
-    New-Item -ItemType Directory -Path $temp | Out-Null
-    try {
+    $fixtureResult = Get-RawImmutableFixtureResult ($null -ne [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList'))
+    if ($fixtureResult.State -eq 'PENDING') {
+        $script:RawBinaryFixturePending = $true
+        $script:RawBinaryFixturePendingReason = 'ProcessStartInfo.ArgumentList is unavailable in Windows PowerShell; pwsh/.NET Core is required to execute raw immutable-blob capture fixtures.'
+        Write-Warning "PENDING: $script:RawBinaryFixturePendingReason"
+    } else {
+        $temp = Join-Path ([IO.Path]::GetTempPath()) ('chidori-lock-composition-' + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $temp | Out-Null
+        try {
         $script:RawCaptureGitExecutable = (Get-Command git -CommandType Application | Select-Object -First 1).Source
         Assert (-not [string]::IsNullOrWhiteSpace($script:RawCaptureGitExecutable)) 'fixture must resolve a Git Application executable'
         $baseLock = Join-Path $temp 'base.lock'
@@ -719,8 +729,9 @@ function Invoke-LockCompositionFixtures {
         [IO.File]::WriteAllText($overlapPackage, "package`n")
         [IO.File]::WriteAllText($overlapCtutils, "ctutils`n")
         Assert-Throws { Write-RawGitOutput $mergedLock @('merge-file', '-p', '--', $overlapPackage, $overlapBase, $overlapCtutils) } 'overlapping materialized snapshots must fail closed'
-    } finally {
-        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+        } finally {
+            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+        }
     }
 
     $resolverHappy = @'
@@ -829,12 +840,28 @@ Assert-Equal $constructedLockBlob (Invoke-ResolvedGit @('hash-object', $candidat
 Invoke-Fixtures
 Invoke-StaticWorkflowFixtures
 Invoke-VerifierPortabilityFixtures
+$pendingFixtureResult = Get-RawImmutableFixtureResult $false
+Assert ($pendingFixtureResult.State -eq 'PENDING' -and $pendingFixtureResult.ExitCode -eq 2) 'unavailable raw immutable-blob fixture capability must be PENDING with exit 2'
+$readyFixtureResult = Get-RawImmutableFixtureResult $true
+Assert ($readyFixtureResult.State -eq 'READY' -and $readyFixtureResult.ExitCode -eq 0) 'available raw immutable-blob fixture capability must remain executable'
 Invoke-LockCompositionFixtures
+if ($FixturesOnly) {
+    if ($script:RawBinaryFixturePending) {
+        Write-Host "PENDING: raw immutable-blob fixture: $script:RawBinaryFixturePendingReason"
+        exit 2
+    }
+    Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
+    exit 0
+}
 if (-not $FixturesOnly) {
     Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
     $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
     Assert-VerifierScriptPortability $verifierScript
     Assert-VerifierScriptRecursionSafety $verifierScript
     Assert-LockCompositionContract $verifierScript
+}
+if ($script:RawBinaryFixturePending) {
+    Write-Host "PENDING: raw immutable-blob fixture: $script:RawBinaryFixturePendingReason"
+    exit 2
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
