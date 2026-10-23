@@ -175,6 +175,15 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
         }
         $parentBound = $phase.Prefix + '\$parents\.Count.*?\$parents\[0\].*?' + $phase.Suffix
         Assert ($Text -match $parentBound) "$($phase.Name) phase must retain sole-parent/base evidence"
+        foreach ($comparison in @(
+            '\$candidateHead\s*-ne\s*\$candidateSha',
+            '\$candidateStatus\s*-ne\s*[''"]{2}',
+            '\$parents\.Count\s*-ne\s*1',
+            '\$parents\[0\]\s*-ne\s*[''"]9e1c295b1f3f90ef342021ec81b52ece7363cd6c',
+            '\$candidatePathText\s*-ne\s*\$approvedCandidatePaths'
+        )) {
+            Assert ($Text -match ($phase.Prefix + $comparison + '.*?' + $phase.Suffix)) "$($phase.Name) phase must compare captured evidence [$comparison] inside its own boundary"
+        }
     }
 }
 
@@ -579,6 +588,12 @@ try {
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$candidatePathText -ne ''hard-coded-paths''')) } 'hard-coded path comparison must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$true')) } 'unused normalized path scalar must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText = ($candidatePaths -join "`n")', '$candidatePathText = (($candidatePaths | Sort-Object) -join "`n")')) } 'sorted path normalization must fail'
+    foreach ($phase in @('post-scrub', 'post-Cargo')) {
+        foreach ($comparison in @("if (`$candidateHead -ne `$candidateSha) { throw '$phase candidate HEAD mismatch' }", "if (`$candidateStatus -ne '') { throw '$phase candidate dirty' }", "if (`$parents.Count -ne 1) { throw '$phase candidate parent count failed' }", "if (`$parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw '$phase candidate base failed' }", "if (`$candidatePathText -ne `$approvedCandidatePaths) { throw '$phase candidate path scope failed' }")) {
+            Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, 'Write-Host removed')) } "$phase phase must reject a removed evidence comparison"
+            Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, "if (`$true) { throw 'hard-coded' }")) } "$phase phase must reject a hard-coded evidence comparison"
+        }
+    }
     $bleed = $candidateCargoWorkflow.Replace('$candidatePaths = git diff', '# removed path capture`n$null = git diff') + "`n  - uses: actions/checkout@v7`n    run: |`n      `$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c `$candidateSha"
     Assert-Throws { Assert-CandidateScrubAndCargoContract $bleed } 'unnamed sibling step must not bleed evidence into locked Cargo block'
 
