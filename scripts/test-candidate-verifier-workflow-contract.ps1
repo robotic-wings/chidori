@@ -131,6 +131,8 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME'
 
     $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
+    $allCandidateScopes = [regex]::Matches($Text, '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{.*?\}\s*finally\s*\{\s*Pop-Location\s*\}')
+    Assert ($allCandidateScopes.Count -eq 1) 'locked Cargo block must contain exactly one balanced canonical candidate Push-Location/try/finally/Pop-Location scope, including no-Cargo scopes'
     $scopeMatches = [regex]::Matches($Text, $scope)
     Assert ($scopeMatches.Count -eq 1) 'locked Cargo block must contain exactly one canonical candidate Push-Location/try/finally/Pop-Location scope'
     $match = $scopeMatches[0]
@@ -577,6 +579,8 @@ $env:RUSTUP_HOME = $rustupHome
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { Write-Host 'second candidate scope' } finally { Pop-Location }`n")
+    Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
         '$candidateHead = git rev-parse HEAD',
         '$candidateStatus = git status --porcelain',
