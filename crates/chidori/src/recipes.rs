@@ -101,4 +101,63 @@ mod tests {
             assert_eq!(recipe.inputs["channel"], "#general");
         }
     }
+
+    #[test]
+    fn load_dir_keeps_yaml_yml_and_json_recipe_fields_and_cron() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("digest.yaml"),
+            "name: digest-yaml\nagent: agents/digest.ts\nschedule: '0 9 * * 1-5'\ninputs: { channel: yaml }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("report.yml"),
+            "name: report-yml\nagent: agents/report.ts\nschedule: '30 8 * * 1-5'\ninputs: { channel: yml }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("archive.json"),
+            r#"{"name":"archive-json","agent":"agents/archive.ts","schedule":"0 0 * * 0","inputs":{"channel":"json"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "not a recipe").unwrap();
+
+        let mut recipes = Recipe::load_dir(dir.path()).unwrap();
+        recipes.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(recipes.len(), 3);
+        let decoded = recipes
+            .iter()
+            .map(|recipe| {
+                (
+                    recipe.name.as_str(),
+                    recipe.agent.as_path(),
+                    recipe.schedule.as_deref(),
+                    recipe.inputs["channel"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decoded,
+            vec![
+                (
+                    "archive-json",
+                    Path::new("agents/archive.ts"),
+                    Some("0 0 * * 0"),
+                    Some("json"),
+                ),
+                (
+                    "digest-yaml",
+                    Path::new("agents/digest.ts"),
+                    Some("0 9 * * 1-5"),
+                    Some("yaml"),
+                ),
+                (
+                    "report-yml",
+                    Path::new("agents/report.ts"),
+                    Some("30 8 * * 1-5"),
+                    Some("yml"),
+                ),
+            ]
+        );
+    }
 }

@@ -71,7 +71,11 @@ fn malformed_manifest_precedes_bind_failure_and_keep_alive_spawn() {
     );
 
     let project = tempfile::tempdir().unwrap();
-    fs::write(project.path().join("worker.ts"), "export {};\n").unwrap();
+    fs::write(
+        project.path().join("worker.ts"),
+        "import { chidori, run } from 'chidori:agent';\nrun(async () => { await chidori.log('manifest-parse-sentinel', {}); });\n",
+    )
+    .unwrap();
     let manifest = project.path().join("chidori.app.yml");
     fs::write(
         &manifest,
@@ -103,6 +107,7 @@ fn malformed_manifest_precedes_bind_failure_and_keep_alive_spawn() {
     let descriptor = project
         .path()
         .join(".chidori/runs/agents/keepalive-probe.json");
+    let run_root = project.path().join(".chidori/runs");
     let normalized = stderr.to_ascii_lowercase();
     let mut violations = Vec::new();
     if !stderr.contains(manifest.to_str().unwrap())
@@ -116,6 +121,9 @@ fn malformed_manifest_precedes_bind_failure_and_keep_alive_spawn() {
     }
     if descriptor.exists() {
         violations.push("keep_alive agent was persisted before malformed manifest rejection");
+    }
+    if run_root.exists() {
+        violations.push("malformed manifest created durable run state before rejection");
     }
     assert!(
         !output.status.success() && violations.is_empty(),
