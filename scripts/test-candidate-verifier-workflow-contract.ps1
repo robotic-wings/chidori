@@ -122,12 +122,30 @@ function Assert-VerifierScriptPortability([string]$Text) {
         $withoutWholeLineComment -replace '\s+#.*$', ''
     }
     $executableText = $commands -join "`n"
-    $bareGit = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?git(?!\.exe\b)(?:[''\"])?(?=$|[\s;|&])'
     $gitExe = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?git\.exe(?:[''\"])?(?=$|[\s;|&])'
     $cmd = '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?cmd(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])'
-    Assert ($executableText -match $bareGit) 'trusted verifier must invoke PATH-resolved bare git'
     Assert ($executableText -notmatch $gitExe) 'trusted verifier must not invoke git.exe, including quoted, mixed-case, or ampersand forms'
     Assert ($executableText -notmatch $cmd) 'trusted verifier must not invoke cmd or cmd.exe, including quoted, mixed-case, or ampersand forms'
+}
+
+function Assert-VerifierScriptRecursionSafety([string]$Text) {
+    $resolutionPattern = '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Get-Command\s+git\s+-CommandType\s+Application\b'
+    $resolutions = [regex]::Matches($Text, $resolutionPattern)
+    Assert ($resolutions.Count -eq 1) 'trusted verifier must resolve exactly one PATH Application identity for git'
+    Assert ($Text -notmatch '(?im)^\s*function\s+git\b') 'trusted verifier must not declare a Git helper or function that can recurse'
+
+    $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value) + '(?:\.Source)?'
+    Assert ($Text -match ('(?im)&\s*' + $resolved + '\b')) 'trusted verifier wrapper invocations must use the resolved git Application variable'
+    Assert ($Text -match ('(?im)Start-Process\s+-FilePath\s+' + $resolved + '\b')) 'trusted verifier byte-safe materialization must use Start-Process -FilePath with the resolved git variable'
+    Assert ($Text -match ('(?im)&\s*' + $resolved + '\s+apply\b')) 'trusted verifier direct apply operations must use the resolved git variable'
+
+    $commands = foreach ($line in ($Text -split "\r?\n")) {
+        $withoutWholeLineComment = $line -replace '^\s*#.*$', ''
+        $withoutWholeLineComment -replace '\s+#.*$', ''
+    }
+    $executableText = $commands -join "`n"
+    Assert ($executableText -notmatch '(?im)(?:^|[;|&]\s*)&?\s*(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier must not bypass the resolved git Application variable with a direct git invocation'
+    Assert ($executableText -notmatch '(?im)Start-Process\s+-FilePath\s+(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier Start-Process must not bypass the resolved git Application variable'
 }
 
 function Assert-WorkflowContract([string]$Workflow) {
@@ -332,13 +350,15 @@ Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; Set-Location trust
 
 function Invoke-VerifierPortabilityFixtures {
     $portable = @'
-function Git([string[]]$Arguments) {
-    $out = & git @Arguments
+$gitApplication = Get-Command git -CommandType Application
+function Invoke-ResolvedGit([string[]]$Arguments) {
+    $out = & $gitApplication.Source @Arguments
 }
-& git apply --no-index patch
-git status --porcelain
+$process = Start-Process -FilePath $gitApplication.Source -ArgumentList @('show', 'HEAD:Cargo.lock') -RedirectStandardOutput lock -NoNewWindow -PassThru -Wait
+& $gitApplication.Source apply --no-index patch
 '@
     Assert-VerifierScriptPortability $portable
+    Assert-VerifierScriptRecursionSafety $portable
 
     foreach ($nonPortable in @(
         'git.exe status',
@@ -363,7 +383,7 @@ git status --porcelain
 # git status --porcelain
   # & git apply --no-index patch
 '@
-    Assert-Throws { Assert-VerifierScriptPortability $commentOnlyBareGit } 'comment-only bare git must not satisfy executable bare-git requirement'
+    Assert-Throws { Assert-VerifierScriptRecursionSafety $commentOnlyBareGit } 'comment-only bare git must not satisfy resolved Application requirement'
 
     $portableWithWindowsComments = $portable + @'
 
@@ -372,6 +392,16 @@ git status --porcelain
   # & 'cmd.exe' /c git status
 '@
     Assert-VerifierScriptPortability $portableWithWindowsComments
+
+    foreach ($recursionUnsafe in @(
+        "function Git { & `$gitApplication.Source status }",
+        "function gIt { & `$gitApplication.Source status }",
+        '& git status',
+        'Start-Process -FilePath git -ArgumentList @(''status'')',
+        '& git apply --no-index patch'
+    )) {
+        Assert-Throws { Assert-VerifierScriptRecursionSafety ($portable + "`n" + $recursionUnsafe) } "recursion-unsafe verifier form must be rejected: $recursionUnsafe"
+    }
 }
 
 Invoke-Fixtures
@@ -379,6 +409,8 @@ Invoke-StaticWorkflowFixtures
 Invoke-VerifierPortabilityFixtures
 if (-not $FixturesOnly) {
     Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
-    Assert-VerifierScriptPortability ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1')))
+    $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
+    Assert-VerifierScriptPortability $verifierScript
+    Assert-VerifierScriptRecursionSafety $verifierScript
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
