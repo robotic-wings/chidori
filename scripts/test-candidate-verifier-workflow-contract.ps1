@@ -199,6 +199,44 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     }
 }
 
+function Assert-ExternalTargetContract([string]$Text) {
+    $lockedCargoBlock = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Run locked Cargo checks in the candidate worktree[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
+    Assert ($lockedCargoBlock.Count -eq 1) 'external candidate target identity must be bound inside exactly one locked Cargo YAML run block'
+    $Text = $lockedCargoBlock[0].Groups['run'].Value
+    $scrub = [regex]::Match($Text, '(?im)^\s*Remove-Item\s+Env:\*')
+    Assert $scrub.Success 'external candidate target must be captured before the relevant environment scrub'
+    Assert ($Text -match '(?im)^\s*\$candidateTarget\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+[''"]candidate-target-\$candidateSha[''"]\s*$') 'workflow must capture exactly one external candidate target before scrub'
+    Assert ([regex]::Matches($Text, '(?im)^\s*\$candidateTarget\s*=').Count -eq 1) 'workflow must capture candidate target exactly once'
+    Assert ([regex]::Match($Text, '(?im)^\s*\$candidateTarget\s*=').Index -lt $scrub.Index) 'candidate target capture must precede the relevant environment scrub in the same run block'
+    Assert ($Text -notmatch '(?im)^\s*\$candidateTarget\s*=.*\$candidateWorktree') 'candidate target must be strictly external to canonical worktree'
+    Assert ($Text -notmatch '(?i)candidate-target-\$candidateSha(?:[/\\]|-|\.\.)') 'candidate target must reject child, suffix, or traversal forms'
+    Assert ($Text -match '(?is)(?:GetFullPath|Resolve-Path).*\$candidateTarget') 'candidate target must be canonicalized before use'
+    Assert ($Text -match '(?is)DirectorySeparatorChar.*?AltDirectorySeparatorChar') 'candidate target boundary must be separator-aware'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical\s*-eq\s*\$candidateWorktreeCanonical') 'candidate target boundary must reject equality with candidate worktree'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical.*?(?:StartsWith|like).*?(?:\$separator|\$alternateSeparator|DirectorySeparatorChar|AltDirectorySeparatorChar)') 'candidate target boundary must reject only separator-bound descendants while allowing siblings'
+    Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
+    Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget') 'scrubbed verifier must receive exactly captured external target through the trusted pwsh invocation'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+metadata.*?\$candidateTarget') 'scrubbed metadata must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+tree.*?\$candidateTarget') 'scrubbed tree must receive exactly captured external target'
+    Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive the exact captured target value through the required pwsh invocation'
+    Assert ($Text -match '(?im)^\s*cargo\s+metadata\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'metadata must receive the exact captured target value'
+    Assert ($Text -match '(?im)^\s*cargo\s+tree\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'tree must receive the exact captured target value'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
+    Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
+    foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
+        $variable = '$' + $phase + 'Porcelain'
+        Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\).*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, immediately exit-check, compare, and report its own output"
+    }
+    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
+    Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
+    Assert ($Text -match '(?is)(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
+    Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
+    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
+        Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
+    }
+}
+
 function Assert-TrustedVerifierIdentity([string]$Text) {
     $trustedCheckout = '(?ms)^\s*-\s*uses:\s*actions/checkout[^\r\n]*\r?\n(?<block>.*?)(?=^\s*-\s|\z)'
     $checkout = [regex]::Match($Text, $trustedCheckout)
@@ -443,6 +481,7 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}cargo\s+(?:metadata|tree)\s+--locked') 'scrubbed candidate environment must bind Cargo invocation'
     Assert-CandidateScrubAndCargoContract $text
+    Assert-ExternalTargetContract $text
 }
 
 function New-FixtureRepo {
@@ -579,6 +618,78 @@ $env:RUSTUP_HOME = $rustupHome
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    $externalTargetHappy = @'
+$candidateSha = $env:CANDIDATE_SHA
+$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
+$candidateTargetCanonical = [IO.Path]::GetFullPath($candidateTarget)
+$candidateWorktreeCanonical = [IO.Path]::GetFullPath($candidateWorktree)
+$separator = [IO.Path]::DirectorySeparatorChar
+$alternateSeparator = [IO.Path]::AltDirectorySeparatorChar
+if ($candidateTargetCanonical -eq $candidateWorktreeCanonical) { throw 'target equals worktree' }
+if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $separator) -or $candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $alternateSeparator)) { throw 'target inside worktree' }
+$targetDirectory = [IO.Directory]::CreateDirectory($candidateTargetCanonical)
+$verifierPrePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcelain" }
+if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
+Remove-Item Env:*
+$env:CARGO_TARGET_DIR = $candidateTarget
+& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
+$verifierPostPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
+$outerPrePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-pre status failed: $outerPrePorcelain" }
+if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
+$outerPostScrubPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
+if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
+cargo metadata --locked --target-dir $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'metadata failed' }
+cargo tree --locked --target-dir $candidateTarget
+if ($LASTEXITCODE -ne 0) { throw 'tree failed' }
+$outerPostCargoPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
+if ($outerPostCargoPorcelain -ne '') { throw "outer-post-Cargo dirty: $outerPostCargoPorcelain" }
+Remove-Item -LiteralPath $candidateTarget -Recurse -Force
+if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
+$finalPostTargetCleanupPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "final-post-target-cleanup status failed: $finalPostTargetCleanupPorcelain" }
+if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup dirty: $finalPostTargetCleanupPorcelain" }
+'@
+    $externalTargetWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($externalTargetHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
+    Assert-ExternalTargetContract $externalTargetWorkflow
+    foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
+        $variable = '$' + $phase + 'Porcelain'
+        $label = switch ($phase) { 'verifierPre' { 'verifier-pre' } 'verifierPost' { 'verifier-post' } 'outerPre' { 'outer-pre' } 'outerPostScrub' { 'outer-post-scrub' } 'outerPostCargo' { 'outer-post-Cargo' } default { 'final-post-target-cleanup' } }
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace("$variable = git status --porcelain --untracked-files=all", "$variable = git status --porcelain")) } "[$phase] missing full status mode must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace("$variable = git status --porcelain --untracked-files=all", 'git status --porcelain --untracked-files=all | Out-Null')) } "[$phase] discarded status output must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace("$variable = git status --porcelain --untracked-files=all", "$variable = ''")) } "[$phase] omitted status capture must fail"
+        $genericStatus = $externalTargetWorkflow.Replace(('throw "' + $label + ' status failed: ' + $variable + '"'), "throw 'generic status failure'").Replace(('throw "' + $label + ' dirty: ' + $variable + '"'), "throw 'generic dirty failure'")
+        Assert-Throws { Assert-ExternalTargetContract $genericStatus } "[$phase] generic status evidence must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace("if ($variable -ne '')", "if ('hard-coded' -ne '')")) } "[$phase] hard-coded status comparison must fail"
+        $maskedStatus = $externalTargetWorkflow.Replace(('if ($LASTEXITCODE -ne 0) { throw "' + $label + ' status failed: ' + $variable + '" }'), "Write-Output 'later success masks status failure'")
+        Assert-Throws { Assert-ExternalTargetContract $maskedStatus } "[$phase] delayed or masked status exit evidence must fail"
+        $phaseBlock = [regex]::Match($externalTargetWorkflow, '(?ms)^[ \t]*\$' + $phase + 'Porcelain\s*=.*?^[ \t]*if \(\$' + $phase + 'Porcelain\s*-ne\s*''''\) \{.*?\}').Value
+        Assert ($phaseBlock -ne '') "fixture phase block [$phase] must be found before relocation"
+        $withoutPhase = $externalTargetWorkflow.Replace($phaseBlock, '')
+        $relocatedPhase = if ($phase -eq 'finalPostTargetCleanup') { $phaseBlock + $withoutPhase } else { $withoutPhase + $phaseBlock }
+        Assert-Throws { Assert-ExternalTargetContract $relocatedPhase } "[$phase] status phase outside its required placement must fail"
+    }
+    $postCleanBlock = [regex]::Match($externalTargetWorkflow, '(?ms)^[ \t]*\$finalPostTargetCleanupPorcelain\s*=.*?^[ \t]*if \(\$finalPostTargetCleanupPorcelain\s*-ne\s*''''\) \{.*?\}').Value
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace($postCleanBlock, '')) } 'missing final post-clean candidate status must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"', '$candidateTarget = $candidateWorktree')) } 'target inside candidate worktree must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('Remove-Item -LiteralPath $candidateTarget', 'git clean -fd')) } 'broad cleanup must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('Remove-Item -LiteralPath $candidateTarget -Recurse -Force', 'Remove-Item -LiteralPath $candidateTarget')) } 'nonrecursive cleanup of nonempty target must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('Remove-Item -LiteralPath $candidateTarget -Recurse -Force', 'Remove-Item -LiteralPath $candidateWorktree -Recurse -Force')) } 'candidate-root cleanup must fail'
+    $targetCapture = '$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"'
+    $disconnectedTarget = $targetCapture + "`n" + $externalTargetWorkflow.Replace($targetCapture, '# disconnected earlier target capture')
+    Assert-Throws { Assert-ExternalTargetContract $disconnectedTarget } 'disconnected earlier-step target capture must not satisfy the locked Cargo block'
+    $postScrubTarget = $externalTargetWorkflow.Replace($targetCapture, '').Replace('Remove-Item Env:*', "Remove-Item Env:*`n    $targetCapture")
+    Assert-Throws { Assert-ExternalTargetContract $postScrubTarget } 'post-scrub target derivation must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('cargo metadata --locked --target-dir $candidateTarget', 'cargo metadata --locked --target-dir $outerTarget')) } 'distinct outer metadata target must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('cargo tree --locked --target-dir $candidateTarget', 'cargo tree --locked --target-dir $outerTarget')) } 'distinct outer tree target must fail'
     $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { `$null = `$null } finally { Pop-Location }`n")
     Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
