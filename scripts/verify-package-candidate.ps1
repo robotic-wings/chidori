@@ -50,7 +50,6 @@ function FileAt([string]$Revision, [string]$Path) {
 $packageCommit = '59ebb109'
 $ctutilsCommit = '00148aa'
 $base = '9e1c295'
-$combinedLockBlob = 'c4b4316368317a342058f77151ab8043afea676b'
 $paths = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
 
 $candidateSha = Invoke-ResolvedGit @('rev-parse', "$Candidate^{commit}")
