@@ -60,7 +60,12 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match 'persist-credentials:\s*false') 'checkout must disable persisted credentials'
     Assert ($text -notmatch '(?i)(secrets\.|github\.token|GH_TOKEN)') 'workflow must not expose secrets or token variables'
     Assert ($text -match 'CANDIDATE_SHA') 'workflow must assign candidate SHA to CANDIDATE_SHA'
-    Assert ($text -notmatch '\$\{\{\s*inputs\.candidate_sha\s*\}\}') 'workflow must not interpolate input SHA into shell or refs'
+    $trustedInputAssignment = '(?m)^\s*CANDIDATE_SHA:\s*\$\{\{\s*inputs\.candidate_sha\s*\}\}\s*$'
+    $trustedAssignments = [regex]::Matches($text, $trustedInputAssignment)
+    Assert ($trustedAssignments.Count -eq 1) 'workflow must contain exactly one trusted CANDIDATE_SHA input assignment'
+    $withoutTrustedAssignment = [regex]::Replace($text, $trustedInputAssignment, '')
+    Assert ($withoutTrustedAssignment -notmatch '\$\{\{\s*inputs\.candidate_sha\s*\}\}') 'workflow must not interpolate input SHA into shell or refs'
+    Assert ($text -match '\$env:CANDIDATE_SHA') 'workflow shell and ref use must flow through CANDIDATE_SHA environment only'
     Assert ($text -match '\^\[0-9a-f\]\{40\}\$') 'workflow must validate exact lowercase 40-hex SHA before use'
     Assert ($text -match 'git worktree add --detach') 'workflow must use detached candidate checkout'
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
