@@ -204,11 +204,18 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ([regex]::Matches($Text, '(?im)^\s*\$candidateTarget\s*=').Count -eq 1) 'workflow must capture candidate target exactly once'
     Assert ($Text -notmatch '(?im)^\s*\$candidateTarget\s*=.*\$candidateWorktree') 'candidate target must be strictly external to canonical worktree'
     Assert ($Text -notmatch '(?i)candidate-target-\$candidateSha(?:[/\\]|-|\.\.)') 'candidate target must reject child, suffix, or traversal forms'
+    Assert ($Text -match '(?is)Resolve-Path\s+-LiteralPath\s+\$candidateTarget') 'candidate target must be canonicalized before use'
+    Assert ($Text -match '(?is)\$candidateTargetCanonical.*?\$candidateWorktreeCanonical.*?(?:-like|StartsWith|IsPathRooted)') 'candidate target must have a strict canonical path-boundary check against candidate worktree'
     Assert ($Text -match '(?im)^\s*\$candidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all') 'candidate clean boundary must capture full porcelain including untracked files'
     Assert ($Text -match '(?is)\$candidatePorcelain.*?\$LASTEXITCODE.*?\$candidatePorcelain\s*-ne\s*[''"]{2}.*?\$candidatePorcelain') 'candidate status failure must report exact captured porcelain output'
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
-    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?(?:&\s+pwsh.*?\$candidateTarget|cargo\s+(?:metadata|tree).*?\$candidateTarget)') 'scrubbed verifier and Cargo must receive captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$candidateTarget') 'scrubbed verifier must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+metadata.*?\$candidateTarget') 'scrubbed metadata must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+tree.*?\$candidateTarget') 'scrubbed tree must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
+    Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
+    Assert ([regex]::Matches($Text, '(?im)^\s*\$candidatePorcelain\s*=').Count -ge 5) 'full candidate porcelain evidence is required at every clean boundary'
 }
 
 function Assert-TrustedVerifierIdentity([string]$Text) {
@@ -596,13 +603,29 @@ $env:RUSTUP_HOME = $rustupHome
 $candidateSha = $env:CANDIDATE_SHA
 $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
 $candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
+$candidateTargetCanonical = Resolve-Path -LiteralPath $candidateTarget
+$candidateWorktreeCanonical = Resolve-Path -LiteralPath $candidateWorktree
+if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical)) { throw 'target inside worktree' }
 $candidatePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
 if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
 Remove-Item Env:*
+$env:CARGO_TARGET_DIR = $candidateTarget
 & pwsh -File $trustedVerifier -Target $candidateTarget
 cargo metadata --locked --target-dir $candidateTarget
 cargo tree --locked --target-dir $candidateTarget
+$candidatePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
+if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
+$candidatePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
+if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
+$candidatePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
+if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
+$candidatePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
+if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
 Remove-Item -LiteralPath $candidateTarget
 if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
 '@
