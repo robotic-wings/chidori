@@ -129,9 +129,18 @@ function Assert-VerifierScriptPortability([string]$Text) {
 }
 
 function Assert-VerifierScriptRecursionSafety([string]$Text) {
-    $resolutionPattern = '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\(\s*Get-Command\s+git\s+-CommandType\s+Application\s*\)\.(?:Source|Path)\s*$'
+    $lookupPattern = 'Get-Command\s+git\s+-All\s+-CommandType\s+Application\b'
+    Assert ([regex]::Matches($Text, $lookupPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase).Count -eq 1) 'trusted verifier must resolve ordered PATH Application candidates for git exactly once'
+    Assert ($Text -match '(?im)^\s*function\s+Resolve-GitExecutablePath\b') 'trusted verifier must define a deterministic git executable-path resolver'
+    Assert ($Text -match '(?is)foreach\s*\([^\)]*Get-Command\s+git\s+-All\s+-CommandType\s+Application') 'trusted verifier resolver must inspect Application candidates in command/PATH order'
+    Assert ($Text -match '(?is)(?:\.Source|\.Path).{0,500}(?:GetFullPath|Resolve-Path)') 'trusted verifier resolver must project and canonicalize nonempty Source/Path candidates'
+    Assert ($Text -match '(?is)(HashSet|Distinct)') 'trusted verifier resolver must de-duplicate equivalent candidates while preserving order'
+    Assert ($Text -match '(?is)Resolve-GitExecutablePath.{0,3000}throw') 'trusted verifier resolver must fail closed when no valid executable candidate exists'
+    Assert ($Text -notmatch '(?im)^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(\s*Get-Command\s+git[^\r\n]*\)\.(?:Source|Path)') 'trusted verifier must not coerce a Get-Command collection Source/Path directly to a scalar'
+
+    $resolutionPattern = '(?im)^\s*(?<variable>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*Resolve-GitExecutablePath\s*$'
     $resolutions = [regex]::Matches($Text, $resolutionPattern)
-    Assert ($resolutions.Count -eq 1) 'trusted verifier must resolve exactly one PATH Application executable path for git'
+    Assert ($resolutions.Count -eq 1) 'trusted verifier must select exactly one scalar executable path from the deterministic resolver'
     Assert ($Text -notmatch '(?im)^\s*function\s+git\b') 'trusted verifier must not declare a Git helper or function that can recurse'
 
     $resolved = [regex]::Escape($resolutions[0].Groups['variable'].Value)
@@ -358,9 +367,31 @@ Set-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; Set-Location trust
     }
 }
 
+function Select-DeterministicGitCandidate([object[]]$Candidates) {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in $Candidates) {
+        $raw = if (-not [string]::IsNullOrWhiteSpace($candidate.Source)) { $candidate.Source } else { $candidate.Path }
+        if ([string]::IsNullOrWhiteSpace($raw) -or -not $candidate.Valid) { continue }
+        $canonical = $candidate.Canonical
+        if ([string]::IsNullOrWhiteSpace($canonical)) { continue }
+        if ($seen.Add($canonical)) { return $canonical }
+    }
+    throw 'no valid git Application executable path'
+}
+
 function Invoke-VerifierPortabilityFixtures {
     $portable = @'
-$gitExecutablePath = (Get-Command git -CommandType Application).Source
+function Resolve-GitExecutablePath {
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in (Get-Command git -All -CommandType Application)) {
+        $raw = if (-not [string]::IsNullOrWhiteSpace($candidate.Source)) { $candidate.Source } else { $candidate.Path }
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        $canonical = (Resolve-Path -LiteralPath ([IO.Path]::GetFullPath($raw))).Path
+        if ($seen.Add($canonical)) { return $canonical }
+    }
+    throw 'no valid git Application executable path'
+}
+$gitExecutablePath = Resolve-GitExecutablePath
 function Invoke-ResolvedGit([string[]]$Arguments) {
     $out = & $gitExecutablePath @Arguments
 }
@@ -369,6 +400,22 @@ $process = Start-Process -FilePath $gitExecutablePath -ArgumentList @('show', 'H
 '@
     Assert-VerifierScriptPortability $portable
     Assert-VerifierScriptRecursionSafety $portable
+
+    $same = Select-DeterministicGitCandidate @(
+        [pscustomobject]@{ Source = 'git-a'; Path = ''; Canonical = 'C:\Git\git.exe'; Valid = $true },
+        [pscustomobject]@{ Source = ''; Path = 'git-link'; Canonical = 'C:\Git\git.exe'; Valid = $true }
+    )
+    Assert ($same -eq 'C:\Git\git.exe') 'equivalent or symlink Application candidates must de-duplicate to one canonical path'
+    $first = Select-DeterministicGitCandidate @(
+        [pscustomobject]@{ Source = 'first'; Path = ''; Canonical = 'C:\Git\first.exe'; Valid = $true },
+        [pscustomobject]@{ Source = 'second'; Path = ''; Canonical = 'D:\Git\second.exe'; Valid = $true }
+    )
+    Assert ($first -eq 'C:\Git\first.exe') 'distinct Application candidates must select the first valid command/PATH entry deterministically'
+    Assert-Throws { Select-DeterministicGitCandidate @([pscustomobject]@{ Source = ''; Path = ''; Canonical = ''; Valid = $false }) } 'invalid or missing Application candidates must fail closed'
+    Assert-Throws { Select-DeterministicGitCandidate @() } 'no Application candidates must fail closed'
+
+    $collectionCoercion = $portable.Replace('$gitExecutablePath = Resolve-GitExecutablePath', '$gitExecutablePath = (Get-Command git -All -CommandType Application).Source')
+    Assert-Throws { Assert-VerifierScriptRecursionSafety $collectionCoercion } 'collection Source/Path coercion must be rejected'
 
     foreach ($nonPortable in @(
         'git.exe status',
