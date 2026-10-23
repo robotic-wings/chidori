@@ -29,6 +29,7 @@ function FileAt([string]$Revision, [string]$Path) {
 $packageCommit = '59ebb109'
 $ctutilsCommit = '00148aa'
 $base = '9e1c295'
+$combinedLockBlob = 'c4b4316368317a342058f77151ab8043afea676b'
 $paths = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
 
 $candidateSha = Git @('rev-parse', "$Candidate^{commit}")
@@ -60,6 +61,12 @@ Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') '3977de82f9795
 Assert-Equal (Blob "$packageCommit^" 'crates/chidori/Cargo.toml') 'cee7ace2bf9f813086176aee084ec0b0867dfa67' 'chidori base blob'
 Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') 'fc56a8752c8cc0ba8fe3a3ba64cb2d841ab881d5' 'chidori target blob'
 
+Assert-Equal (Git @('rev-parse', "$ctutilsCommit^")) (Git @('rev-parse', $base)) '00148aa parent'
+$ctutilsPaths = Git @('show', '--format=', '--name-only', $ctutilsCommit)
+Assert-Equal $ctutilsPaths 'Cargo.lock' '00148aa changed-path set'
+Assert-Equal (Blob "$ctutilsCommit^" 'Cargo.lock') '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9' 'ctutils lock base blob'
+Assert-Equal (Blob $ctutilsCommit 'Cargo.lock') 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66' 'ctutils lock target blob'
+
 # Materialize the exact combination from the two direct patches in a disposable
 # directory. Exact byte equality below proves all non-allowlisted lock stanzas,
 # dependency lists, features, sources, and checksums were preserved.
@@ -86,7 +93,9 @@ try {
         Pop-Location
     }
 
-    Assert-Equal (Git @('hash-object', (Join-Path $temp 'Cargo.lock'))) (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
+    $constructedLockBlob = Git @('hash-object', (Join-Path $temp 'Cargo.lock'))
+    Assert-Equal $constructedLockBlob $combinedLockBlob 'deterministic combined Cargo.lock blob'
+    Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock') 'candidate Cargo.lock blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori-js/Cargo.toml') (Blob $candidateSha 'crates/chidori-js/Cargo.toml') 'candidate chidori-js manifest blob'
     Assert-Equal (Blob $packageCommit 'crates/chidori/Cargo.toml') (Blob $candidateSha 'crates/chidori/Cargo.toml') 'candidate chidori manifest blob'
 } finally {
