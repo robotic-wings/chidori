@@ -167,6 +167,30 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
     Assert ($executableText -notmatch '(?im)Start-Process\s+-FilePath\s+(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier Start-Process must not bypass the resolved git Application variable'
 }
 
+function Assert-LockCompositionContract([string]$Text) {
+    foreach ($required in @(
+        '59ebb109', '00148aa', '47fbe5113e4b7c18cf2cc96f3a0410f045a281a9',
+        '9e36a2e89363eeedc4215a68dbd51f33dfec3741', 'fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66',
+        'c4b4316368317a342058f77151ab8043afea676b'
+    )) { Assert ($Text -match [regex]::Escape($required)) "trusted verifier must bind lock composition provenance [$required]" }
+    Assert ($Text -match '(?is)\$packageCommit\s*=\s*[''\"]59ebb109[''\"]') 'trusted verifier must name the package direct commit'
+    Assert ($Text -match '(?is)\$ctutilsCommit\s*=\s*[''\"]00148aa[''\"]') 'trusted verifier must name the ctutils direct commit'
+    Assert ($Text -match '(?is)show.{0,300}--name-only.{0,500}\$packageCommit') 'trusted verifier must inspect package direct changed paths'
+    Assert ($Text -match '(?is)show.{0,300}--name-only.{0,500}\$ctutilsCommit') 'trusted verifier must inspect ctutils direct changed paths'
+    Assert ($Text -match '(?is)Assert-Equal\s+\$directPaths') 'trusted verifier must require the exact package changed-path set'
+    Assert ($Text -match '(?is)Assert-Equal\s+\$ctutilsPaths') 'trusted verifier must require the exact ctutils changed-path set'
+    Assert ($Text -match '(?is)\$packageCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind package parent lock base'
+    Assert ($Text -match '(?is)\$ctutilsCommit\^.{0,500}47fbe5113e4b7c18cf2cc96f3a0410f045a281a9') 'trusted verifier must bind ctutils parent lock base'
+    Assert ($Text -match '(?is)Write-GitOutput\s+\$packageLock.{0,500}show.{0,500}\$packageCommit.*Cargo\.lock') 'trusted verifier must materialize the package lock snapshot'
+    Assert ($Text -match '(?is)Write-GitOutput\s+\$baseLock.{0,500}show.{0,500}\$base.*Cargo\.lock') 'trusted verifier must materialize the shared base lock snapshot'
+    Assert ($Text -match '(?is)Write-GitOutput\s+\$ctutilsLock.{0,500}show.{0,500}\$ctutilsCommit.*Cargo\.lock') 'trusted verifier must materialize the ctutils lock snapshot'
+    $mergePattern = '(?is)Start-Process\s+-FilePath\s+\$gitExecutablePath.{0,1500}merge-file.{0,800}-p.{0,800}\$packageLock.{0,800}\$baseLock.{0,800}\$ctutilsLock.{0,1500}-RedirectStandardOutput\s+\$mergedLock'
+    Assert ($Text -match $mergePattern) 'trusted verifier must byte-safely emit package/base/ctutils ordered three-way merge bytes'
+    Assert ($Text -match '(?is)\$mergeProcess\.ExitCode\s+-ne\s+0.{0,500}throw') 'trusted verifier must fail closed on a nonzero three-way merge conflict'
+    Assert ($Text -match '(?is)hash-object.{0,1000}\$mergedLock.{0,1000}c4b4316368317a342058f77151ab8043afea676b.{0,1000}Blob\s+\$candidateSha.{0,500}Cargo\.lock') 'trusted verifier must hash emitted merge bytes to final lock blob before candidate comparison'
+    Assert ($Text -notmatch '(?is)(?:git\s+)?diff\s+--binary|apply\s+--no-index') 'trusted verifier must not reconstruct the lock with diff/apply patch application'
+}
+
 function Assert-WorkflowContract([string]$Workflow) {
     Assert (Test-Path -LiteralPath $Workflow) 'missing .github/workflows/candidate-verifier.yml'
     $text = [IO.File]::ReadAllText($Workflow)
@@ -475,13 +499,91 @@ Start-Process -FilePath $gitApplication -ArgumentList @('status')
     Assert-Throws { Assert-VerifierScriptRecursionSafety $rawApplicationStartProcess } 'raw ApplicationInfo Start-Process must be rejected'
 }
 
+function Write-FixtureGitOutput([string]$Path, [string[]]$Arguments) {
+    $process = Start-Process -FilePath git.exe -ArgumentList $Arguments -RedirectStandardOutput $Path -NoNewWindow -PassThru -Wait
+    if ($process.ExitCode -ne 0) { throw "fixture git $($Arguments -join ' ') failed" }
+}
+
+function Get-FixtureGitHash([string]$Path) {
+    $hash = (& git.exe hash-object $Path | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'fixture hash-object failed' }
+    return $hash
+}
+
+function Invoke-FixtureThreeWayMerge([string]$Package, [string]$Base, [string]$Ctutils, [string]$Output) {
+    $process = Start-Process -FilePath git.exe -ArgumentList @('merge-file', '-p', '--', $Package, $Base, $Ctutils) -RedirectStandardOutput $Output -NoNewWindow -PassThru -Wait
+    if ($process.ExitCode -ne 0) { throw 'fixture three-way merge conflict' }
+}
+
+function Assert-FixtureMergedHash([string]$Package, [string]$Base, [string]$Ctutils, [string]$Output, [string]$ExpectedHash) {
+    Invoke-FixtureThreeWayMerge $Package $Base $Ctutils $Output
+    Assert ((Get-FixtureGitHash $Output) -eq $ExpectedHash) 'materialized three-way merge bytes did not match the required final lock blob'
+}
+
+function Invoke-LockCompositionFixtures {
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('chidori-lock-composition-' + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    try {
+        $baseLock = Join-Path $temp 'base.lock'
+        $packageLock = Join-Path $temp 'package.lock'
+        $ctutilsLock = Join-Path $temp 'ctutils.lock'
+        $mergedLock = Join-Path $temp 'merged.lock'
+        Write-FixtureGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
+        Write-FixtureGitOutput $packageLock @('show', '59ebb109:Cargo.lock')
+        Write-FixtureGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
+        Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b'
+        Assert-Throws { Assert-FixtureMergedHash $baseLock $packageLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong package/base/ctutils merge order must fail final-byte identity'
+        Assert-Throws { Assert-FixtureMergedHash $packageLock $ctutilsLock $baseLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'swapped base and ctutils snapshots must fail final-byte identity'
+        Write-FixtureGitOutput $baseLock @('show', '59ebb109:Cargo.lock')
+        Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong base snapshot must fail final-byte identity'
+        Write-FixtureGitOutput $baseLock @('show', '9e1c295:Cargo.lock')
+        Write-FixtureGitOutput $ctutilsLock @('show', '9e1c295:Cargo.lock')
+        Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock 'c4b4316368317a342058f77151ab8043afea676b' } 'wrong ctutils target snapshot must fail final-byte identity'
+        Write-FixtureGitOutput $ctutilsLock @('show', '00148aa:Cargo.lock')
+        Assert-Throws { Assert-FixtureMergedHash $packageLock $baseLock $ctutilsLock $mergedLock ('0' * 40) } 'wrong expected final lock hash must fail equality'
+
+        $overlapBase = Join-Path $temp 'overlap-base.lock'; $overlapPackage = Join-Path $temp 'overlap-package.lock'; $overlapCtutils = Join-Path $temp 'overlap-ctutils.lock'
+        [IO.File]::WriteAllText($overlapBase, "same`n")
+        [IO.File]::WriteAllText($overlapPackage, "package`n")
+        [IO.File]::WriteAllText($overlapCtutils, "ctutils`n")
+        Assert-Throws { Invoke-FixtureThreeWayMerge $overlapPackage $overlapBase $overlapCtutils $mergedLock } 'overlapping materialized snapshots must fail closed'
+    } finally {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    }
+
+    $compositionHappy = @'
+$packageCommit = '59ebb109'
+$ctutilsCommit = '00148aa'
+git show --format= --name-only $packageCommit Cargo.lock
+git show --format= --name-only $ctutilsCommit Cargo.lock
+Assert-Equal $directPaths $paths
+Assert-Equal $ctutilsPaths Cargo.lock
+Blob "$packageCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
+Blob "$ctutilsCommit^" Cargo.lock 47fbe5113e4b7c18cf2cc96f3a0410f045a281a9
+9e36a2e89363eeedc4215a68dbd51f33dfec3741
+fdb8d4c8fe35e68650b80f2c3e7ccb69b56b1f66
+Write-GitOutput $packageLock @('show', "$packageCommit`:Cargo.lock")
+Write-GitOutput $baseLock @('show', "$base`:Cargo.lock")
+Write-GitOutput $ctutilsLock @('show', "$ctutilsCommit`:Cargo.lock")
+$mergeProcess = Start-Process -FilePath $gitExecutablePath -ArgumentList @('merge-file', '-p', '--', $packageLock, $baseLock, $ctutilsLock) -RedirectStandardOutput $mergedLock -PassThru -Wait
+if ($mergeProcess.ExitCode -ne 0) { throw 'conflict' }
+$constructedLockBlob = Invoke-ResolvedGit @('hash-object', $mergedLock)
+Assert-Equal $constructedLockBlob 'c4b4316368317a342058f77151ab8043afea676b'
+Assert-Equal $constructedLockBlob (Blob $candidateSha 'Cargo.lock')
+'@
+    Assert-LockCompositionContract $compositionHappy
+    Assert-Throws { Assert-LockCompositionContract ($compositionHappy + "`n& `$gitExecutablePath apply --no-index `$packagePatch") } 'direct patch application must fail the composition contract'
+}
+
 Invoke-Fixtures
 Invoke-StaticWorkflowFixtures
 Invoke-VerifierPortabilityFixtures
+Invoke-LockCompositionFixtures
 if (-not $FixturesOnly) {
     Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
     $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
     Assert-VerifierScriptPortability $verifierScript
     Assert-VerifierScriptRecursionSafety $verifierScript
+    Assert-LockCompositionContract $verifierScript
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
