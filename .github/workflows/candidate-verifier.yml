@@ -62,7 +62,7 @@ jobs:
           $homePath = $env:HOME
           $cargoHome = $env:CARGO_HOME
           $rustupHome = $env:RUSTUP_HOME
-          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $trustedScripts 'verify-package-candidate.ps1') -Candidate $candidateSha; Pop-Location
+          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $trustedScripts 'verify-package-candidate.ps1') -Candidate $candidateSha; Pop-Location
 
       - name: Run locked Cargo checks in the candidate worktree
         shell: pwsh
