@@ -217,7 +217,7 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
     foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
         $variable = '$' + $phase + 'Porcelain'
-        Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all.*?\$LASTEXITCODE.*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, exit-check, compare, and report its own output"
+        Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\).*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, immediately exit-check, compare, and report its own output"
     }
     Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
     Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh|cargo\s+metadata)') 'verified external target directory must be created before use'
@@ -654,10 +654,21 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
         $variable = '$' + $phase + 'Porcelain'
         $label = switch ($phase) { 'verifierPre' { 'verifier-pre' } 'verifierPost' { 'verifier-post' } 'outerPre' { 'outer-pre' } 'outerPostScrub' { 'outer-post-scrub' } 'outerPostCargo' { 'outer-post-Cargo' } default { 'final-post-target-cleanup' } }
         Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("$variable = git status --porcelain --untracked-files=all", "$variable = git status --porcelain")) } "[$phase] missing full status mode must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("$variable = git status --porcelain --untracked-files=all", 'git status --porcelain --untracked-files=all | Out-Null')) } "[$phase] discarded status output must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("$variable = git status --porcelain --untracked-files=all", "$variable = ''")) } "[$phase] omitted status capture must fail"
         $genericStatus = $externalTargetHappy.Replace(('throw "' + $label + ' status failed: ' + $variable + '"'), "throw 'generic status failure'").Replace(('throw "' + $label + ' dirty: ' + $variable + '"'), "throw 'generic dirty failure'")
         Assert-Throws { Assert-ExternalTargetContract $genericStatus } "[$phase] generic status evidence must fail"
         Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("if ($variable -ne '')", "if ('hard-coded' -ne '')")) } "[$phase] hard-coded status comparison must fail"
+        $maskedStatus = $externalTargetHappy.Replace(('if ($LASTEXITCODE -ne 0) { throw "' + $label + ' status failed: ' + $variable + '" }'), "Write-Output 'later success masks status failure'")
+        Assert-Throws { Assert-ExternalTargetContract $maskedStatus } "[$phase] delayed or masked status exit evidence must fail"
+        $phaseBlock = [regex]::Match($externalTargetHappy, '(?ms)^\$' + $phase + 'Porcelain\s*=.*?^if \(\$' + $phase + 'Porcelain\s*-ne\s*''''\) \{.*?\}').Value
+        Assert ($phaseBlock -ne '') "fixture phase block [$phase] must be found before relocation"
+        $withoutPhase = $externalTargetHappy.Replace($phaseBlock, '')
+        $relocatedPhase = if ($phase -eq 'finalPostTargetCleanup') { $phaseBlock + $withoutPhase } else { $withoutPhase + $phaseBlock }
+        Assert-Throws { Assert-ExternalTargetContract $relocatedPhase } "[$phase] status phase outside its required placement must fail"
     }
+    $postCleanBlock = [regex]::Match($externalTargetHappy, '(?ms)^\$finalPostTargetCleanupPorcelain\s*=.*?^if \(\$finalPostTargetCleanupPorcelain\s*-ne\s*''''\) \{.*?\}').Value
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace($postCleanBlock, '')) } 'missing final post-clean candidate status must fail'
     Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"', '$candidateTarget = $candidateWorktree')) } 'target inside candidate worktree must fail'
     Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('Remove-Item -LiteralPath $candidateTarget', 'git clean -fd')) } 'broad cleanup must fail'
     Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('Remove-Item -LiteralPath $candidateTarget -Recurse -Force', 'Remove-Item -LiteralPath $candidateTarget')) } 'nonrecursive cleanup of nonempty target must fail'
