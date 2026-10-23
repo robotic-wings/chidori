@@ -166,26 +166,87 @@ function Assert-VerifierScriptRecursionSafety([string]$Text) {
     Assert ($executableText -notmatch '(?im)Start-Process\s+-FilePath\s+(?:[''\"])?git(?:\.exe)?(?:[''\"])?(?=$|[\s;|&])') 'trusted verifier Start-Process must not bypass the resolved git Application variable'
 }
 
+function Get-ContainingFunctionName([System.Management.Automation.Language.Ast]$Node) {
+    for ($parent = $Node.Parent; $null -ne $parent; $parent = $parent.Parent) {
+        if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $parent.Name }
+    }
+    return $null
+}
+
+function Get-BoundCommandArgument([System.Management.Automation.Language.CommandAst]$Command, [string]$ParameterName, [int]$FallbackIndex) {
+    $elements = $Command.CommandElements
+    for ($index = 0; $index -lt $elements.Count; $index++) {
+        if ($elements[$index] -is [System.Management.Automation.Language.CommandParameterAst] -and $elements[$index].ParameterName -ieq $ParameterName) {
+            if ($index + 1 -lt $elements.Count -and -not ($elements[$index + 1] -is [System.Management.Automation.Language.CommandParameterAst])) { return $elements[$index + 1] }
+            return $null
+        }
+    }
+    if ($elements.Count -gt $FallbackIndex) { return $elements[$FallbackIndex] }
+    return $null
+}
+
+function Get-ArgumentVectorElements([System.Management.Automation.Language.Ast]$Argument) {
+    if ($Argument -isnot [System.Management.Automation.Language.ArrayExpressionAst]) { return $null }
+    $statements = $Argument.SubExpression.Statements
+    if ($statements.Count -ne 1 -or $statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) { return $null }
+    $pipeline = $statements[0].PipelineElements
+    if ($pipeline.Count -ne 1 -or $pipeline[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $null }
+    $expression = $pipeline[0].Expression
+    if ($expression -isnot [System.Management.Automation.Language.ArrayLiteralAst]) { return $null }
+    return ,@($expression.Elements)
+}
+
+function Assert-NonReplayLiteralVector([System.Management.Automation.Language.Ast]$Argument, [string]$Route) {
+    $elements = Get-ArgumentVectorElements $Argument
+    Assert ($null -ne $elements -and $elements.Count -gt 0 -and $elements[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) "$Route must use a literal, unsplatted command argument vector"
+    $verb = $elements[0].Value.ToLowerInvariant()
+    Assert ($verb -notin @('apply', 'patch', 'am')) 'trusted verifier must not replay lock changes through apply, patch, am, or diff --binary'
+    if ($verb -eq 'diff') {
+        Assert (-not (@($elements | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] } | ForEach-Object Value) -contains '--binary')) 'trusted verifier must not replay lock changes through apply, patch, am, or diff --binary'
+    }
+}
+
 function Assert-NoPatchReplay([string]$Text) {
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
     Assert ($errors.Count -eq 0) 'trusted verifier replay analysis requires parseable PowerShell'
-    $replayVerb = '(?:apply|patch|am)'
-    $diffBinary = 'diff[''\"]?(?:\s*,?\s*[''\"]?--binary[''\"]?)'
     $commands = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
     foreach ($command in $commands) {
         $name = $command.GetCommandName()
-        $source = $command.Extent.Text
-        $isResolvedDirect = $source -match '(?is)^\s*&\s*\$[A-Za-z_][A-Za-z0-9_]*\b'
-        $isResolvedWrapper = $name -eq 'Invoke-ResolvedGit'
-        $isResolvedStartProcess = $name -eq 'Start-Process' -and $source -match '(?is)-FilePath\s+\$[A-Za-z_][A-Za-z0-9_]*\b'
-        if (-not ($isResolvedDirect -or $isResolvedWrapper -or $isResolvedStartProcess)) { continue }
+        $elements = $command.CommandElements
+        $functionName = Get-ContainingFunctionName $command
+        $isResolvedDirect = $command.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand -and $elements.Count -gt 0 -and $elements[0] -is [System.Management.Automation.Language.VariableExpressionAst]
+        if ($isResolvedDirect) {
+            $argument = if ($elements.Count -gt 1) { $elements[1] } else { $null }
+            if ($functionName -eq 'Invoke-ResolvedGit' -and $argument -is [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            if ($argument -is [System.Management.Automation.Language.VariableExpressionAst]) { throw 'resolved direct Git route must not use a variable or splatted argument vector' }
+            if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $verb = $argument.Value.ToLowerInvariant()
+                Assert ($verb -notin @('apply', 'patch', 'am', 'diff')) 'trusted verifier must not replay lock changes through apply, patch, am, or diff --binary'
+            } else { throw 'resolved direct Git route must use a literal command token' }
+            continue
+        }
 
-        $directReplay = '(?is)^\s*&\s*\$[A-Za-z_][A-Za-z0-9_]*\s+(?:[''\"]?' + $replayVerb + '[''\"]?\b|[''\"]?' + $diffBinary + ')'
-        $wrapperReplay = '(?is)^\s*Invoke-ResolvedGit\s+@\(\s*[''\"]?(?:' + $replayVerb + '|' + $diffBinary + ')'
-        $startReplay = '(?is)^\s*Start-Process\b.*?-ArgumentList\s+@\(\s*[''\"]?(?:' + $replayVerb + '|' + $diffBinary + ')'
-        Assert ($source -notmatch $directReplay -and $source -notmatch $wrapperReplay -and $source -notmatch $startReplay) 'trusted verifier must not replay lock changes through apply, patch, am, or diff --binary'
+        if ($name -eq 'Invoke-ResolvedGit') {
+            Assert-NonReplayLiteralVector (Get-BoundCommandArgument $command 'Arguments' 1) 'resolved Git wrapper'
+            continue
+        }
+        if ($name -eq 'Write-GitOutput') {
+            Assert-NonReplayLiteralVector (Get-BoundCommandArgument $command 'Arguments' 2) 'resolved Git output wrapper'
+            continue
+        }
+        if ($name -eq 'Start-Process') {
+            if (@($elements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) {
+                throw 'resolved Start-Process Git route must not use splatted parameters'
+            }
+            $filePath = Get-BoundCommandArgument $command 'FilePath' 2
+            if ($filePath -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                $argument = Get-BoundCommandArgument $command 'ArgumentList' 4
+                if ($functionName -eq 'Write-GitOutput' -and $argument -is [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                Assert-NonReplayLiteralVector $argument 'resolved Start-Process Git route'
+            }
+        }
     }
 }
 
@@ -528,14 +589,22 @@ $description = 'git diff --binary is forbidden only when executed'
 Write-Host "git am is not a command here"
 '@
     Assert-NoPatchReplay $replayCommentsAndStrings
-    foreach ($replay in @(
-        '& $gitExecutablePath apply --no-index patch',
-        "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('apply', '--no-index', 'patch')",
-        "Invoke-ResolvedGit @('patch', 'patchfile')",
-        "Invoke-ResolvedGit @('am', 'mailbox')",
-        "Start-Process -FilePath `$gitExecutablePath -ArgumentList @('diff', '--binary')"
-    )) {
-        Assert-Throws { Assert-NoPatchReplay ($portable + "`n" + $replay) } "replay command must be rejected: $replay"
+    $replayVectors = @(
+        "@('apply', '--no-index', 'patch')",
+        "@('patch', 'patchfile')",
+        "@('am', 'mailbox')",
+        "@('diff', '--binary', 'HEAD')"
+    )
+    foreach ($vector in $replayVectors) {
+        foreach ($replay in @(
+            "Invoke-ResolvedGit -Arguments $vector",
+            "`$gitArguments = $vector`n& `$gitExecutablePath `$gitArguments",
+            "`$gitArguments = $vector`nStart-Process -FilePath `$gitExecutablePath -ArgumentList `$gitArguments",
+            "`$gitSplat = @{ Arguments = $vector }`nInvoke-ResolvedGit @gitSplat",
+            "`$processSplat = @{ FilePath = `$gitExecutablePath; ArgumentList = $vector }`nStart-Process @processSplat"
+        )) {
+            Assert-Throws { Assert-NoPatchReplay ($portable + "`n" + $replay) } "replay command must be rejected: $replay"
+        }
     }
 }
 
