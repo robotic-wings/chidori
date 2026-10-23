@@ -208,8 +208,6 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)DirectorySeparatorChar.*?AltDirectorySeparatorChar') 'candidate target boundary must be separator-aware'
     Assert ($Text -match '(?is)\$candidateTargetCanonical\s*-eq\s*\$candidateWorktreeCanonical') 'candidate target boundary must reject equality with candidate worktree'
     Assert ($Text -match '(?is)\$candidateTargetCanonical.*?(?:StartsWith|like).*?(?:\$separator|\$alternateSeparator|DirectorySeparatorChar|AltDirectorySeparatorChar)') 'candidate target boundary must reject only separator-bound descendants while allowing siblings'
-    Assert ($Text -match '(?im)^\s*\$candidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all') 'candidate clean boundary must capture full porcelain including untracked files'
-    Assert ($Text -match '(?is)\$candidatePorcelain.*?\$LASTEXITCODE.*?\$candidatePorcelain\s*-ne\s*[''"]{2}.*?\$candidatePorcelain') 'candidate status failure must report exact captured porcelain output'
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$candidateTarget') 'scrubbed verifier must receive exactly captured external target'
@@ -217,7 +215,14 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+tree.*?\$candidateTarget') 'scrubbed tree must receive exactly captured external target'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
     Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
-    Assert ([regex]::Matches($Text, '(?im)^\s*\$candidatePorcelain\s*=').Count -ge 5) 'full candidate porcelain evidence is required at every clean boundary'
+    foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
+        $variable = '$' + $phase + 'Porcelain'
+        Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all.*?\$LASTEXITCODE.*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, exit-check, compare, and report its own output"
+    }
+    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
+    Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh|cargo\s+metadata)') 'verified external target directory must be created before use'
+    Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
+    Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
     foreach ($operation in @('&\s+pwsh.*?\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
         Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
     }
@@ -614,36 +619,49 @@ $separator = [IO.Path]::DirectorySeparatorChar
 $alternateSeparator = [IO.Path]::AltDirectorySeparatorChar
 if ($candidateTargetCanonical -eq $candidateWorktreeCanonical) { throw 'target equals worktree' }
 if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $separator) -or $candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $alternateSeparator)) { throw 'target inside worktree' }
-$candidatePorcelain = git status --porcelain --untracked-files=all
-if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
-if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
+$targetDirectory = [IO.Directory]::CreateDirectory($candidateTargetCanonical)
+$verifierPrePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcelain" }
+if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
 Remove-Item Env:*
 $env:CARGO_TARGET_DIR = $candidateTarget
 & pwsh -File $trustedVerifier -Target $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
+$verifierPostPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
+$outerPrePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-pre status failed: $outerPrePorcelain" }
+if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
+$outerPostScrubPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
+if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
 cargo metadata --locked --target-dir $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'metadata failed' }
 cargo tree --locked --target-dir $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'tree failed' }
-$candidatePorcelain = git status --porcelain --untracked-files=all
-if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
-if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
-$candidatePorcelain = git status --porcelain --untracked-files=all
-if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
-if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
-$candidatePorcelain = git status --porcelain --untracked-files=all
-if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
-if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
-$candidatePorcelain = git status --porcelain --untracked-files=all
-if ($LASTEXITCODE -ne 0) { throw "status failed: $candidatePorcelain" }
-if ($candidatePorcelain -ne '') { throw "dirty: $candidatePorcelain" }
-Remove-Item -LiteralPath $candidateTarget
+$outerPostCargoPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
+if ($outerPostCargoPorcelain -ne '') { throw "outer-post-Cargo dirty: $outerPostCargoPorcelain" }
+Remove-Item -LiteralPath $candidateTarget -Recurse -Force
 if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
+$finalPostTargetCleanupPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "final-post-target-cleanup status failed: $finalPostTargetCleanupPorcelain" }
+if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup dirty: $finalPostTargetCleanupPorcelain" }
 '@
     Assert-ExternalTargetContract $externalTargetHappy
-    Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('--untracked-files=all', '')) } 'candidate residue status mode must fail'
+    foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
+        $variable = '$' + $phase + 'Porcelain'
+        $label = switch ($phase) { 'verifierPre' { 'verifier-pre' } 'verifierPost' { 'verifier-post' } 'outerPre' { 'outer-pre' } 'outerPostScrub' { 'outer-post-scrub' } 'outerPostCargo' { 'outer-post-Cargo' } default { 'final-post-target-cleanup' } }
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("$variable = git status --porcelain --untracked-files=all", "$variable = git status --porcelain")) } "[$phase] missing full status mode must fail"
+        $genericStatus = $externalTargetHappy.Replace(('throw "' + $label + ' status failed: ' + $variable + '"'), "throw 'generic status failure'").Replace(('throw "' + $label + ' dirty: ' + $variable + '"'), "throw 'generic dirty failure'")
+        Assert-Throws { Assert-ExternalTargetContract $genericStatus } "[$phase] generic status evidence must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace("if ($variable -ne '')", "if ('hard-coded' -ne '')")) } "[$phase] hard-coded status comparison must fail"
+    }
     Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"', '$candidateTarget = $candidateWorktree')) } 'target inside candidate worktree must fail'
     Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('Remove-Item -LiteralPath $candidateTarget', 'git clean -fd')) } 'broad cleanup must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('Remove-Item -LiteralPath $candidateTarget -Recurse -Force', 'Remove-Item -LiteralPath $candidateTarget')) } 'nonrecursive cleanup of nonempty target must fail'
+    Assert-Throws { Assert-ExternalTargetContract ($externalTargetHappy.Replace('Remove-Item -LiteralPath $candidateTarget -Recurse -Force', 'Remove-Item -LiteralPath $candidateWorktree -Recurse -Force')) } 'candidate-root cleanup must fail'
     $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { `$null = `$null } finally { Pop-Location }`n")
     Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
