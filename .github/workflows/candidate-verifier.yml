@@ -1,0 +1,75 @@
+name: Candidate verifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full lowercase SHA of the standalone package candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        name: Check out trusted verifier revision
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate identity and materialize candidate
+        shell: pwsh
+        run: |
+          if ($env:CANDIDATE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'candidate_sha must be exactly 40 lowercase hexadecimal characters' }
+          Push-Location trusted
+          try {
+            if (git status --porcelain) { throw 'trusted verifier checkout is dirty' }
+            if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'trusted verifier checkout does not equal github.sha' }
+            git fetch origin $env:CANDIDATE_SHA
+            if ((git rev-parse "$env:CANDIDATE_SHA^{commit}") -ne $env:CANDIDATE_SHA) { throw 'candidate SHA is not fetchable as the requested commit' }
+            git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+          } finally {
+            Pop-Location
+          }
+          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA
+          try {
+            if ((git rev-parse HEAD) -ne $env:CANDIDATE_SHA) { throw 'candidate worktree HEAD does not equal candidate SHA' }
+            if (git status --porcelain) { throw 'candidate worktree is dirty' }
+            $parents = (git show -s --format=%P $env:CANDIDATE_SHA).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+            if ($parents.Count -ne 1) { throw 'candidate must have exactly one parent' }
+            if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate parent does not equal approved base' }
+            Write-Host "trusted_sha=$env:GITHUB_SHA candidate_sha=$env:CANDIDATE_SHA candidate_parent=$($parents[0])"
+          } finally {
+            Pop-Location
+          }
+
+      - name: Run trusted verifier against the candidate
+        shell: pwsh
+        run: |
+          $candidateSha = $env:CANDIDATE_SHA
+          $trustedScripts = Join-Path $env:RUNNER_TEMP 'trusted/scripts'
+          $toolPath = $env:PATH
+          $homePath = $env:HOME
+          $cargoHome = $env:CARGO_HOME
+          $rustupHome = $env:RUSTUP_HOME
+          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $trustedScripts 'verify-package-candidate.ps1') -Candidate $candidateSha; Pop-Location
+
+      - name: Run locked Cargo checks in the candidate worktree
+        shell: pwsh
+        run: |
+          $toolPath = $env:PATH
+          $homePath = $env:HOME
+          $cargoHome = $env:CARGO_HOME
+          $rustupHome = $env:RUSTUP_HOME
+          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; cargo metadata --locked --format-version 1 --no-deps; Pop-Location
+          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; cargo tree --locked -p chidori; Pop-Location
