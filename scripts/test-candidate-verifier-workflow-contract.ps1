@@ -109,6 +109,11 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
 }
 
 function Assert-CandidateScrubAndCargoContract([string]$Text) {
+    $lockedCargoBlock = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Run locked Cargo checks in the candidate worktree[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]*name:|\z)')
+    Assert ($lockedCargoBlock.Count -eq 1) 'workflow must define exactly one Run locked Cargo checks YAML run block'
+    $Text = $lockedCargoBlock[0].Groups['run'].Value
+    Assert ($Text -notmatch '(?im)^\s*#') 'comments cannot satisfy locked Cargo evidence requirements'
+    Assert ($Text -notmatch '(?i)\b(?:Out-Null|Write-Host)\b') 'locked Cargo evidence must capture native output rather than discard it'
     $captureSha = '(?m)^\s*\$candidateSha\s*=\s*\$env:CANDIDATE_SHA\s*$'
     $captureWorktree = '(?m)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$'
     Assert ([regex]::Matches($Text, $captureSha).Count -eq 1) 'workflow must capture candidate SHA exactly once before environment scrub'
@@ -138,13 +143,20 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
         'cargo\s+tree\s+--locked'
     )
     foreach ($command in $evidenceCommands) {
-        $commands = [regex]::Matches($Text, '(?im)^\s*' + $command + '.*$')
+        $commands = [regex]::Matches($Text, '(?im)^\s*(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*$')
         Assert ($commands.Count -gt 0) "workflow must contain evidence command [$command]"
         foreach ($native in $commands) {
             $following = $Text.Substring($native.Index + $native.Length, [Math]::Min(400, $Text.Length - $native.Index - $native.Length))
             Assert ($following -match '(?is)^\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw\b') "native evidence command [$command] must have an immediately adjacent LASTEXITCODE throw"
         }
     }
+
+    Assert ($Text -match '(?im)^\s*\$candidateHead\s*=\s*git\s+rev-parse\s+HEAD') 'locked Cargo block must capture candidate HEAD output'
+    Assert ($Text -match '(?im)^\s*\$candidateStatus\s*=\s*git\s+status\s+--porcelain') 'locked Cargo block must capture candidate status output'
+    Assert ($Text -match '(?im)^\s*\$parents\s*=\s*\(git\s+show\s+-s\s+--format=%P\s+\$candidateSha\)') 'locked Cargo block must capture candidate parent output'
+    Assert ($Text -match '(?is)\$candidateHead\s*-ne\s*\$candidateSha') 'locked Cargo block must compare captured HEAD to captured candidate SHA'
+    Assert ($Text -match '(?is)\$candidateStatus\s*-ne\s*[''"]{2}') 'locked Cargo block must compare captured status for cleanliness'
+    Assert ($Text -match '(?is)\$parents\.Count\s*-ne\s*1.{0,500}\$parents\[0\]\s*-ne\s*[''"]9e1c295b1f3f90ef342021ec81b52ece7363cd6c') 'locked Cargo block must compare captured sole parent to approved base'
 
     $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha')
     foreach ($phase in @(
@@ -153,7 +165,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
         @{ Name = 'post-Cargo'; Prefix = '(?is)cargo\s+tree\s+--locked.*?'; Suffix = '\}\s*finally\s*\{\s*Pop-Location' }
     )) {
         foreach ($command in $phaseCommands) {
-            $bound = $phase.Prefix + $command + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $phase.Suffix
+            $bound = $phase.Prefix + '(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $phase.Suffix
             Assert ($Text -match $bound) "$($phase.Name) phase must bind [$command] with an immediately adjacent LASTEXITCODE throw"
         }
         $parentBound = $phase.Prefix + '\$parents\.Count.*?\$parents\[0\].*?' + $phase.Suffix
@@ -481,15 +493,16 @@ $toolPath = $env:PATH
 $homePath = $env:HOME
 $cargoHome = $env:CARGO_HOME
 $rustupHome = $env:RUSTUP_HOME
-git rev-parse HEAD | Out-Null
+$candidateHead = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
-git status --porcelain | Out-Null
+$candidateStatus = git status --porcelain
 if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
-git show -s --format=%P $candidateSha | Out-Null
+$parents = (git show -s --format=%P $candidateSha).Split(' ')
 if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
-$parents = @('approved-base')
+if ($candidateHead -ne $candidateSha) { throw 'candidate HEAD mismatch' }
+if ($candidateStatus -ne '') { throw 'candidate dirty' }
 if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
-if ($parents[0] -ne 'approved-base') { throw 'candidate base failed' }
+if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
 Remove-Item Env:*
 $env:PATH = $toolPath
 $env:HOME = $homePath
@@ -497,40 +510,43 @@ $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
 Push-Location $candidateWorktree
 try {
-    git rev-parse HEAD | Out-Null
+    $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
-    git status --porcelain | Out-Null
+    $candidateStatus = git status --porcelain
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
-    git show -s --format=%P $candidateSha | Out-Null
+    $parents = (git show -s --format=%P $candidateSha).Split(' ')
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
-    $parents = @('approved-base')
+    if ($candidateHead -ne $candidateSha) { throw 'post-scrub candidate HEAD mismatch' }
+    if ($candidateStatus -ne '') { throw 'post-scrub candidate dirty' }
     if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
-    if ($parents[0] -ne 'approved-base') { throw 'post-scrub candidate base failed' }
+    if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
     cargo metadata --locked --format-version 1 --no-deps
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     cargo tree --locked -p chidori
     if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
-    git rev-parse HEAD | Out-Null
+    $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
-    git status --porcelain | Out-Null
+    $candidateStatus = git status --porcelain
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
-    git show -s --format=%P $candidateSha | Out-Null
+    $parents = (git show -s --format=%P $candidateSha).Split(' ')
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
-    $parents = @('approved-base')
+    if ($candidateHead -ne $candidateSha) { throw 'post-Cargo candidate HEAD mismatch' }
+    if ($candidateStatus -ne '') { throw 'post-Cargo candidate dirty' }
     if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
-    if ($parents[0] -ne 'approved-base') { throw 'post-Cargo candidate base failed' }
+    if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
 } finally {
     Pop-Location
 }
 '@
-    Assert-CandidateScrubAndCargoContract $candidateCargoHappy
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-scrub parent evidence failure check must fail'
-    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-Cargo parent evidence failure check must fail'
+    $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
+    Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-scrub parent evidence failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-Cargo parent evidence failure check must fail'
 
     $runnerTempTrusted = $happy.Replace('$env:GITHUB_WORKSPACE', '$env:RUNNER_TEMP')
     Assert-Throws { Assert-TrustedVerifierIdentity $runnerTempTrusted } 'RUNNER_TEMP trusted verifier root must be rejected'
