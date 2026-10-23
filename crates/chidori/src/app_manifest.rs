@@ -337,14 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn loads_and_validates_a_full_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        touch_agent(dir.path(), "agents/triage.ts");
-        touch_agent(dir.path(), "agents/scribe.ts");
-        let path = write_manifest(
-            dir.path(),
-            "chidori.app.yml",
-            r#"
+    fn loads_and_validates_a_full_manifest_from_both_yaml_extensions() {
+        for name in ["chidori.app.yml", "chidori.app.yaml"] {
+            let dir = tempfile::tempdir().unwrap();
+            touch_agent(dir.path(), "agents/triage.ts");
+            touch_agent(dir.path(), "agents/scribe.ts");
+            let path = write_manifest(
+                dir.path(),
+                name,
+                r#"
 name: support-desk
 agents:
   - name: triage
@@ -359,17 +360,26 @@ routes:
     agent: triage
     signal: github-event
 "#,
-        );
-        let manifest = AppManifest::load(&path).unwrap();
-        assert_eq!(manifest.name.as_deref(), Some("support-desk"));
-        assert_eq!(manifest.fleet().count(), 1);
-        let recipes = manifest.to_recipes();
-        assert_eq!(recipes.len(), 1);
-        assert_eq!(recipes[0].name, "scribe");
-        // 5-field cron normalized to the scheduler's 6-field parser.
-        assert_eq!(recipes[0].schedule.as_deref(), Some("0 0 9 * * 1-5"));
-        assert!(recipes[0].agent.is_absolute());
-        assert_eq!(manifest.routes.len(), 1);
+            );
+            let manifest = AppManifest::load(&path).unwrap();
+            assert_eq!(
+                manifest.name.as_deref(),
+                Some("support-desk"),
+                "manifest {name}"
+            );
+            assert_eq!(manifest.fleet().count(), 1, "manifest {name}");
+            let recipes = manifest.to_recipes();
+            assert_eq!(recipes.len(), 1, "manifest {name}");
+            assert_eq!(recipes[0].name, "scribe", "manifest {name}");
+            // 5-field cron normalized to the scheduler's 6-field parser.
+            assert_eq!(
+                recipes[0].schedule.as_deref(),
+                Some("0 0 9 * * 1-5"),
+                "manifest {name}"
+            );
+            assert!(recipes[0].agent.is_absolute(), "manifest {name}");
+            assert_eq!(manifest.routes.len(), 1, "manifest {name}");
+        }
     }
 
     #[test]

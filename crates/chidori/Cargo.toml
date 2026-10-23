@@ -95,7 +95,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 cron = "0.12"
 
 # YAML recipe parsing
-serde_yaml = "0.9"
+serde_yaml = { package = "noyalib-serde-yaml", version = "=0.0.58" }
 
 # OpenTelemetry OTLP export — emits one span per host function call so agents
 # can be shipped into any OTLP-compatible backend (tael, Jaeger, Tempo, etc.).
