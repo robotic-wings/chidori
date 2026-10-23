@@ -101,6 +101,45 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
     Assert ($operationCount -gt 0) "workflow must contain $Name"
 }
 
+function Assert-CandidateScrubAndCargoContract([string]$Text) {
+    $captureSha = '(?m)^\s*\$candidateSha\s*=\s*\$env:CANDIDATE_SHA\s*$'
+    $captureWorktree = '(?m)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$'
+    Assert ([regex]::Matches($Text, $captureSha).Count -eq 1) 'workflow must capture candidate SHA exactly once before environment scrub'
+    Assert ([regex]::Matches($Text, $captureWorktree).Count -eq 1) 'workflow must capture canonical candidate worktree before environment scrub'
+    $captureEnd = [regex]::Match($Text, $captureWorktree).Index
+    $firstScrub = [regex]::Match($Text, '(?im)^\s*Remove-Item\s+Env:\*').Index
+    Assert ($firstScrub -ge 0 -and $captureEnd -lt $firstScrub) 'candidate SHA and canonical worktree capture must precede environment scrub'
+
+    $scrubbed = $Text.Substring($firstScrub)
+    Assert ($scrubbed -notmatch '(?i)\$env:(?:RUNNER_TEMP|CANDIDATE_SHA|GITHUB_TOKEN|GH_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN)') 'scrubbed execution must never re-read candidate/runtime or credential environment values'
+    Assert ($scrubbed -notmatch '(?i)\$env:(?:GITHUB_WORKSPACE|GITHUB_SHA)\s*=') 'scrubbed execution must not restore GitHub identity environment values'
+    foreach ($safe in @('PATH', 'HOME', 'CARGO_HOME', 'RUSTUP_HOME')) {
+        Assert ($scrubbed -match ('(?im)^\s*\$env:' + $safe + '\s*=\s*\$')) "scrubbed execution must restore only the captured $safe environment value"
+    }
+    Assert ($scrubbed -notmatch '(?im)^\s*\$env:(?!(?:PATH|HOME|CARGO_HOME|RUSTUP_HOME)\b)[A-Za-z_][A-Za-z0-9_]*\s*=') 'scrubbed execution must not restore any environment variable outside PATH/HOME/CARGO_HOME/RUSTUP_HOME'
+
+    $scope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<body>.*?)cargo\s+metadata\s+--locked(?<afterMetadata>.*?)cargo\s+tree\s+--locked(?<afterTree>.*?)\}\s*finally\s*\{\s*Pop-Location\s*\}'
+    $match = [regex]::Match($Text, $scope)
+    Assert $match.Success 'metadata and tree must run in one balanced canonical candidate Push-Location/try/finally/Pop-Location scope'
+    Assert ($match.Groups['body'].Value -notmatch '(?i)(?:Set-Location|Push-Location|Pop-Location|\bcd\b|\bsl\b|\bchdir\b)') 'candidate Cargo scope must not mutate the canonical location'
+
+    $evidenceCommands = @(
+        'git\s+rev-parse\s+HEAD',
+        'git\s+status\s+--porcelain',
+        'git\s+show\s+-s\s+--format=%P\s+\$candidateSha',
+        'cargo\s+metadata\s+--locked',
+        'cargo\s+tree\s+--locked'
+    )
+    foreach ($command in $evidenceCommands) {
+        $commands = [regex]::Matches($Text, '(?im)^\s*' + $command + '.*$')
+        Assert ($commands.Count -gt 0) "workflow must contain evidence command [$command]"
+        foreach ($native in $commands) {
+            $following = $Text.Substring($native.Index + $native.Length, [Math]::Min(400, $Text.Length - $native.Index - $native.Length))
+            Assert ($following -match '(?is)^\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw\b') "native evidence command [$command] must have an immediately adjacent LASTEXITCODE throw"
+        }
+    }
+}
+
 function Assert-TrustedVerifierIdentity([string]$Text) {
     $trustedCheckout = '(?ms)^\s*-\s*uses:\s*actions/checkout[^\r\n]*\r?\n(?<block>.*?)(?=^\s*-\s|\z)'
     $checkout = [regex]::Match($Text, $trustedCheckout)
@@ -346,6 +385,7 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
     Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}cargo\s+(?:metadata|tree)\s+--locked') 'scrubbed candidate environment must bind Cargo invocation'
+    Assert-CandidateScrubAndCargoContract $text
 }
 
 function New-FixtureRepo {
@@ -414,6 +454,45 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
     Assert-SafeCandidateExecution $happy 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert-SafeCandidateExecution $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
+
+    $candidateCargoHappy = @'
+$candidateSha = $env:CANDIDATE_SHA
+$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+$toolPath = $env:PATH
+$homePath = $env:HOME
+$cargoHome = $env:CARGO_HOME
+$rustupHome = $env:RUSTUP_HOME
+git rev-parse HEAD | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
+git status --porcelain | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
+git show -s --format=%P $candidateSha | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
+Remove-Item Env:*
+$env:PATH = $toolPath
+$env:HOME = $homePath
+$env:CARGO_HOME = $cargoHome
+$env:RUSTUP_HOME = $rustupHome
+Push-Location $candidateWorktree
+try {
+    cargo metadata --locked --format-version 1 --no-deps
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    cargo tree --locked -p chidori
+    if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+    git rev-parse HEAD | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
+    git status --porcelain | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+} finally {
+    Pop-Location
+}
+'@
+    Assert-CandidateScrubAndCargoContract $candidateCargoHappy
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")', '$candidateWorktree = $env:RUNNER_TEMP')) } 'missing canonical candidate worktree capture must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('$env:PATH = $toolPath', '$env:CANDIDATE_SHA = $candidateSha')) } 'unsafe environment restoration must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoHappy.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
 
     $runnerTempTrusted = $happy.Replace('$env:GITHUB_WORKSPACE', '$env:RUNNER_TEMP')
     Assert-Throws { Assert-TrustedVerifierIdentity $runnerTempTrusted } 'RUNNER_TEMP trusted verifier root must be rejected'
