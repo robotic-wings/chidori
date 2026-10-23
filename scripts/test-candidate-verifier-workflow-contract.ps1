@@ -24,6 +24,13 @@ function Get-RawImmutableFixtureResult([bool]$ArgumentListAvailable) {
     return [pscustomobject]@{ State = 'READY'; ExitCode = 0 }
 }
 
+function Get-DefaultContractCapabilityResult([bool]$ArgumentListAvailable) {
+    return [pscustomobject]@{
+        ReportPending = -not $ArgumentListAvailable
+        ContinueStaticContracts = $true
+    }
+}
+
 function Git([string]$Repo, [string[]]$Arguments) {
     $out = & git.exe -C $Repo @Arguments 2>$null
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed" }
@@ -954,6 +961,10 @@ $pendingFixtureResult = Get-RawImmutableFixtureResult $false
 Assert ($pendingFixtureResult.State -eq 'PENDING' -and $pendingFixtureResult.ExitCode -eq 2) 'unavailable raw immutable-blob fixture capability must be PENDING with exit 2'
 $readyFixtureResult = Get-RawImmutableFixtureResult $true
 Assert ($readyFixtureResult.State -eq 'READY' -and $readyFixtureResult.ExitCode -eq 0) 'available raw immutable-blob fixture capability must remain executable'
+$defaultPendingResult = Get-DefaultContractCapabilityResult $false
+Assert ($defaultPendingResult.ReportPending -and $defaultPendingResult.ContinueStaticContracts) 'default route must report unavailable raw capture as PENDING and continue static contracts'
+$defaultReadyResult = Get-DefaultContractCapabilityResult $true
+Assert ((-not $defaultReadyResult.ReportPending) -and $defaultReadyResult.ContinueStaticContracts) 'default route must run static contracts when raw capture is executable'
 Invoke-LockCompositionFixtures
 if ($FixturesOnly) {
     if ($script:RawBinaryFixturePending) {
@@ -963,15 +974,16 @@ if ($FixturesOnly) {
     Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
     exit 0
 }
-if (-not $FixturesOnly) {
-    Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
-    $verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
-    Assert-VerifierScriptPortability $verifierScript
-    Assert-VerifierScriptRecursionSafety $verifierScript
-    Assert-LockCompositionContract $verifierScript
-}
+# The default route intentionally evaluates these static contracts even when the
+# local raw-byte fixture is PENDING; only FixturesOnly returns early for that
+# capability state.
+Assert-WorkflowContract (Join-Path $PSScriptRoot '..\.github\workflows\candidate-verifier.yml')
+$verifierScript = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'verify-package-candidate.ps1'))
+Assert-VerifierScriptPortability $verifierScript
+Assert-VerifierScriptRecursionSafety $verifierScript
+Assert-LockCompositionContract $verifierScript
 if ($script:RawBinaryFixturePending) {
-    Write-Host "PENDING: raw immutable-blob fixture: $script:RawBinaryFixturePendingReason"
+    Write-Host "PENDING: raw immutable-blob fixture after completed static contract evaluation: $script:RawBinaryFixturePendingReason"
     exit 2
 }
 Write-Host 'PASS: candidate-verifier workflow contracts and hermetic fixtures'
