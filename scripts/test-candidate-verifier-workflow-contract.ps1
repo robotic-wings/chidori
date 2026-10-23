@@ -579,7 +579,7 @@ $env:RUSTUP_HOME = $rustupHome
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
-    $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { Write-Host 'second candidate scope' } finally { Pop-Location }`n")
+    $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { `$null = `$null } finally { Pop-Location }`n")
     Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
         '$candidateHead = git rev-parse HEAD',
