@@ -146,8 +146,10 @@ function Assert-FullUntrackedCleanGate([string]$Text, [string]$Variable, [string
 
 function Assert-NormalizedCandidateStatus([string]$Text, [string]$Prefix, [string]$Suffix, [string]$Name) {
     $normalized = '\$candidateStatus\s*=\s*@\(\$candidateStatus\)\s*-join\s+["'']`n["'']'
-    Assert ([regex]::Matches($Text, $normalized).Count -ge 3) "$Name candidate status must normalize each phase-local capture with the exact ordered newline scalar"
-    Assert ([regex]::Matches($Text, '(?is)\$candidateStatus\s*=\s*git\s+status\s+--porcelain.*?if\s*\(\s*\$candidateStatus\s*-ne\s*[''\"]{2}\s*\)\s*\{\s*throw.*?\$candidateStatus').Count -ge 3) "$Name candidate status must immediately exit-check, compare, and report its captured scalar"
+    $slice = [regex]::Match($Text, $Prefix + '(?<phase>.*?)' + $Suffix)
+    Assert $slice.Success "$Name phase must have a bounded candidate-status evidence slice"
+    $chain = '(?is)\$candidateStatus\s*=\s*git\s+status\s+--porcelain\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw[^\r\n}]*\}\s*\r?\n\s*' + $normalized + '.*?if\s*\(\s*\$candidateStatus\s*-ne\s*[''\"]{2}\s*\)\s*\{\s*throw[^\r\n}]*\$candidateStatus[^\r\n}]*\}'
+    Assert ($slice.Groups['phase'].Value -match $chain) "$Name candidate status must immediately exit-check, normalize with the exact newline scalar, compare, and report its captured scalar inside its own phase"
 }
 
 function Assert-CleanMaterializationContract([string]$Text) {
@@ -971,6 +973,15 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
         Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Failure, "throw 'generic status failure'")) } "$($statusPhase.Name) candidate status failure must report its normalized scalar"
         Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Comparison, "if ('hard-coded' -ne '') { throw 'hard-coded status' }")) } "$($statusPhase.Name) candidate status must not use a hard-coded comparison"
         Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Comparison, "if (`$true) { throw 'unused status' }")) } "$($statusPhase.Name) candidate status scalar must not be unused"
+    }
+    foreach ($statusLocation in @(
+        @{ Name = 'pre-scrub'; Capture = '$candidateStatus = git status --porcelain'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }" },
+        @{ Name = 'post-scrub'; Capture = '    $candidateStatus = git status --porcelain'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }" },
+        @{ Name = 'post-Cargo'; Capture = '    $candidateStatus = git status --porcelain'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }" }
+    )) {
+        $relocated = $candidateCargoWorkflow.Replace($statusLocation.Capture, '$relocatedCandidateStatus = git status --porcelain') + "`n    `$candidateStatus = git status --porcelain`n    if (`$LASTEXITCODE -ne 0) { throw 'relocated status failed' }`n    `$candidateStatus = @(`$candidateStatus) -join `"`n`"`n    if (`$candidateStatus -ne '') { throw `"relocated dirty: `$candidateStatus`" }"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract $relocated } "$($statusLocation.Name) candidate status relocated outside its phase must not satisfy that phase"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusLocation.Guard, "Write-Output 'later success masks status failure'")) } "$($statusLocation.Name) candidate status requires an immediate native exit guard inside its own phase"
     }
     $bleed = $candidateCargoWorkflow.Replace('$candidatePaths = git diff', '# removed path capture`n$null = git diff') + "`n  - uses: actions/checkout@v7`n    run: |`n      `$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c `$candidateSha"
     Assert-Throws { Assert-CandidateScrubAndCargoContract $bleed } 'unnamed sibling step must not bleed evidence into locked Cargo block'
