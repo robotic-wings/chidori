@@ -31,24 +31,31 @@ jobs:
         shell: pwsh
         run: |
           if ($env:CANDIDATE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'candidate_sha must be exactly 40 lowercase hexadecimal characters' }
+          $candidateSha = $env:CANDIDATE_SHA
+          $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
           Push-Location trusted
           try {
             if (git status --porcelain) { throw 'trusted verifier checkout is dirty' }
             if ((git rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'trusted verifier checkout does not equal github.sha' }
             git fetch origin $env:CANDIDATE_SHA
-            if ((git rev-parse "$env:CANDIDATE_SHA^{commit}") -ne $env:CANDIDATE_SHA) { throw 'candidate SHA is not fetchable as the requested commit' }
-            git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+            if ((git rev-parse "$candidateSha^{commit}") -ne $candidateSha) { throw 'candidate SHA is not fetchable as the requested commit' }
+            git worktree add --detach $candidateWorktree $candidateSha
+            if ($LASTEXITCODE -ne 0) { throw 'candidate worktree creation failed' }
           } finally {
             Pop-Location
           }
-          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA
+          Push-Location $candidateWorktree
           try {
-            if ((git rev-parse HEAD) -ne $env:CANDIDATE_SHA) { throw 'candidate worktree HEAD does not equal candidate SHA' }
-            if (git status --porcelain) { throw 'candidate worktree is dirty' }
-            $parents = (git show -s --format=%P $env:CANDIDATE_SHA).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+            $materializedCandidateHead = git rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw "materialized HEAD failed: $materializedCandidateHead" }
+            if ($materializedCandidateHead -ne $candidateSha) { throw "materialized HEAD mismatch: $materializedCandidateHead" }
+            $materializedCandidatePorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "materialized status failed: $materializedCandidatePorcelain" }
+            if ($materializedCandidatePorcelain -ne '') { throw "materialized dirty: $materializedCandidatePorcelain" }
+            $parents = (git show -s --format=%P $candidateSha).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
             if ($parents.Count -ne 1) { throw 'candidate must have exactly one parent' }
             if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate parent does not equal approved base' }
-            Write-Host "trusted_sha=$env:GITHUB_SHA candidate_sha=$env:CANDIDATE_SHA candidate_parent=$($parents[0])"
+            Write-Host "trusted_sha=$env:GITHUB_SHA candidate_sha=$candidateSha candidate_parent=$($parents[0])"
           } finally {
             Pop-Location
           }
@@ -76,6 +83,9 @@ jobs:
           $approvedCandidatePaths = "Cargo.lock`ncrates/chidori-js/Cargo.toml`ncrates/chidori/Cargo.toml"
           Push-Location $candidateWorktree
           try {
+            $preTargetPorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }
+            if ($preTargetPorcelain -ne '') { throw "pre-target dirty: $preTargetPorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
             $candidateStatus = git status --porcelain --untracked-files=all
