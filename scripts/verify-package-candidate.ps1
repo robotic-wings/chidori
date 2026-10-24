@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Candidate
+    [string]$Candidate,
+    [Parameter(Mandatory = $true)]
+    [string]$Target
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,7 +76,7 @@ $headSha = Invoke-ResolvedGit @('rev-parse', 'HEAD^{commit}')
 Assert-Equal $candidateSha $headSha 'candidate must be the checked-out HEAD'
 $null = Invoke-ResolvedGit @('merge-base', '--is-ancestor', $base, $candidateSha)
 
-$dirtyBefore = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
+$dirtyBefore = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=all')
 if ($dirtyBefore) { throw "tracked tree is dirty before verification: $dirtyBefore" }
 
 $candidatePaths = Invoke-ResolvedGit @('diff', '--name-only', $base, $candidateSha)
@@ -145,11 +147,11 @@ $chidoriManifest = FileAt $candidateSha 'crates/chidori/Cargo.toml'
 if ($jsManifest -notmatch '(?m)^version = "0\.4\.1"$') { throw 'chidori-js manifest is not exactly version 0.4.1' }
 if ($chidoriManifest -notmatch '(?m)^chidori-js = \{ path = "\.\./chidori-js", version = "0\.4\.1" \}$') { throw 'chidori path dependency is not exact chidori-js 0.4.1' }
 
-& cargo metadata --locked --format-version 1 --no-deps | Out-Null
+& cargo metadata --locked --format-version 1 --no-deps --target-dir $Target | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'cargo metadata --locked failed' }
-& cargo tree --locked -p chidori | Out-Null
+& cargo tree --locked -p chidori --target-dir $Target | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'cargo tree --locked -p chidori failed' }
 
-$dirtyAfter = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
+$dirtyAfter = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=all')
 if ($dirtyAfter) { throw "tracked tree is dirty after verification: $dirtyAfter" }
 Write-Host "PASS: candidate $candidateSha is checked-out HEAD and is bound to direct patches 59ebb109 + 00148aa with locked metadata/tree evidence."
