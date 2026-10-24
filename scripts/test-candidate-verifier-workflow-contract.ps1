@@ -108,6 +108,20 @@ function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pa
     Assert ($operationCount -gt 0) "workflow must contain $Name"
 }
 
+function Assert-NoCargoTargetDirFlags([string]$Text) {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    Assert ($errors.Count -eq 0) 'Cargo target-dir inspection requires parseable PowerShell'
+    $cargoCommands = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'cargo' }, $true)
+    foreach ($cargoCommand in $cargoCommands) {
+        $elements = $cargoCommand.CommandElements
+        if ($elements.Count -ge 2 -and $elements[1].Extent.Text -in @('metadata', 'tree')) {
+            Assert (-not ($elements | Where-Object { $_.Extent.Text -match '(?i)^--target-dir(?:=|$)' })) 'literal Cargo metadata/tree commands must use CARGO_TARGET_DIR isolation, never a --target-dir CLI flag'
+        }
+    }
+}
+
 function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $lockedCargoBlock = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Run locked Cargo checks in the candidate worktree[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
     Assert ($lockedCargoBlock.Count -eq 1) 'workflow must define exactly one Run locked Cargo checks YAML run block'
@@ -157,6 +171,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $literalTree = '(?im)^\s*cargo\s+tree\s+--locked\b.*$'
     Assert ([regex]::Matches($match.Value, $literalMetadata).Count -eq 1) 'candidate scope must use one literal cargo metadata --locked command'
     Assert ([regex]::Matches($match.Value, $literalTree).Count -eq 1) 'candidate scope must use one literal cargo tree --locked command'
+    Assert-NoCargoTargetDirFlags $match.Value
     Assert ($match.Value -match ('(?is)' + $verifierPost + '.*?' + $literalMetadata + '\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $literalTree + '\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) 'verifier-post evidence and phase-local Git checks must precede literal Cargo commands with immediate exit throws'
     $preScope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<pre>.*?)Remove-Item\s+Env:\*'
     $preMatch = [regex]::Match($Text, $preScope)
@@ -237,11 +252,11 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget') 'scrubbed verifier must receive exactly captured external target through the trusted pwsh invocation'
-    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+metadata.*?\$candidateTarget') 'scrubbed metadata must receive exactly captured external target'
-    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?cargo\s+tree.*?\$candidateTarget') 'scrubbed tree must receive exactly captured external target'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget.*?cargo\s+metadata\s+--locked') 'scrubbed metadata must receive the captured external target through CARGO_TARGET_DIR'
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget.*?cargo\s+tree\s+--locked') 'scrubbed tree must receive the captured external target through CARGO_TARGET_DIR'
     Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive the exact captured target value through the required pwsh invocation'
-    Assert ($Text -match '(?im)^\s*cargo\s+metadata\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'metadata must receive the exact captured target value'
-    Assert ($Text -match '(?im)^\s*cargo\s+tree\s+--locked\s+--target-dir\s+\$candidateTarget\s*$') 'tree must receive the exact captured target value'
+    Assert ($Text -match '(?im)^\s*cargo\s+metadata\s+--locked\b.*$') 'metadata must be a literal locked Cargo command using the restored environment target'
+    Assert ($Text -match '(?im)^\s*cargo\s+tree\s+--locked\b.*$') 'tree must be a literal locked Cargo command using the restored environment target'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
     Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
     foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
@@ -252,7 +267,7 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
     Assert ($Text -match '(?is)(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
     Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
-    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
+    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata\s+--locked\b', 'cargo\s+tree\s+--locked\b')) {
         Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
     }
 }
@@ -645,6 +660,10 @@ if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPo
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    Assert-NoCargoTargetDirFlags "cargo metadata --locked # --target-dir ignored`ncargo tree --locked"
+    Assert-NoCargoTargetDirFlags "`$example = 'cargo metadata --locked --target-dir ignored'`ncargo metadata --locked`ncargo tree --locked"
+    Assert-Throws { Assert-NoCargoTargetDirFlags 'cargo metadata --locked --target-dir output' } 'executed split target-dir flag must fail command-aware inspection'
+    Assert-Throws { Assert-NoCargoTargetDirFlags 'cargo tree --locked --target-dir=output' } 'executed equals target-dir flag must fail command-aware inspection'
     $externalTargetHappy = @'
 $candidateSha = $env:CANDIDATE_SHA
 $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
@@ -672,9 +691,9 @@ if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
 $outerPostScrubPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
 if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
-cargo metadata --locked --target-dir $candidateTarget
+cargo metadata --locked
 if ($LASTEXITCODE -ne 0) { throw 'metadata failed' }
-cargo tree --locked --target-dir $candidateTarget
+cargo tree --locked
 if ($LASTEXITCODE -ne 0) { throw 'tree failed' }
 $outerPostCargoPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
@@ -715,8 +734,8 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-ExternalTargetContract $disconnectedTarget } 'disconnected earlier-step target capture must not satisfy the locked Cargo block'
     $postScrubTarget = $externalTargetWorkflow.Replace($targetCapture, '').Replace('Remove-Item Env:*', "Remove-Item Env:*`n    $targetCapture")
     Assert-Throws { Assert-ExternalTargetContract $postScrubTarget } 'post-scrub target derivation must fail'
-    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('cargo metadata --locked --target-dir $candidateTarget', 'cargo metadata --locked --target-dir $outerTarget')) } 'distinct outer metadata target must fail'
-    Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace('cargo tree --locked --target-dir $candidateTarget', 'cargo tree --locked --target-dir $outerTarget')) } 'distinct outer tree target must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', 'cargo metadata --locked --target-dir $candidateTarget')) } 'split target-dir metadata flag must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo tree --locked -p chidori', 'cargo tree --locked --target-dir=$candidateTarget -p chidori')) } 'equals target-dir tree flag must fail'
     $secondNoCargoScope = $candidateCargoWorkflow.Replace("run: |`n", "run: |`n    Push-Location `$candidateWorktree`n    try { `$null = `$null } finally { Pop-Location }`n")
     Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
