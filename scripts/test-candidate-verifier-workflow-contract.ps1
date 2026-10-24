@@ -122,6 +122,22 @@ function Assert-NoCargoTargetDirFlags([string]$Text) {
     }
 }
 
+function Assert-FullUntrackedCleanGate([string]$Text, [string]$Variable, [string]$Name) {
+    $escaped = [regex]::Escape($Variable)
+    Assert ($Text -match ('(?is)' + $escaped + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $escaped + '\s*-ne\s*[''\"]{2}.*?' + $escaped)) "$Name must capture full untracked porcelain, immediately check native exit, compare empty, and report its captured output"
+}
+
+function Assert-CleanMaterializationContract([string]$Text) {
+    $worktree = [regex]::Match($Text, '(?im)^\s*git\s+worktree\s+add\s+--detach\b.*$')
+    Assert $worktree.Success 'workflow must materialize the candidate worktree before clean verification'
+    $afterWorktree = $Text.Substring($worktree.Index + $worktree.Length)
+    Assert ($afterWorktree -match '(?is)Push-Location\s+\$candidateWorktree.*?\$materializedCandidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all') 'materialized candidate worktree must be entered before its full clean gate'
+    Assert-FullUntrackedCleanGate $afterWorktree '$materializedCandidatePorcelain' 'materialized candidate worktree clean gate'
+    $gate = [regex]::Match($afterWorktree, '(?is)\$materializedCandidatePorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all.*?\$materializedCandidatePorcelain\s*-ne\s*[''\"]{2}.*?\$materializedCandidatePorcelain')
+    $beforeGate = $afterWorktree.Substring(0, $gate.Index)
+    Assert ($beforeGate -notmatch '(?i)(?:\$candidateTarget\s*=|New-Item|CreateDirectory|cargo\s+|&\s+pwsh|verify-package-candidate)') 'no target, temp/output setup, verifier, or Cargo work may precede materialized candidate clean proof'
+}
+
 function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $lockedCargoBlock = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Run locked Cargo checks in the candidate worktree[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
     Assert ($lockedCargoBlock.Count -eq 1) 'workflow must define exactly one Run locked Cargo checks YAML run block'
@@ -160,6 +176,10 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $match = $scopeMatches[0]
     Assert $match.Success 'metadata and tree must run in one balanced canonical candidate Push-Location/try/finally/Pop-Location scope'
     Assert ($match.Groups['body'].Value -notmatch '(?i)(?:Set-Location|Push-Location|Pop-Location|\bcd\b|\bsl\b|\bchdir\b)') 'candidate Cargo scope must not mutate the canonical location'
+    Assert-FullUntrackedCleanGate $match.Value '$preTargetPorcelain' 'locked-Cargo pre-target clean gate'
+    $preTargetGate = [regex]::Match($match.Value, '(?is)\$preTargetPorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all.*?\$preTargetPorcelain\s*-ne\s*[''\"]{2}.*?\$preTargetPorcelain')
+    $beforePreTargetGate = $match.Value.Substring(0, $preTargetGate.Index)
+    Assert ($beforePreTargetGate -notmatch '(?i)(?:New-Item|CreateDirectory|cargo\s+|&\s+pwsh|verify-package-candidate)') 'no target setup, verifier, or Cargo work may precede locked-Cargo pre-target clean proof'
     $scopedVerifier = '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget'
     $verifierInvocations = [regex]::Matches($Text, $scopedVerifier)
     Assert ($verifierInvocations.Count -eq 1) 'trusted verifier must run exactly once with the captured target'
@@ -512,6 +532,7 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert-TrustedVerifierIdentity $text
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
+    Assert-CleanMaterializationContract $text
     Assert-CandidateScrubAndCargoContract $text
     Assert-ExternalTargetContract $text
 }
@@ -583,6 +604,24 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
     Assert-SafeCandidateExecution $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
 
+    $materializationHappy = @'
+git worktree add --detach $candidateWorktree $candidateSha
+Push-Location $candidateWorktree
+$materializedCandidatePorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "materialized status failed: $materializedCandidatePorcelain" }
+if ($materializedCandidatePorcelain -ne '') { throw "materialized dirty: $materializedCandidatePorcelain" }
+$candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
+Pop-Location
+'@
+    Assert-CleanMaterializationContract $materializationHappy
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('git status --porcelain --untracked-files=all', 'git status --porcelain')) } 'materialization gate must require full untracked status'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('$materializedCandidatePorcelain = git status --porcelain --untracked-files=all', 'git status --porcelain --untracked-files=all | Out-Null')) } 'materialization gate must capture output'
+    $genericMaterializationFailure = $materializationHappy.Replace('throw "materialized status failed: $materializedCandidatePorcelain"', "throw 'generic status failure'").Replace('throw "materialized dirty: $materializedCandidatePorcelain"', "throw 'generic dirty failure'")
+    Assert-Throws { Assert-CleanMaterializationContract $genericMaterializationFailure } 'materialization failure must report captured porcelain'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('if ($materializedCandidatePorcelain -ne '''')', "if ('hard-coded' -ne '')")) } 'materialization gate must compare captured porcelain'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('if ($LASTEXITCODE -ne 0)', 'Write-Output masked')) } 'materialization native status failure must not be masked'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('Push-Location $candidateWorktree', '$candidateTarget = Join-Path $candidateWorktree target`nPush-Location $candidateWorktree')) } 'candidate-root setup before materialization proof must fail'
+
     $candidateCargoHappy = @'
 $candidateSha = $env:CANDIDATE_SHA
 $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
@@ -597,6 +636,9 @@ $rustupHome = $env:RUSTUP_HOME
 $approvedCandidatePaths = "Cargo.lock`ncrates/chidori-js/Cargo.toml`ncrates/chidori/Cargo.toml"
 Push-Location $candidateWorktree
 try {
+$preTargetPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }
+if ($preTargetPorcelain -ne '') { throw "pre-target dirty: $preTargetPorcelain" }
 $candidateHead = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
 $candidateStatus = git status --porcelain
@@ -660,6 +702,10 @@ if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPo
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$preTargetPorcelain = git status --porcelain --untracked-files=all', '$preTargetPorcelain = git status --porcelain')) } 'locked-Cargo pre-target gate must require full untracked status'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$preTargetPorcelain = git status --porcelain --untracked-files=all', 'git status --porcelain --untracked-files=all | Out-Null')) } 'locked-Cargo pre-target gate must capture output'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }', 'Write-Output masked')) } 'locked-Cargo pre-target native failure must not be masked'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$preTargetPorcelain = git status --porcelain --untracked-files=all', 'New-Item -ItemType Directory -Path $candidateWorktree/output`n$preTargetPorcelain = git status --porcelain --untracked-files=all')) } 'candidate-root setup before pre-target clean proof must fail'
     Assert-NoCargoTargetDirFlags "cargo metadata --locked # --target-dir ignored`ncargo tree --locked"
     Assert-NoCargoTargetDirFlags "`$example = 'cargo metadata --locked --target-dir ignored'`ncargo metadata --locked`ncargo tree --locked"
     Assert-Throws { Assert-NoCargoTargetDirFlags 'cargo metadata --locked --target-dir output' } 'executed split target-dir flag must fail command-aware inspection'
