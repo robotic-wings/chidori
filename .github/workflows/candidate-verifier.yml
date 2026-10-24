@@ -51,6 +51,7 @@ jobs:
             if ($materializedCandidateHead -ne $candidateSha) { throw "materialized HEAD mismatch: $materializedCandidateHead" }
             $materializedCandidatePorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "materialized status failed: $materializedCandidatePorcelain" }
+            $materializedCandidatePorcelain = @($materializedCandidatePorcelain) -join "`n"
             if ($materializedCandidatePorcelain -ne '') { throw "materialized dirty: $materializedCandidatePorcelain" }
             $parents = (git show -s --format=%P $candidateSha).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
             if ($parents.Count -ne 1) { throw 'candidate must have exactly one parent' }
@@ -85,15 +86,17 @@ jobs:
           try {
             $preTargetPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }
+            $preTargetPorcelain = @($preTargetPorcelain) -join "`n"
             if ($preTargetPorcelain -ne '') { throw "pre-target dirty: $preTargetPorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
             $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
+            $candidateStatus = @($candidateStatus) -join "`n"
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
             if ($candidateHead -ne $candidateSha) { throw 'candidate HEAD mismatch' }
-            if ($candidateStatus -ne '') { throw 'candidate dirty' }
+            if ($candidateStatus -ne '') { throw "candidate dirty: $candidateStatus" }
             if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
             if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
             $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -103,6 +106,7 @@ jobs:
             $targetDirectory = [IO.Directory]::CreateDirectory($candidateTargetCanonical)
             $verifierPrePorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcelain" }
+            $verifierPrePorcelain = @($verifierPrePorcelain) -join "`n"
             if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
             Remove-Item Env:*
             $env:PATH = $toolPath
@@ -115,18 +119,21 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
             $verifierPostPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+            $verifierPostPorcelain = @($verifierPostPorcelain) -join "`n"
             if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
             $outerPrePorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "outer-pre status failed: $outerPrePorcelain" }
+            $outerPrePorcelain = @($outerPrePorcelain) -join "`n"
             if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
             $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
+            $candidateStatus = @($candidateStatus) -join "`n"
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
             if ($candidateHead -ne $candidateSha) { throw 'post-scrub candidate HEAD mismatch' }
-            if ($candidateStatus -ne '') { throw 'post-scrub candidate dirty' }
+            if ($candidateStatus -ne '') { throw "post-scrub candidate dirty: $candidateStatus" }
             if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
             if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
             $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -135,6 +142,7 @@ jobs:
             if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
             $outerPostScrubPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
+            $outerPostScrubPorcelain = @($outerPostScrubPorcelain) -join "`n"
             if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
             cargo metadata --locked --format-version 1 --no-deps
             if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
@@ -142,15 +150,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
             $outerPostCargoPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
+            $outerPostCargoPorcelain = @($outerPostCargoPorcelain) -join "`n"
             if ($outerPostCargoPorcelain -ne '') { throw "outer-post-Cargo dirty: $outerPostCargoPorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
             $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+            $candidateStatus = @($candidateStatus) -join "`n"
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
             if ($candidateHead -ne $candidateSha) { throw 'post-Cargo candidate HEAD mismatch' }
-            if ($candidateStatus -ne '') { throw 'post-Cargo candidate dirty' }
+            if ($candidateStatus -ne '') { throw "post-Cargo candidate dirty: $candidateStatus" }
             if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
             if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
             $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -161,6 +171,7 @@ jobs:
             if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
             $finalPostTargetCleanupPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "final-post-target-cleanup status failed: $finalPostTargetCleanupPorcelain" }
+            $finalPostTargetCleanupPorcelain = @($finalPostTargetCleanupPorcelain) -join "`n"
             if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup dirty: $finalPostTargetCleanupPorcelain" }
           } finally {
             Pop-Location
