@@ -31,7 +31,7 @@ use crate::tools::{ToolDef, ToolParam};
 /// `<server_id>__<tool>` naming, `ToolBackend::Mcp` dispatch, and the catalog
 /// contract are identical for both, so engine/bindings/scheduler are untouched.
 pub enum McpClientHandle {
-    Stdio(Box<McpClient>),
+    Stdio(McpClient),
     Http(McpHttpClient),
 }
 
@@ -82,7 +82,7 @@ impl McpManager {
             let handle = match server.transport {
                 McpTransport::Stdio => McpClient::spawn(server.clone())
                     .await
-                    .map(|client| McpClientHandle::Stdio(Box::new(client))),
+                    .map(McpClientHandle::Stdio),
                 McpTransport::Http => McpHttpClient::connect(id, server.clone())
                     .await
                     .map(McpClientHandle::Http),

@@ -37,12 +37,12 @@ fn default_schema() -> Value {
 }
 
 pub struct McpClient {
-    stdin: Mutex<ChildStdin>,
+    stdin: Box<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Arc<Mutex<std::collections::HashMap<i64, oneshot::Sender<Value>>>>,
     tools: Vec<RemoteTool>,
     /// Holding the child keeps the process alive for the life of the client.
-    _child: Mutex<Child>,
+    _child: Box<Mutex<Child>>,
 }
 
 impl McpClient {
@@ -96,11 +96,11 @@ impl McpClient {
         });
 
         let client = Self {
-            stdin: Mutex::new(stdin),
+            stdin: Box::new(Mutex::new(stdin)),
             next_id: AtomicI64::new(1),
             pending,
             tools: Vec::new(),
-            _child: Mutex::new(child),
+            _child: Box::new(Mutex::new(child)),
         };
 
         // Handshake.
