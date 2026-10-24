@@ -77,28 +77,28 @@ function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern
 }
 
 function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name) {
-    # The inline form is retained for the dedicated worktree-creation route.
-    # A captured form is permitted only in the named materialization step, after
-    # that same run block has captured the canonical SHA and worktree variables.
-    $operations = [regex]::Matches($Text, '(?im)^\s*git\s+worktree\s+add\s+--detach\b.*$')
+    # Here-string bodies can contain command-looking documentation.  Remove them
+    # before enumerating executable command lines; ordinary quoted strings cannot
+    # satisfy the anchored command form because their line begins with a quote or
+    # an assignment rather than git.
+    $executableText = [regex]::Replace($Text, "(?ms)@'.*?^\s*'@[ \t]*$", '')
+    $executableText = [regex]::Replace($executableText, '(?ms)@".*?^\s*"@[ \t]*$', '')
+    $operations = [regex]::Matches($executableText, '(?im)^\s*git\s+worktree\s+add\s+--detach\b.*$')
     Assert ($operations.Count -eq 1) "workflow must contain exactly one executable $Name operation"
     $operation = $operations[0]
     $inline = '^\s*git\s+worktree\s+add\s+--detach\s+(?:"|'')?' + [regex]::Escape($script:CanonicalCandidateWorktree) + '(?:"|'')?\s+\$env:CANDIDATE_SHA\s*$'
     if ($operation.Value -match $inline) { return }
 
+    $blocks = [regex]::Matches($executableText, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Validate identity and materialize candidate[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
     $capturedValid = $false
-    $blocks = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Validate identity and materialize candidate[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
     foreach ($block in $blocks) {
         $run = $block.Groups['run'].Value
         $shaCapture = [regex]::Match($run, '(?im)^\s*\$candidateSha\s*=\s*\$env:CANDIDATE_SHA\s*$')
         $worktreeCapture = [regex]::Match($run, '(?im)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$')
         $capturedOperation = [regex]::Match($run, '(?im)^\s*git\s+worktree\s+add\s+--detach\s+\$candidateWorktree\s+\$candidateSha\s*$')
-        $capturedAbsoluteIndex = $block.Groups['run'].Index + $capturedOperation.Index
-        if ($shaCapture.Success -and $worktreeCapture.Success -and $capturedOperation.Success -and $capturedAbsoluteIndex -eq $operation.Index -and $shaCapture.Index -lt $capturedOperation.Index -and $worktreeCapture.Index -lt $capturedOperation.Index) {
-            $capturedValid = $true
-        }
+        if ($shaCapture.Success -and $worktreeCapture.Success -and $capturedOperation.Success -and $capturedOperation.Value -eq $operation.Value -and $shaCapture.Index -lt $capturedOperation.Index -and $worktreeCapture.Index -lt $capturedOperation.Index) { $capturedValid = $true }
     }
-    Assert $capturedValid "$Name must use exact inline canonical form or the validated captured materialization form"
+    Assert $capturedValid "$Name captured form requires preceding exact candidate SHA and canonical worktree captures in the same named materialization run block"
 }
 
 function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pattern) {
@@ -653,6 +653,20 @@ $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
 $example = 'git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA'
 '@
     Assert-Throws { Assert-CanonicalWorktreeOperation $commentedWorktree 'detached candidate worktree' } 'comments and strings must not establish canonical worktree creation'
+    $hereStringInlineWorktree = @'
+$documentation = @"
+git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+"@
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringInlineWorktree 'detached candidate worktree' } 'inline-looking here-string text must not establish worktree creation'
+    $hereStringCapturedWorktree = @'
+$documentation = @"
+git worktree add --detach $candidateWorktree $candidateSha
+"@
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringCapturedWorktree 'detached candidate worktree' } 'captured-form here-string text must not establish worktree creation'
+    $hereStringCaptureDefinitions = "- name: Validate identity and materialize candidate`n  run: |`n    `$documentation = @`"`n    `$candidateSha = `$env:CANDIDATE_SHA`n    `$candidateWorktree = Join-Path `$env:RUNNER_TEMP (`"candidate-`$candidateSha`")`n`"@`n    git worktree add --detach `$candidateWorktree `$candidateSha"
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringCaptureDefinitions 'detached candidate worktree' } 'capture-looking here-string text must not establish captured worktree provenance'
     $coexistingAlternates = @(
         'git worktree add --detach $worktreeAlias $candidateSha',
         'git worktree add --detach $env:RUNNER_TEMP/candidate-$candidateSha $candidateSha',
