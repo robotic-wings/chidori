@@ -53,34 +53,32 @@ jobs:
             Pop-Location
           }
 
-      - name: Run trusted verifier against the candidate
-        shell: pwsh
-        run: |
-          $candidateSha = $env:CANDIDATE_SHA
-          $trustedRoot = Join-Path $env:GITHUB_WORKSPACE 'trusted'
-          $trustedVerifier = Join-Path $trustedRoot 'scripts/verify-package-candidate.ps1'
-          if (-not (Test-Path -LiteralPath $trustedVerifier)) { throw 'missing trusted verifier' }
-          $toolPath = $env:PATH
-          $homePath = $env:HOME
-          $cargoHome = $env:CARGO_HOME
-          $rustupHome = $env:RUSTUP_HOME
-          Push-Location $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA; Remove-Item Env:*; $env:PATH = $toolPath; $env:HOME = $homePath; $env:CARGO_HOME = $cargoHome; $env:RUSTUP_HOME = $rustupHome; if ($trustedVerifier -notmatch 'verify-package-candidate.ps1$') { throw 'unexpected trusted verifier path' }; & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha; Pop-Location
-
       - name: Run locked Cargo checks in the candidate worktree
         shell: pwsh
         run: |
           $candidateSha = $env:CANDIDATE_SHA
           $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+          $candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
+          $candidateTargetCanonical = [IO.Path]::GetFullPath($candidateTarget)
+          $candidateWorktreeCanonical = [IO.Path]::GetFullPath($candidateWorktree)
+          $separator = [IO.Path]::DirectorySeparatorChar
+          $alternateSeparator = [IO.Path]::AltDirectorySeparatorChar
+          if ($candidateTargetCanonical -eq $candidateWorktreeCanonical) { throw 'target equals worktree' }
+          if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $separator) -or $candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $alternateSeparator)) { throw 'target inside worktree' }
+          if (Test-Path -LiteralPath $candidateTargetCanonical) { throw 'candidate target already exists' }
           $toolPath = $env:PATH
           $homePath = $env:HOME
           $cargoHome = $env:CARGO_HOME
           $rustupHome = $env:RUSTUP_HOME
+          $trustedRoot = Join-Path $env:GITHUB_WORKSPACE 'trusted'
+          $trustedVerifier = Join-Path $trustedRoot 'scripts/verify-package-candidate.ps1'
+          if (-not (Test-Path -LiteralPath $trustedVerifier)) { throw 'missing trusted verifier' }
           $approvedCandidatePaths = "Cargo.lock`ncrates/chidori-js/Cargo.toml`ncrates/chidori/Cargo.toml"
           Push-Location $candidateWorktree
           try {
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
-            $candidateStatus = git status --porcelain
+            $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
@@ -92,14 +90,28 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'candidate path evidence failed' }
             $candidatePathText = ($candidatePaths -join "`n")
             if ($candidatePathText -ne $approvedCandidatePaths) { throw 'candidate path scope failed' }
+            $targetDirectory = [IO.Directory]::CreateDirectory($candidateTargetCanonical)
+            $verifierPrePorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcelain" }
+            if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
             Remove-Item Env:*
             $env:PATH = $toolPath
             $env:HOME = $homePath
             $env:CARGO_HOME = $cargoHome
             $env:RUSTUP_HOME = $rustupHome
+            $env:CARGO_TARGET_DIR = $candidateTarget
+            if ($trustedVerifier -notmatch 'verify-package-candidate.ps1$') { throw 'unexpected trusted verifier path' }
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+            if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
+            $verifierPostPorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+            if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
+            $outerPrePorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "outer-pre status failed: $outerPrePorcelain" }
+            if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
-            $candidateStatus = git status --porcelain
+            $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
@@ -111,13 +123,19 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate path evidence failed' }
             $candidatePathText = ($candidatePaths -join "`n")
             if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-scrub candidate path scope failed' }
+            $outerPostScrubPorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
+            if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
             cargo metadata --locked --format-version 1 --no-deps
             if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
             cargo tree --locked -p chidori
             if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+            $outerPostCargoPorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
+            if ($outerPostCargoPorcelain -ne '') { throw "outer-post-Cargo dirty: $outerPostCargoPorcelain" }
             $candidateHead = git rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
-            $candidateStatus = git status --porcelain
+            $candidateStatus = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
             $parents = (git show -s --format=%P $candidateSha).Split(' ')
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
@@ -129,6 +147,11 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate path evidence failed' }
             $candidatePathText = ($candidatePaths -join "`n")
             if ($candidatePathText -ne $approvedCandidatePaths) { throw 'post-Cargo candidate path scope failed' }
+            Remove-Item -LiteralPath $candidateTarget -Recurse -Force
+            if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
+            $finalPostTargetCleanupPorcelain = git status --porcelain --untracked-files=all
+            if ($LASTEXITCODE -ne 0) { throw "final-post-target-cleanup status failed: $finalPostTargetCleanupPorcelain" }
+            if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup dirty: $finalPostTargetCleanupPorcelain" }
           } finally {
             Pop-Location
           }
