@@ -214,6 +214,9 @@ fn relay_sandbox_notes(sandbox: &super::sandbox::SandboxOutcome) {
     if (env_truthy("CHIDORI_VERBOSE") || env_truthy("CHIDORI_ISOLATE_VERBOSE"))
         && !env_truthy("CHIDORI_ISOLATE_SANDBOX_NOTES_QUIET")
     {
+        for layer in sandbox.active_layers() {
+            eprintln!("isolate worker: sandbox: {layer}");
+        }
         for note in &sandbox.notes {
             eprintln!("isolate worker: sandbox: {note}");
         }
