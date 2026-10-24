@@ -140,7 +140,16 @@ function Assert-NoCargoTargetDirFlags([string]$Text) {
 
 function Assert-FullUntrackedCleanGate([string]$Text, [string]$Variable, [string]$Name) {
     $escaped = [regex]::Escape($Variable)
-    Assert ($Text -match ('(?is)' + $escaped + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $escaped + '\s*-ne\s*[''\"]{2}.*?' + $escaped)) "$Name must capture full untracked porcelain, immediately check native exit, compare empty, and report its captured output"
+    $normalization = $escaped + '\s*=\s*@\(' + $escaped + '\)\s*-join\s+["'']`n["'']'
+    Assert ($Text -match ('(?is)' + $escaped + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?\}\s*\r?\n\s*' + $normalization + '\s*\r?\n\s*if\s*\(\s*' + $escaped + '\s*-ne\s*[''\"]{2}\s*\)\s*\{\s*throw.*?' + $escaped)) "$Name must capture full untracked porcelain, immediately check native exit, normalize to an ordered scalar, compare empty, and report that normalized scalar"
+}
+
+function Assert-NormalizedCandidateStatus([string]$Text, [string]$Prefix, [string]$Suffix, [string]$Name) {
+    $normalized = '\$candidateStatus\s*=\s*@\(\$candidateStatus\)\s*-join\s+["'']`n["'']'
+    $slice = [regex]::Match($Text, $Prefix + '(?<phase>.*?)' + $Suffix)
+    Assert $slice.Success "$Name phase must have a bounded candidate-status evidence slice"
+    $chain = '(?is)\$candidateStatus\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw[^\r\n}]*\}\s*\r?\n\s*' + $normalized + '.*?if\s*\(\s*\$candidateStatus\s*-ne\s*[''\"]{2}\s*\)\s*\{\s*throw[^\r\n}]*\$candidateStatus[^\r\n}]*\}'
+    Assert ($slice.Groups['phase'].Value -match $chain) "$Name candidate status must immediately exit-check, normalize with the exact newline scalar, compare, and report its captured scalar inside its own phase"
 }
 
 function Assert-CleanMaterializationContract([string]$Text) {
@@ -254,12 +263,13 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     Assert ($Text -notmatch '(?is)\$candidatePaths\s*-ne\s*\$approvedCandidatePaths') 'locked Cargo block must not compare a raw path array to an approved scalar'
     Assert ($Text -notmatch '(?i)\$candidatePaths.{0,100}(?:Sort-Object|\|\s*sort)') 'locked Cargo block must preserve captured path ordering without sorting'
 
-    $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha', 'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha')
+    $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain\s+--untracked-files=all', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha', 'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha')
     foreach ($phase in @(
         @{ Name = 'pre-scrub'; Prefix = '(?is)\$candidateWorktree\s*=.*?'; Suffix = 'Remove-Item\s+Env:\*' },
         @{ Name = 'post-scrub/pre-Cargo'; Prefix = '(?is)\$verifierPostPorcelain.*?'; Suffix = 'cargo\s+metadata\s+--locked' },
         @{ Name = 'post-Cargo'; Prefix = '(?is)cargo\s+tree\s+--locked.*?'; Suffix = '\}\s*finally\s*\{\s*Pop-Location' }
     )) {
+        Assert-NormalizedCandidateStatus $Text $phase.Prefix $phase.Suffix $phase.Name
         foreach ($command in $phaseCommands) {
             $bound = $phase.Prefix + '(?:\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*\(?)?' + $command + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $phase.Suffix
             Assert ($Text -match $bound) "$($phase.Name) phase must bind [$command] with an immediately adjacent LASTEXITCODE throw"
@@ -305,7 +315,7 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)(?:&\s+pwsh|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must follow verifier and Cargo use'
     foreach ($phase in @('verifierPre', 'verifierPost', 'outerPre', 'outerPostScrub', 'outerPostCargo', 'finalPostTargetCleanup')) {
         $variable = '$' + $phase + 'Porcelain'
-        Assert ($Text -match ('(?is)' + [regex]::Escape($variable) + '\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\).*?' + [regex]::Escape($variable) + '\s*-ne\s*[''\"]{2}.*?' + [regex]::Escape($variable))) "named full porcelain block [$phase] must capture, immediately exit-check, compare, and report its own output"
+        Assert-FullUntrackedCleanGate $Text $variable "named full porcelain block [$phase]"
     }
     Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
     Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
@@ -689,6 +699,7 @@ if ($LASTEXITCODE -ne 0) { throw "materialized HEAD failed: $materializedCandida
 if ($materializedCandidateHead -ne $candidateSha) { throw "materialized HEAD mismatch: $materializedCandidateHead" }
 $materializedCandidatePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "materialized status failed: $materializedCandidatePorcelain" }
+$materializedCandidatePorcelain = @($materializedCandidatePorcelain) -join "`n"
 if ($materializedCandidatePorcelain -ne '') { throw "materialized dirty: $materializedCandidatePorcelain" }
 $candidateTarget = Join-Path $env:RUNNER_TEMP "candidate-target-$candidateSha"
 Pop-Location
@@ -700,6 +711,8 @@ Pop-Location
     $genericMaterializationFailure = $materializationHappy.Replace('throw "materialized status failed: $materializedCandidatePorcelain"', "throw 'generic status failure'").Replace('throw "materialized dirty: $materializedCandidatePorcelain"', "throw 'generic dirty failure'")
     Assert-Throws { Assert-CleanMaterializationContract $genericMaterializationFailure } 'materialization failure must report captured porcelain'
     Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('if ($materializedCandidatePorcelain -ne '''')', "if ('hard-coded' -ne '')")) } 'materialization gate must compare captured porcelain'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('$materializedCandidatePorcelain = @($materializedCandidatePorcelain) -join "`n"', '$materializedCandidatePorcelain = $null')) } 'materialization gate must reject raw null-versus-empty porcelain comparison'
+    Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('$materializedCandidatePorcelain = @($materializedCandidatePorcelain) -join "`n"', '$materializedCandidatePorcelain = $materializedCandidatePorcelain')) } 'materialization gate must reject non-normalized porcelain arrays'
     Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('if ($LASTEXITCODE -ne 0)', 'Write-Output masked')) } 'materialization native status failure must not be masked'
     Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('Push-Location $candidateWorktree', '$candidateTarget = Join-Path $candidateWorktree target`nPush-Location $candidateWorktree')) } 'candidate-root setup before materialization proof must fail'
     Assert-Throws { Assert-CleanMaterializationContract ($materializationHappy.Replace('$materializedCandidatePorcelain = git status --porcelain --untracked-files=all', "Set-Content -LiteralPath (Join-Path `$candidateWorktree 'residue') -Value residue`n`$materializedCandidatePorcelain = git status --porcelain --untracked-files=all")) } 'candidate writes before materialization clean proof must fail'
@@ -723,15 +736,17 @@ Push-Location $candidateWorktree
 try {
 $preTargetPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }
+$preTargetPorcelain = @($preTargetPorcelain) -join "`n"
 if ($preTargetPorcelain -ne '') { throw "pre-target dirty: $preTargetPorcelain" }
 $candidateHead = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }
-$candidateStatus = git status --porcelain
+$candidateStatus = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }
+$candidateStatus = @($candidateStatus) -join "`n"
 $parents = (git show -s --format=%P $candidateSha).Split(' ')
 if ($LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }
 if ($candidateHead -ne $candidateSha) { throw 'candidate HEAD mismatch' }
-if ($candidateStatus -ne '') { throw 'candidate dirty' }
+if ($candidateStatus -ne '') { throw "candidate dirty: $candidateStatus" }
 if ($parents.Count -ne 1) { throw 'candidate parent count failed' }
 if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'candidate base failed' }
 $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -751,12 +766,13 @@ if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorc
 if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
     $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
-    $candidateStatus = git status --porcelain
+    $candidateStatus = git status --porcelain --untracked-files=all
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }
+    $candidateStatus = @($candidateStatus) -join "`n"
     $parents = (git show -s --format=%P $candidateSha).Split(' ')
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }
     if ($candidateHead -ne $candidateSha) { throw 'post-scrub candidate HEAD mismatch' }
-    if ($candidateStatus -ne '') { throw 'post-scrub candidate dirty' }
+    if ($candidateStatus -ne '') { throw "post-scrub candidate dirty: $candidateStatus" }
     if ($parents.Count -ne 1) { throw 'post-scrub candidate parent count failed' }
     if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-scrub candidate base failed' }
     $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -769,12 +785,13 @@ if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPo
     if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
     $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate HEAD evidence failed' }
-    $candidateStatus = git status --porcelain
+    $candidateStatus = git status --porcelain --untracked-files=all
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }
+    $candidateStatus = @($candidateStatus) -join "`n"
     $parents = (git show -s --format=%P $candidateSha).Split(' ')
     if ($LASTEXITCODE -ne 0) { throw 'post-Cargo candidate parent evidence failed' }
     if ($candidateHead -ne $candidateSha) { throw 'post-Cargo candidate HEAD mismatch' }
-    if ($candidateStatus -ne '') { throw 'post-Cargo candidate dirty' }
+    if ($candidateStatus -ne '') { throw "post-Cargo candidate dirty: $candidateStatus" }
     if ($parents.Count -ne 1) { throw 'post-Cargo candidate parent count failed' }
     if ($parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw 'post-Cargo candidate base failed' }
     $candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha
@@ -795,6 +812,7 @@ if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPo
     Assert-Throws { Assert-CandidateScrubAndCargoContract $genericPreTargetFailure } 'locked-Cargo pre-target failure must report captured porcelain'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($preTargetPorcelain -ne '''')', "if ('hard-coded' -ne '')")) } 'locked-Cargo pre-target gate must compare captured porcelain'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($preTargetPorcelain -ne '''')', "if (`$true) { throw 'dirty' }")) } 'locked-Cargo pre-target gate must use captured porcelain'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidateStatus = @($candidateStatus) -join "`n"', '$candidateStatus = $candidateStatus')) } 'phase-local candidate statuses must not retain raw array/null output instead of scalar normalization'
     Assert-NoCargoTargetDirFlags "cargo metadata --locked # --target-dir ignored`ncargo tree --locked"
     Assert-NoCargoTargetDirFlags "`$example = 'cargo metadata --locked --target-dir ignored'`ncargo metadata --locked`ncargo tree --locked"
     Assert-Throws { Assert-NoCargoTargetDirFlags 'cargo metadata --locked --target-dir output' } 'executed split target-dir flag must fail command-aware inspection'
@@ -812,6 +830,7 @@ if ($candidateTargetCanonical.StartsWith($candidateWorktreeCanonical + $separato
 $targetDirectory = [IO.Directory]::CreateDirectory($candidateTargetCanonical)
 $verifierPrePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "verifier-pre status failed: $verifierPrePorcelain" }
+$verifierPrePorcelain = @($verifierPrePorcelain) -join "`n"
 if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
 Remove-Item Env:*
 $env:CARGO_TARGET_DIR = $candidateTarget
@@ -819,12 +838,15 @@ $env:CARGO_TARGET_DIR = $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
 $verifierPostPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+$verifierPostPorcelain = @($verifierPostPorcelain) -join "`n"
 if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
 $outerPrePorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "outer-pre status failed: $outerPrePorcelain" }
+$outerPrePorcelain = @($outerPrePorcelain) -join "`n"
 if ($outerPrePorcelain -ne '') { throw "outer-pre dirty: $outerPrePorcelain" }
 $outerPostScrubPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "outer-post-scrub status failed: $outerPostScrubPorcelain" }
+$outerPostScrubPorcelain = @($outerPostScrubPorcelain) -join "`n"
 if ($outerPostScrubPorcelain -ne '') { throw "outer-post-scrub dirty: $outerPostScrubPorcelain" }
 cargo metadata --locked
 if ($LASTEXITCODE -ne 0) { throw 'metadata failed' }
@@ -832,11 +854,13 @@ cargo tree --locked
 if ($LASTEXITCODE -ne 0) { throw 'tree failed' }
 $outerPostCargoPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "outer-post-Cargo status failed: $outerPostCargoPorcelain" }
+$outerPostCargoPorcelain = @($outerPostCargoPorcelain) -join "`n"
 if ($outerPostCargoPorcelain -ne '') { throw "outer-post-Cargo dirty: $outerPostCargoPorcelain" }
 Remove-Item -LiteralPath $candidateTarget -Recurse -Force
 if (Test-Path -LiteralPath $candidateTarget) { throw 'target cleanup failed' }
 $finalPostTargetCleanupPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "final-post-target-cleanup status failed: $finalPostTargetCleanupPorcelain" }
+$finalPostTargetCleanupPorcelain = @($finalPostTargetCleanupPorcelain) -join "`n"
 if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup dirty: $finalPostTargetCleanupPorcelain" }
 '@
     $externalTargetWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($externalTargetHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
@@ -850,6 +874,9 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
         $genericStatus = $externalTargetWorkflow.Replace(('throw "' + $label + ' status failed: ' + $variable + '"'), "throw 'generic status failure'").Replace(('throw "' + $label + ' dirty: ' + $variable + '"'), "throw 'generic dirty failure'")
         Assert-Throws { Assert-ExternalTargetContract $genericStatus } "[$phase] generic status evidence must fail"
         Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace("if ($variable -ne '')", "if ('hard-coded' -ne '')")) } "[$phase] hard-coded status comparison must fail"
+        $normalizationLine = $variable + ' = @(' + $variable + ') -join "`n"'
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace($normalizationLine, '$null = $null')) } "[$phase] missing scalar normalization must fail"
+        Assert-Throws { Assert-ExternalTargetContract ($externalTargetWorkflow.Replace($normalizationLine, "$variable = $variable")) } "[$phase] raw array status must not substitute for scalar normalization"
         $maskedStatus = $externalTargetWorkflow.Replace(('if ($LASTEXITCODE -ne 0) { throw "' + $label + ' status failed: ' + $variable + '" }'), "Write-Output 'later success masks status failure'")
         Assert-Throws { Assert-ExternalTargetContract $maskedStatus } "[$phase] delayed or masked status exit evidence must fail"
         $phaseBlock = [regex]::Match($externalTargetWorkflow, '(?ms)^[ \t]*\$' + $phase + 'Porcelain\s*=.*?^[ \t]*if \(\$' + $phase + 'Porcelain\s*-ne\s*''''\) \{.*?\}').Value
@@ -875,7 +902,7 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-CandidateScrubAndCargoContract $secondNoCargoScope } 'second no-Cargo candidate scope must fail'
     foreach ($prePushEvidence in @(
         '$candidateHead = git rev-parse HEAD',
-        '$candidateStatus = git status --porcelain',
+        '$candidateStatus = git status --porcelain --untracked-files=all',
         '$parents = (git show -s --format=%P $candidateSha).Split('' '')',
         '$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c $candidateSha'
     )) {
@@ -887,6 +914,12 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Remove-Item Env:*', 'Pop-Location`nRemove-Item Env:*')) } 'split candidate scopes must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate HEAD evidence failed' }", 'Pop-Location')) } 'Pop-Location must not mask pre-scrub native failure'
     $approvedPathLines = @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml')
+    $zeroPorcelain = @($null) -join "`n"
+    $onePorcelain = @('?? residue') -join "`n"
+    $multiplePorcelain = @('?? residue-a', '?? residue-b') -join "`n"
+    Assert ($zeroPorcelain -ceq '') 'zero native porcelain lines must normalize to the exact empty scalar'
+    Assert ($onePorcelain -ne '' -and $onePorcelain -match 'residue') 'one native porcelain record must remain nonempty and reportable after scalar normalization'
+    Assert ($multiplePorcelain -eq "?? residue-a`n?? residue-b") 'multiple native porcelain records must preserve order in the reportable scalar'
     $approvedPathText = ($approvedPathLines -join "`n")
     Assert ((@('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml') -join "`n") -eq $approvedPathText) 'ordered approved candidate paths must normalize to the expected scalar'
     foreach ($badPaths in @(@('crates/chidori-js/Cargo.toml', 'Cargo.lock', 'crates/chidori/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml'), @('Cargo.lock', 'crates/chidori-js/Cargo.toml', 'crates/chidori/Cargo.toml', 'extra'))) {
@@ -927,10 +960,34 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText -ne $approvedCandidatePaths', '$true')) } 'unused normalized path scalar must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$candidatePathText = ($candidatePaths -join "`n")', '$candidatePathText = (($candidatePaths | Sort-Object) -join "`n")')) } 'sorted path normalization must fail'
     foreach ($phase in @('post-scrub', 'post-Cargo')) {
-        foreach ($comparison in @("if (`$candidateHead -ne `$candidateSha) { throw '$phase candidate HEAD mismatch' }", "if (`$candidateStatus -ne '') { throw '$phase candidate dirty' }", "if (`$parents.Count -ne 1) { throw '$phase candidate parent count failed' }", "if (`$parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw '$phase candidate base failed' }", "if (`$candidatePathText -ne `$approvedCandidatePaths) { throw '$phase candidate path scope failed' }")) {
+        foreach ($comparison in @("if (`$candidateHead -ne `$candidateSha) { throw '$phase candidate HEAD mismatch' }", "if (`$candidateStatus -ne '') { throw `"$phase candidate dirty: `$candidateStatus`" }", "if (`$parents.Count -ne 1) { throw '$phase candidate parent count failed' }", "if (`$parents[0] -ne '9e1c295b1f3f90ef342021ec81b52ece7363cd6c') { throw '$phase candidate base failed' }", "if (`$candidatePathText -ne `$approvedCandidatePaths) { throw '$phase candidate path scope failed' }")) {
             Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, 'Write-Host removed')) } "$phase phase must reject a removed evidence comparison"
             Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($comparison, "if (`$true) { throw 'hard-coded' }")) } "$phase phase must reject a hard-coded evidence comparison"
         }
+    }
+    foreach ($statusPhase in @(
+        @{ Name = 'pre-scrub'; Comparison = 'if ($candidateStatus -ne '''') { throw "candidate dirty: $candidateStatus" }'; Failure = 'throw "candidate dirty: $candidateStatus"' },
+        @{ Name = 'post-scrub'; Comparison = 'if ($candidateStatus -ne '''') { throw "post-scrub candidate dirty: $candidateStatus" }'; Failure = 'throw "post-scrub candidate dirty: $candidateStatus"' },
+        @{ Name = 'post-Cargo'; Comparison = 'if ($candidateStatus -ne '''') { throw "post-Cargo candidate dirty: $candidateStatus" }'; Failure = 'throw "post-Cargo candidate dirty: $candidateStatus"' }
+    )) {
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Failure, "throw 'generic status failure'")) } "$($statusPhase.Name) candidate status failure must report its normalized scalar"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Comparison, "if ('hard-coded' -ne '') { throw 'hard-coded status' }")) } "$($statusPhase.Name) candidate status must not use a hard-coded comparison"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusPhase.Comparison, "if (`$true) { throw 'unused status' }")) } "$($statusPhase.Name) candidate status scalar must not be unused"
+    }
+    foreach ($statusLocation in @(
+        @{ Name = 'pre-scrub'; Capture = '$candidateStatus = git status --porcelain --untracked-files=all'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'candidate status evidence failed' }" },
+        @{ Name = 'post-scrub'; Capture = '    $candidateStatus = git status --porcelain --untracked-files=all'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate status evidence failed' }" },
+        @{ Name = 'post-Cargo'; Capture = '    $candidateStatus = git status --porcelain --untracked-files=all'; Guard = "if (`$LASTEXITCODE -ne 0) { throw 'post-Cargo candidate status evidence failed' }" }
+    )) {
+        $guardIndex = $candidateCargoWorkflow.IndexOf($statusLocation.Guard, [System.StringComparison]::Ordinal)
+        Assert ($guardIndex -ge 0) "$($statusLocation.Name) fixture must contain its exact candidate-status exit guard"
+        $phaseIndex = $candidateCargoWorkflow.LastIndexOf($statusLocation.Capture, $guardIndex, [System.StringComparison]::Ordinal)
+        Assert ($phaseIndex -ge 0) "$($statusLocation.Name) fixture must contain its exact full-untracked candidate-status command before its own exit guard"
+        $defaultModeWorkflow = $candidateCargoWorkflow.Substring(0, $phaseIndex) + $statusLocation.Capture.Replace(' --untracked-files=all', '') + $candidateCargoWorkflow.Substring($phaseIndex + $statusLocation.Capture.Length)
+        Assert-Throws { Assert-CandidateScrubAndCargoContract $defaultModeWorkflow } "$($statusLocation.Name) candidate status must capture full untracked porcelain"
+        $relocated = $candidateCargoWorkflow.Replace($statusLocation.Capture, '$relocatedCandidateStatus = git status --porcelain --untracked-files=all') + "`n    `$candidateStatus = git status --porcelain --untracked-files=all`n    if (`$LASTEXITCODE -ne 0) { throw 'relocated status failed' }`n    `$candidateStatus = @(`$candidateStatus) -join `"`n`"`n    if (`$candidateStatus -ne '') { throw `"relocated dirty: `$candidateStatus`" }"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract $relocated } "$($statusLocation.Name) candidate status relocated outside its phase must not satisfy that phase"
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($statusLocation.Guard, "Write-Output 'later success masks status failure'")) } "$($statusLocation.Name) candidate status requires an immediate native exit guard inside its own phase"
     }
     $bleed = $candidateCargoWorkflow.Replace('$candidatePaths = git diff', '# removed path capture`n$null = git diff') + "`n  - uses: actions/checkout@v7`n    run: |`n      `$candidatePaths = git diff --name-only 9e1c295b1f3f90ef342021ec81b52ece7363cd6c `$candidateSha"
     Assert-Throws { Assert-CandidateScrubAndCargoContract $bleed } 'unnamed sibling step must not bleed evidence into locked Cargo block'
