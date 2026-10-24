@@ -115,7 +115,7 @@ jobs:
             $env:RUSTUP_HOME = $rustupHome
             $env:CARGO_TARGET_DIR = $candidateTarget
             if ($trustedVerifier -notmatch 'verify-package-candidate.ps1$') { throw 'unexpected trusted verifier path' }
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target $candidateTarget
             if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
             $verifierPostPorcelain = git status --porcelain --untracked-files=all
             if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
