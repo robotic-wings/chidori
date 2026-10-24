@@ -267,7 +267,7 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
     Assert ($Text -match '(?is)(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
     Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
-    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata.*?\$candidateTarget', 'cargo\s+tree.*?\$candidateTarget')) {
+    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata\s+--locked\b', 'cargo\s+tree\s+--locked\b')) {
         Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
     }
 }
