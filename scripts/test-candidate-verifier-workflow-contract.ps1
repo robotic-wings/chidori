@@ -152,6 +152,19 @@ function Assert-NormalizedCandidateStatus([string]$Text, [string]$Prefix, [strin
     Assert ($slice.Groups['phase'].Value -match $chain) "$Name candidate status must immediately exit-check, normalize with the exact newline scalar, compare, and report its captured scalar inside its own phase"
 }
 
+function Get-SecuredTrustedVerifierInvocation([string]$Text) {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    Assert ($errors.Count -eq 0) 'secured trusted-verifier invocation analysis requires parseable PowerShell'
+    $commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'pwsh' }, $true))
+    Assert ($commands.Count -eq 1) 'trusted verifier must have exactly one executable pwsh invocation'
+    $command = $commands[0]
+    $exact = '^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget\s*$'
+    Assert ($command.Extent.Text -match $exact) 'trusted verifier must use exact secured pwsh flags, trusted verifier, Candidate candidateSha, then Target candidateTarget binding'
+    return $command
+}
+
 function Assert-CleanMaterializationContract([string]$Text) {
     $blocks = [regex]::Matches($Text, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Validate identity and materialize candidate[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
     Assert ($blocks.Count -eq 1) 'workflow must define exactly one Validate identity and materialize candidate YAML run block'
@@ -213,9 +226,10 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $preTargetGate = [regex]::Match($match.Value, '(?is)\$preTargetPorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all.*?\$preTargetPorcelain\s*-ne\s*[''\"]{2}.*?\$preTargetPorcelain')
     $beforePreTargetGate = $match.Value.Substring(0, $preTargetGate.Index)
     Assert ($beforePreTargetGate -notmatch '(?i)(?:\$candidateTarget\s*=|Set-Content|Add-Content|Out-File|Copy-Item|Move-Item|New-Item|CreateDirectory|Remove-Item|\[IO\.File\]::(?:Write|Create|Append)|cargo\s+|&\s+pwsh|verify-package-candidate)') 'no candidate-mutating setup, target creation, verifier, or Cargo work may precede locked-Cargo pre-target clean proof'
-    $scopedVerifier = '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget'
+    $scopedVerifier = '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget'
+    $securedVerifierCommand = Get-SecuredTrustedVerifierInvocation $Text
     $verifierInvocations = [regex]::Matches($Text, $scopedVerifier)
-    Assert ($verifierInvocations.Count -eq 1) 'trusted verifier must run exactly once with the captured target'
+    Assert ($verifierInvocations.Count -eq 1) 'trusted verifier must run exactly once with the captured Candidate and target'
     Assert ($verifierInvocations[0].Index -ge $match.Index -and ($verifierInvocations[0].Index + $verifierInvocations[0].Length) -le ($match.Index + $match.Length)) 'trusted verifier must run inside the sole canonical candidate scope'
     Assert ($match.Value -match ('(?is)Remove-Item\s+Env:\*.*?' + $cargoTargetRestore + '.*?' + $scopedVerifier + '.*?cargo\s+metadata\s+--locked')) 'trusted verifier must follow scrub and exact CARGO_TARGET_DIR restore before Cargo'
     $verifierPost = '\$verifierPostPorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?\$verifierPostPorcelain\s*-ne\s*[''\"]{2}.*?\$verifierPostPorcelain'
@@ -305,10 +319,11 @@ function Assert-ExternalTargetContract([string]$Text) {
     Assert ($Text -match '(?is)\$candidateTargetCanonical.*?(?:StartsWith|like).*?(?:\$separator|\$alternateSeparator|DirectorySeparatorChar|AltDirectorySeparatorChar)') 'candidate target boundary must reject only separator-bound descendants while allowing siblings'
     Assert ($Text -notmatch '(?i)git\s+clean') 'cleanup must not broadly clean candidate state'
     Assert ($Text -match '(?is)Remove-Item\s+-LiteralPath\s+\$candidateTarget.{0,500}Test-Path\s+-LiteralPath\s+\$candidateTarget') 'external target cleanup must be narrow and prove post-clean absence'
-    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget') 'scrubbed verifier must receive exactly captured external target through the trusted pwsh invocation'
+    $null = Get-SecuredTrustedVerifierInvocation $Text
+    Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget') 'scrubbed verifier must receive exactly captured Candidate and external target through the trusted pwsh invocation'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget.*?cargo\s+metadata\s+--locked') 'scrubbed metadata must receive the captured external target through CARGO_TARGET_DIR'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget.*?cargo\s+tree\s+--locked') 'scrubbed tree must receive the captured external target through CARGO_TARGET_DIR'
-    Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive the exact captured target value through the required pwsh invocation'
+    Assert ($Text -match '(?im)^\s*&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget\s*$') 'trusted verifier must receive exact captured Candidate and Target values through the required pwsh invocation'
     Assert ($Text -match '(?im)^\s*cargo\s+metadata\s+--locked\b.*$') 'metadata must be a literal locked Cargo command using the restored environment target'
     Assert ($Text -match '(?im)^\s*cargo\s+tree\s+--locked\b.*$') 'tree must be a literal locked Cargo command using the restored environment target'
     Assert ($Text -match '(?is)Remove-Item\s+Env:\*.*?\$env:CARGO_TARGET_DIR\s*=\s*\$candidateTarget') 'scrubbed execution must restore captured CARGO_TARGET_DIR'
@@ -317,11 +332,11 @@ function Assert-ExternalTargetContract([string]$Text) {
         $variable = '$' + $phase + 'Porcelain'
         Assert-FullUntrackedCleanGate $Text $variable "named full porcelain block [$phase]"
     }
-    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
+    Assert ($Text -match '(?is)\$verifierPrePorcelain.*?Remove-Item\s+Env:\*.*?&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget.*?\$verifierPostPorcelain.*?\$outerPrePorcelain.*?\$outerPostScrubPorcelain.*?cargo\s+metadata.*?cargo\s+tree.*?\$outerPostCargoPorcelain.*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?\$finalPostTargetCleanupPorcelain') 'named porcelain phase blocks must remain ordered around verifier, scrub, Cargo, and cleanup'
     Assert ($Text -match '(?is)(?:New-Item|CreateDirectory).*?\$candidateTarget.*?(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+metadata)') 'verified external target directory must be created before use'
     Assert ($Text -match '(?is)(?:&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass|cargo\s+tree).*?Remove-Item\s+-LiteralPath\s+\$candidateTarget\s+-Recurse\s+-Force.*?Test-Path\s+-LiteralPath\s+\$candidateTarget.*?\$finalPostTargetCleanupPorcelain') 'nonempty external target cleanup must be narrow, post-use, proved absent, and followed by final clean evidence'
     Assert ($Text -notmatch '(?i)(?:Remove-Item\s+-LiteralPath\s+(?:\*|\$candidateWorktree)|git\s+clean)') 'cleanup must not use wildcard, candidate-root deletion, or git clean'
-    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Target\s+\$candidateTarget', 'cargo\s+metadata\s+--locked\b', 'cargo\s+tree\s+--locked\b')) {
+    foreach ($operation in @('&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\s+-Candidate\s+\$candidateSha\s+-Target\s+\$candidateTarget', 'cargo\s+metadata\s+--locked\b', 'cargo\s+tree\s+--locked\b')) {
         Assert ($Text -match ('(?is)' + $operation + '.*?\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) "external target operation [$operation] requires an immediate native exit guard"
     }
 }
@@ -759,7 +774,7 @@ $env:HOME = $homePath
 $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
 $env:CARGO_TARGET_DIR = $candidateTarget
-& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'trusted verifier failed' }
 $verifierPostPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
@@ -804,6 +819,26 @@ if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPo
 '@
     $candidateCargoWorkflow = "- name: Run locked Cargo checks in the candidate worktree`n  run: |`n" + (($candidateCargoHappy -split "`n" | ForEach-Object { '    ' + $_ }) -join "`n")
     Assert-CandidateScrubAndCargoContract $candidateCargoWorkflow
+    $securedVerifierInvocation = '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target $candidateTarget'
+    foreach ($badInvocation in @(
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget -Candidate $candidateSha',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier $candidateSha $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate ''hard-coded'' -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $env:CANDIDATE_SHA -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateAlias -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateWorktree -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target (Join-Path $candidateTarget ''derived'')',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Candidate $candidateSha -Target $candidateTarget',
+        '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target $candidateTarget -Target $candidateTarget'
+    )) {
+        Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($securedVerifierInvocation, $badInvocation)) } "secured verifier invocation escape [$badInvocation] must fail"
+    }
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', $securedVerifierInvocation + "`nPush-Location `$candidateWorktree")) } 'secured verifier invocation outside the canonical candidate scope must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace($securedVerifierInvocation, $securedVerifierInvocation + "`n" + $securedVerifierInvocation)) } 'duplicate secured verifier invocation must fail'
+    Assert-Throws { Get-SecuredTrustedVerifierInvocation "# $securedVerifierInvocation" } 'comment-only verifier invocation text must remain inert'
+    Assert-Throws { Get-SecuredTrustedVerifierInvocation "`$documentation = '$securedVerifierInvocation'" } 'string-only verifier invocation text must remain inert'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$preTargetPorcelain = git status --porcelain --untracked-files=all', '$preTargetPorcelain = git status --porcelain')) } 'locked-Cargo pre-target gate must require full untracked status'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$preTargetPorcelain = git status --porcelain --untracked-files=all', 'git status --porcelain --untracked-files=all | Out-Null')) } 'locked-Cargo pre-target gate must capture output'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw "pre-target status failed: $preTargetPorcelain" }', 'Write-Output masked')) } 'locked-Cargo pre-target native failure must not be masked'
@@ -834,7 +869,7 @@ $verifierPrePorcelain = @($verifierPrePorcelain) -join "`n"
 if ($verifierPrePorcelain -ne '') { throw "verifier-pre dirty: $verifierPrePorcelain" }
 Remove-Item Env:*
 $env:CARGO_TARGET_DIR = $candidateTarget
-& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
+& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Candidate $candidateSha -Target $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'verifier failed' }
 $verifierPostPorcelain = git status --porcelain --untracked-files=all
 if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
