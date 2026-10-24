@@ -151,6 +151,13 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     Assert ($verifierInvocations.Count -eq 1) 'trusted verifier must run exactly once with the captured target'
     Assert ($verifierInvocations[0].Index -ge $match.Index -and ($verifierInvocations[0].Index + $verifierInvocations[0].Length) -le ($match.Index + $match.Length)) 'trusted verifier must run inside the sole canonical candidate scope'
     Assert ($match.Value -match ('(?is)Remove-Item\s+Env:\*.*?' + $cargoTargetRestore + '.*?' + $scopedVerifier + '.*?cargo\s+metadata\s+--locked')) 'trusted verifier must follow scrub and exact CARGO_TARGET_DIR restore before Cargo'
+    $verifierPost = '\$verifierPostPorcelain\s*=\s*git\s+status\s+--porcelain\s+--untracked-files=all\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?\$verifierPostPorcelain\s*-ne\s*[''\"]{2}.*?\$verifierPostPorcelain'
+    Assert ($match.Value -match ('(?is)' + $scopedVerifier + '.*?' + $verifierPost + '.*?cargo\s+metadata\s+--locked')) 'verifier-post full porcelain evidence must follow verifier and precede Cargo'
+    $literalMetadata = '(?im)^\s*cargo\s+metadata\s+--locked\b.*$'
+    $literalTree = '(?im)^\s*cargo\s+tree\s+--locked\b.*$'
+    Assert ([regex]::Matches($match.Value, $literalMetadata).Count -eq 1) 'candidate scope must use one literal cargo metadata --locked command'
+    Assert ([regex]::Matches($match.Value, $literalTree).Count -eq 1) 'candidate scope must use one literal cargo tree --locked command'
+    Assert ($match.Value -match ('(?is)' + $verifierPost + '.*?' + $literalMetadata + '\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw.*?' + $literalTree + '\s*\r?\n\s*if\s*\(\s*\$LASTEXITCODE\s*-ne\s*0\s*\)\s*\{\s*throw')) 'verifier-post evidence and phase-local Git checks must precede literal Cargo commands with immediate exit throws'
     $preScope = '(?is)Push-Location\s+\$candidateWorktree\s*\r?\n\s*try\s*\{(?<pre>.*?)Remove-Item\s+Env:\*'
     $preMatch = [regex]::Match($Text, $preScope)
     Assert $preMatch.Success 'canonical candidate Push-Location/try scope must begin before pre-scrub evidence'
@@ -191,7 +198,7 @@ function Assert-CandidateScrubAndCargoContract([string]$Text) {
     $phaseCommands = @('git\s+rev-parse\s+HEAD', 'git\s+status\s+--porcelain', 'git\s+show\s+-s\s+--format=%P\s+\$candidateSha', 'git\s+diff\s+--name-only\s+9e1c295b1f3f90ef342021ec81b52ece7363cd6c\s+\$candidateSha')
     foreach ($phase in @(
         @{ Name = 'pre-scrub'; Prefix = '(?is)\$candidateWorktree\s*=.*?'; Suffix = 'Remove-Item\s+Env:\*' },
-        @{ Name = 'post-scrub/pre-Cargo'; Prefix = '(?is)Remove-Item\s+Env:\*.*?'; Suffix = 'cargo\s+metadata\s+--locked' },
+        @{ Name = 'post-scrub/pre-Cargo'; Prefix = '(?is)\$verifierPostPorcelain.*?'; Suffix = 'cargo\s+metadata\s+--locked' },
         @{ Name = 'post-Cargo'; Prefix = '(?is)cargo\s+tree\s+--locked.*?'; Suffix = '\}\s*finally\s*\{\s*Pop-Location' }
     )) {
         foreach ($command in $phaseCommands) {
@@ -490,8 +497,6 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert-TrustedVerifierIdentity $text
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
     Assert ($text -notmatch '(?im)&\s+powershell(?:\.exe)?\s+-NoProfile') 'trusted verifier must not use the Windows-only powershell interpreter'
-    Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}verify-package-candidate\.ps1') 'scrubbed candidate environment must bind verifier invocation'
-    Assert ($text -match '(?is)(env\s+-i|Remove-Item\s+Env:).{0,2000}cargo\s+(?:metadata|tree)\s+--locked') 'scrubbed candidate environment must bind Cargo invocation'
     Assert-CandidateScrubAndCargoContract $text
     Assert-ExternalTargetContract $text
 }
@@ -599,6 +604,9 @@ $env:RUSTUP_HOME = $rustupHome
 $env:CARGO_TARGET_DIR = $candidateTarget
 & pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget
 if ($LASTEXITCODE -ne 0) { throw 'trusted verifier failed' }
+$verifierPostPorcelain = git status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0) { throw "verifier-post status failed: $verifierPostPorcelain" }
+if ($verifierPostPorcelain -ne '') { throw "verifier-post dirty: $verifierPostPorcelain" }
     $candidateHead = git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'post-scrub candidate HEAD evidence failed' }
     $candidateStatus = git status --porcelain
@@ -743,6 +751,15 @@ if ($finalPostTargetCleanupPorcelain -ne '') { throw "final-post-target-cleanup 
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', '& pwsh -NoProfile -ExecutionPolicy Bypass -File $trustedVerifier -Target $candidateTarget`nPush-Location $candidateWorktree')) } 'verifier outside the canonical candidate scope must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow + "`n    Push-Location `$candidateWorktree`n    try { & pwsh -NoProfile -ExecutionPolicy Bypass -File `$trustedVerifier -Target `$candidateTarget } finally { Pop-Location }") } 'second verifier candidate scope must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('Push-Location $candidateWorktree', 'Push-Location trusted')) } 'trusted or host worktree execution must fail'
+    $longDistance = $candidateCargoWorkflow.Replace("    `$candidateHead = git rev-parse HEAD", ("    `$padding = '" + ('x' * 2101) + "'`n    `$candidateHead = git rev-parse HEAD"))
+    Assert-CandidateScrubAndCargoContract $longDistance
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', 'cargo metadata --locked --format-version 1 --no-deps`n    cargo metadata --locked --format-version 1 --no-deps').Replace('$verifierPostPorcelain = git status --porcelain --untracked-files=all', 'cargo tree --locked -p chidori`n    $verifierPostPorcelain = git status --porcelain --untracked-files=all')) } 'Cargo before required verifier-post phase must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('$verifierPostPorcelain = git status --porcelain --untracked-files=all', '$null = git status --porcelain --untracked-files=all')) } 'missing verifier-post phase must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', '$cargoText = ''cargo metadata --locked --format-version 1 --no-deps''')) } 'string-only Cargo text must not satisfy literal metadata execution'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', '# cargo metadata --locked --format-version 1 --no-deps')) } 'comment-only Cargo text must not satisfy literal metadata execution'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', '& $cargoExecutable metadata --locked --format-version 1 --no-deps')) } 'variable-backed Cargo executable must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', 'cargo @cargoArguments')) } 'splatted Cargo metadata must fail'
+    Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('cargo metadata --locked --format-version 1 --no-deps', 'Start-Process cargo -ArgumentList ''metadata'', ''--locked''')) } 'process-launch Cargo bypass must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace('if ($LASTEXITCODE -ne 0) { throw ''cargo metadata failed'' }', 'Write-Host masked')) } 'delayed Cargo failure check must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'candidate parent evidence failed' }", 'Write-Host masked')) } 'delayed native evidence failure check must fail'
     Assert-Throws { Assert-CandidateScrubAndCargoContract ($candidateCargoWorkflow.Replace("if (`$LASTEXITCODE -ne 0) { throw 'post-scrub candidate parent evidence failed' }", 'Write-Host masked')) } 'missing post-scrub parent evidence failure check must fail'
