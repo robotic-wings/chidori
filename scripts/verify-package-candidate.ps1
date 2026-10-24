@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Candidate
+    [string]$Candidate,
+    [Parameter(Mandatory = $true)]
+    [string]$Target
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,8 +76,9 @@ $headSha = Invoke-ResolvedGit @('rev-parse', 'HEAD^{commit}')
 Assert-Equal $candidateSha $headSha 'candidate must be the checked-out HEAD'
 $null = Invoke-ResolvedGit @('merge-base', '--is-ancestor', $base, $candidateSha)
 
-$dirtyBefore = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
+$dirtyBefore = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=all')
 if ($dirtyBefore) { throw "tracked tree is dirty before verification: $dirtyBefore" }
+if ($env:CARGO_TARGET_DIR -ne $Target) { throw 'CARGO_TARGET_DIR does not match verifier target' }
 
 $candidatePaths = Invoke-ResolvedGit @('diff', '--name-only', $base, $candidateSha)
 Assert-Equal $candidatePaths ($paths -join [Environment]::NewLine) 'candidate changed-path set from 9e1c295'
@@ -150,6 +153,6 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo metadata --locked failed' }
 & cargo tree --locked -p chidori | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'cargo tree --locked -p chidori failed' }
 
-$dirtyAfter = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=no')
+$dirtyAfter = Invoke-ResolvedGit @('status', '--porcelain', '--untracked-files=all')
 if ($dirtyAfter) { throw "tracked tree is dirty after verification: $dirtyAfter" }
 Write-Host "PASS: candidate $candidateSha is checked-out HEAD and is bound to direct patches 59ebb109 + 00148aa with locked metadata/tree evidence."
