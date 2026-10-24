@@ -42,15 +42,31 @@ pub struct SandboxOutcome {
     pub landlock_enforced: bool,
     /// The seccomp denylist is installed (Linux).
     pub seccomp_applied: bool,
-    /// A Seatbelt profile is confining the worker (macOS). Only ever set/read on
-    /// macOS, so it is dead on other targets.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// A Seatbelt profile is confining the worker (macOS).
     pub seatbelt_applied: bool,
     /// Human-readable reasons for any layer that was skipped.
     pub notes: Vec<String>,
 }
 
 impl SandboxOutcome {
+    /// The confinement layers that applied successfully, in application order.
+    pub fn active_layers(&self) -> Vec<&'static str> {
+        let mut layers = Vec::with_capacity(4);
+        if self.network_isolated {
+            layers.push("network namespace isolated");
+        }
+        if self.landlock_enforced {
+            layers.push("Landlock read-only enforced");
+        }
+        if self.seccomp_applied {
+            layers.push("seccomp denylist applied");
+        }
+        if self.seatbelt_applied {
+            layers.push("Seatbelt profile applied");
+        }
+        layers
+    }
+
     /// Whether the platform's *primary* confinement is active — the gate for
     /// `CHIDORI_ISOLATE_REQUIRE_SANDBOX` (seccomp on Linux, Seatbelt on macOS).
     /// The namespace/Landlock layers are defense-in-depth on top of this.
@@ -432,5 +448,46 @@ mod tests {
                 "`{name}` is not denied, so the `{aliased}` denial can be bypassed through it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::SandboxOutcome;
+
+    #[test]
+    fn active_layers_is_empty_when_no_layer_applied() {
+        assert!(SandboxOutcome::default().active_layers().is_empty());
+    }
+
+    #[test]
+    fn active_layers_reports_each_applied_layer_in_order() {
+        let expected = [
+            "network namespace isolated",
+            "Landlock read-only enforced",
+            "seccomp denylist applied",
+            "Seatbelt profile applied",
+        ];
+
+        for (index, label) in expected.iter().enumerate() {
+            let mut outcome = SandboxOutcome::default();
+            match index {
+                0 => outcome.network_isolated = true,
+                1 => outcome.landlock_enforced = true,
+                2 => outcome.seccomp_applied = true,
+                3 => outcome.seatbelt_applied = true,
+                _ => unreachable!(),
+            }
+            assert_eq!(outcome.active_layers(), vec![*label]);
+        }
+
+        let all_layers = SandboxOutcome {
+            network_isolated: true,
+            landlock_enforced: true,
+            seccomp_applied: true,
+            seatbelt_applied: true,
+            notes: Vec::new(),
+        };
+        assert_eq!(all_layers.active_layers(), expected);
     }
 }

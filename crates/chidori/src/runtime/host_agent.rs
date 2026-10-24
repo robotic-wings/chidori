@@ -2988,6 +2988,28 @@ mod tests {
         .unwrap()
     }
 
+    fn wait_for_initial_stale_owner_lease(store: &dyn RunStore) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let last_observation = loop {
+            let observation = match store.get_blob(crate::runtime::store::LEASE_FILE) {
+                Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(lease) => return lease,
+                    Err(error) => format!(
+                        "unparseable lease bytes: {error}; bytes={}",
+                        String::from_utf8_lossy(&bytes)
+                    ),
+                },
+                Ok(None) => "lease blob is absent".to_string(),
+                Err(error) => format!("reading lease blob: {error:#}"),
+            };
+            if std::time::Instant::now() >= deadline {
+                break observation;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        panic!("timed out waiting for parseable initial A lease: {last_observation}");
+    }
+
     #[derive(Clone, Copy)]
     pub(super) enum LeaseWaitGatePoint {
         BeforeAcquire,
@@ -4966,6 +4988,20 @@ mod tests {
         (predecessor_run_id, inbox)
     }
 
+    fn assert_same_name_spawn_seed(inbox: &[u8]) {
+        let queued: Vec<QueuedSignal> =
+            serde_json::from_slice(inbox).expect("same-name seed must decode as queued signals");
+        assert_eq!(queued.len(), 1, "same-name seed must contain one signal");
+        let signal = &queued[0];
+        assert_eq!(signal.name, "go");
+        assert_eq!(signal.payload, json!({ "id": "must-survive" }));
+        assert_eq!(
+            signal.from,
+            json!({ "kind": "test", "id": "predecessor-migration" })
+        );
+        assert_eq!(signal.delivery_seq, 17);
+    }
+
     fn same_name_spawn_child_command(
         root: &Path,
         backend: &str,
@@ -6544,7 +6580,7 @@ mod tests {
             let name = format!("same-name-race-{backend}-{trial}");
             let (predecessor_run_id, predecessor_inbox) =
                 seed_same_name_spawn_race(&root, backend, &name);
-            assert_eq!(predecessor_inbox.len(), 232);
+            assert_same_name_spawn_seed(&predecessor_inbox);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let gate_address = listener.local_addr().unwrap().to_string();
             listener.set_nonblocking(true).unwrap();
@@ -6770,7 +6806,7 @@ mod tests {
                 assert_eq!(control_report["matching_signal_rows"], 1);
                 assert_eq!(control_report["effect_count"], 1);
                 assert!(control_report["inbox"] == "[]" || control_report["inbox"] == "");
-                assert_eq!(control_inbox.len(), 232);
+                assert_same_name_spawn_seed(&control_inbox);
                 assert!(!control_predecessor.is_empty());
                 eprintln!(
                     "SAME_NAME_SPAWN_SINGLE_CONTROL backend={backend} report={control_report}"
@@ -7536,7 +7572,7 @@ mod tests {
             FsRunStore::new(run_base.join(&run_id)),
             Arc::new(SqliteRunStore::new(shared.clone(), &run_id)),
         );
-        let initial_lease = stale_owner_lease(&store);
+        let initial_lease = wait_for_initial_stale_owner_lease(&store);
         let initial_expiry: chrono::DateTime<chrono::Utc> =
             serde_json::from_value(initial_lease["expires_at"].clone()).unwrap();
         stale_owner_release(ready_socket, b'G');
