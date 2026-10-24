@@ -76,13 +76,29 @@ function Assert-EnvBoundOperation([string]$Text, [string]$Name, [string]$Pattern
     }
 }
 
-function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name, [string]$Pattern) {
-    $operations = [regex]::Matches($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Multiline)
-    Assert ($operations.Count -gt 0) "workflow must contain $Name"
-    $canonicalPattern = [regex]::Escape($script:CanonicalCandidateWorktree) + '(?=$|[\s;"''])'
-    foreach ($operation in $operations) {
-        Assert ($operation.Value -match $canonicalPattern) "$Name must use canonical candidate worktree expression with a token/path boundary"
+function Assert-CanonicalWorktreeOperation([string]$Text, [string]$Name) {
+    # Here-string bodies can contain command-looking documentation.  Remove them
+    # before enumerating executable command lines; ordinary quoted strings cannot
+    # satisfy the anchored command form because their line begins with a quote or
+    # an assignment rather than git.
+    $executableText = [regex]::Replace($Text, "(?ms)@'.*?^\s*'@[ \t]*$", '')
+    $executableText = [regex]::Replace($executableText, '(?ms)@".*?^\s*"@[ \t]*$', '')
+    $operations = [regex]::Matches($executableText, '(?im)^\s*git\s+worktree\s+add\s+--detach\b.*$')
+    Assert ($operations.Count -eq 1) "workflow must contain exactly one executable $Name operation"
+    $operation = $operations[0]
+    $inline = '^\s*git\s+worktree\s+add\s+--detach\s+(?:"|'')?' + [regex]::Escape($script:CanonicalCandidateWorktree) + '(?:"|'')?\s+\$env:CANDIDATE_SHA\s*$'
+    if ($operation.Value -match $inline) { return }
+
+    $blocks = [regex]::Matches($executableText, '(?ms)^[ \t]*-[ \t]*name:[ \t]*Validate identity and materialize candidate[ \t]*\r?\n.*?^[ \t]*run:[ \t]*\|[ \t]*\r?\n(?<run>.*?)(?=^[ \t]*-[ \t]+(?:name:|uses:)|\z)')
+    $capturedValid = $false
+    foreach ($block in $blocks) {
+        $run = $block.Groups['run'].Value
+        $shaCapture = [regex]::Match($run, '(?im)^\s*\$candidateSha\s*=\s*\$env:CANDIDATE_SHA\s*$')
+        $worktreeCapture = [regex]::Match($run, '(?im)^\s*\$candidateWorktree\s*=\s*Join-Path\s+\$env:RUNNER_TEMP\s+\(["'']candidate-\$candidateSha["'']\)\s*$')
+        $capturedOperation = [regex]::Match($run, '(?im)^\s*git\s+worktree\s+add\s+--detach\s+\$candidateWorktree\s+\$candidateSha\s*$')
+        if ($shaCapture.Success -and $worktreeCapture.Success -and $capturedOperation.Success -and $capturedOperation.Value -eq $operation.Value -and $shaCapture.Index -lt $capturedOperation.Index -and $worktreeCapture.Index -lt $capturedOperation.Index) { $capturedValid = $true }
     }
+    Assert $capturedValid "$Name captured form requires preceding exact candidate SHA and canonical worktree captures in the same named materialization run block"
 }
 
 function Assert-SafeCandidateExecution([string]$Text, [string]$Name, [string]$Pattern) {
@@ -534,8 +550,7 @@ function Assert-WorkflowContract([string]$Workflow) {
     Assert ($text -match '\$env:CANDIDATE_SHA') 'workflow shell and ref use must flow through CANDIDATE_SHA environment only'
     Assert ($text -match '\^\[0-9a-f\]\{40\}\$') 'workflow must validate exact lowercase 40-hex SHA before use'
     Assert-EnvBoundOperation $text 'candidate fetch' '^.*git\s+fetch.*$'
-    $worktreeTarget = 'git\s+worktree\s+add\s+--detach\s+(?:"|'')?' + [regex]::Escape($script:CanonicalCandidateWorktree)
-    Assert-CanonicalWorktreeOperation $text 'detached candidate worktree' "^.*$worktreeTarget.*$"
+    Assert-CanonicalWorktreeOperation $text 'detached candidate worktree'
     Assert ($text -match 'git status --porcelain') 'workflow must require clean tracked trees'
     Assert-TrustedVerifierIdentity $text
     Assert ($text -match '(?m)&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File') 'trusted verifier must use the Ubuntu-compatible pwsh interpreter'
@@ -607,10 +622,62 @@ Push-Location "$env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA"; cargo tree --lock
 '@
     Assert-TrustedVerifierIdentity $happy
     Assert-EnvBoundOperation $happy 'candidate fetch' '^.*git\s+fetch.*$'
-    Assert-CanonicalWorktreeOperation $happy 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    Assert-CanonicalWorktreeOperation $happy 'detached candidate worktree'
     Assert-SafeCandidateExecution $happy 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b'
     Assert-SafeCandidateExecution $happy 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked'
     Assert-SafeCandidateExecution $happy 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked'
+
+    $capturedWorktreeHappy = @'
+- name: Validate identity and materialize candidate
+  run: |
+    $candidateSha = $env:CANDIDATE_SHA
+    $candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+    git worktree add --detach $candidateWorktree $candidateSha
+'@
+    Assert-CanonicalWorktreeOperation $capturedWorktreeHappy 'detached candidate worktree'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy.Replace('$candidateSha', '$candidateAlias')) 'detached candidate worktree' } 'captured worktree form must reject SHA aliases'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy.Replace('$candidateWorktree $candidateSha', '$worktreeAlias $candidateSha')) 'detached candidate worktree' } 'captured worktree form must reject worktree aliases'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy.Replace('$candidateWorktree $candidateSha', '$env:RUNNER_TEMP/candidate-$candidateSha $candidateSha')) 'detached candidate worktree' } 'captured worktree form must reject noncanonical direct paths'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy.Replace('$candidateWorktree $candidateSha', '$candidateWorktree/child $candidateSha')) 'detached candidate worktree' } 'captured worktree form must reject child traversal targets'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy.Replace('$candidateWorktree $candidateSha', '$candidateWorktree $env:CANDIDATE_SHA')) 'detached candidate worktree' } 'captured worktree form must require the captured SHA argument'
+    $outOfBlockCaptures = @'
+$candidateSha = $env:CANDIDATE_SHA
+$candidateWorktree = Join-Path $env:RUNNER_TEMP ("candidate-$candidateSha")
+- name: Validate identity and materialize candidate
+  run: |
+    git worktree add --detach $candidateWorktree $candidateSha
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $outOfBlockCaptures 'detached candidate worktree' } 'captured worktree form must reject captures outside the named materialization block'
+    $commentedWorktree = @'
+# git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+$example = 'git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA'
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $commentedWorktree 'detached candidate worktree' } 'comments and strings must not establish canonical worktree creation'
+    $hereStringInlineWorktree = @'
+$documentation = @"
+git worktree add --detach $env:RUNNER_TEMP/candidate-$env:CANDIDATE_SHA $env:CANDIDATE_SHA
+"@
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringInlineWorktree 'detached candidate worktree' } 'inline-looking here-string text must not establish worktree creation'
+    $hereStringCapturedWorktree = @'
+$documentation = @"
+git worktree add --detach $candidateWorktree $candidateSha
+"@
+'@
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringCapturedWorktree 'detached candidate worktree' } 'captured-form here-string text must not establish worktree creation'
+    $hereStringCaptureDefinitions = "- name: Validate identity and materialize candidate`n  run: |`n    `$documentation = @`"`n    `$candidateSha = `$env:CANDIDATE_SHA`n    `$candidateWorktree = Join-Path `$env:RUNNER_TEMP (`"candidate-`$candidateSha`")`n`"@`n    git worktree add --detach `$candidateWorktree `$candidateSha"
+    Assert-Throws { Assert-CanonicalWorktreeOperation $hereStringCaptureDefinitions 'detached candidate worktree' } 'capture-looking here-string text must not establish captured worktree provenance'
+    $coexistingAlternates = @(
+        'git worktree add --detach $worktreeAlias $candidateSha',
+        'git worktree add --detach $env:RUNNER_TEMP/candidate-$candidateSha $candidateSha',
+        'git worktree add --detach $candidateWorktree/child $candidateSha',
+        'git worktree add --detach $candidateWorktree $env:CANDIDATE_SHA'
+    )
+    foreach ($alternate in $coexistingAlternates) {
+        Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy + "`n    $alternate") 'detached candidate worktree' } "a valid captured worktree route must not authorize coexisting alternate route [$alternate]"
+    }
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($capturedWorktreeHappy + "`n    git worktree add --detach `$candidateWorktree `$candidateSha") 'detached candidate worktree' } 'duplicate captured worktree-add operations must fail'
+    Assert-Throws { Assert-CanonicalWorktreeOperation ($happy + "`n- name: Validate identity and materialize candidate`n  run: |`n    `$candidateSha = `$env:CANDIDATE_SHA`n    `$candidateWorktree = Join-Path `$env:RUNNER_TEMP (`"candidate-`$candidateSha`")`n    git worktree add --detach `$candidateWorktree `$candidateSha") 'detached candidate worktree' } 'valid inline worktree route must not authorize an extra captured route'
 
     $materializationRun = @'
 $candidateSha = $env:CANDIDATE_SHA
@@ -898,7 +965,7 @@ Set-Location "candidate-$candidate_alias"; cargo metadata --locked
 Set-Location "candidate-$candidate_alias"; cargo tree --locked
 '@
     Assert-Throws { Assert-EnvBoundOperation $inertAlias 'candidate fetch' '^.*git\s+fetch.*$' } 'inert earlier env reference must not authorize alias-backed fetch'
-    Assert-Throws { Assert-CanonicalWorktreeOperation $inertAlias 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$' } 'inert earlier env reference must not authorize alias-backed worktree'
+    Assert-Throws { Assert-CanonicalWorktreeOperation $inertAlias 'detached candidate worktree' } 'inert earlier env reference must not authorize alias-backed worktree'
     Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'trusted verifier invocation' '&\s+pwsh\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+\$trustedVerifier\b' } 'inert earlier env reference must not authorize alias-backed verifier'
     Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'inert earlier env reference must not authorize alias-backed metadata'
     Assert-Throws { Assert-SafeCandidateExecution $inertAlias 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'inert earlier env reference must not authorize alias-backed tree'
@@ -923,7 +990,7 @@ Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; powershell -
 Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; cargo metadata --locked
 Set-Location "$env:RUNNER_TEMP/candidate-other-$env:CANDIDATE_SHA"; cargo tree --locked
 '@
-    Assert-CanonicalWorktreeOperation $mismatchedWorktree 'detached candidate worktree' '^.*git\s+worktree\s+add\s+--detach.*$'
+    Assert-CanonicalWorktreeOperation $mismatchedWorktree 'detached candidate worktree'
     Assert-Throws { Assert-SafeCandidateExecution $mismatchedWorktree 'trusted verifier invocation' 'verify-package-candidate\.ps1' } 'verifier must use worktree creation target exactly'
     Assert-Throws { Assert-SafeCandidateExecution $mismatchedWorktree 'candidate Cargo metadata invocation' 'cargo\s+metadata\s+--locked' } 'metadata must use worktree creation target exactly'
     Assert-Throws { Assert-SafeCandidateExecution $mismatchedWorktree 'candidate Cargo tree invocation' 'cargo\s+tree\s+--locked' } 'tree must use worktree creation target exactly'
