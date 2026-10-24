@@ -753,17 +753,17 @@ impl FsRunStore {
                 .with_context(|| format!("opening directory for sync {}", directory.display()))?
                 .sync_all()
                 .with_context(|| format!("syncing directory {}", directory.display()))?;
+
+            #[cfg(all(test, unix))]
+            self.after_blob_directory_sync(directory);
+            Ok(())
         }
 
         #[cfg(not(unix))]
-        anyhow::bail!(
+        Err(anyhow::anyhow!(
             "directory sync for durable filesystem blob writes is unsupported on this platform: {}",
             directory.display()
-        );
-
-        #[cfg(all(test, unix))]
-        self.after_blob_directory_sync(directory);
-        Ok(())
+        ))
     }
 
     fn write_file_atomic_from(
@@ -3761,6 +3761,7 @@ pub fn effect_barriers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::runtime::snapshot::{
         HostOperationId, HostPromiseRecord, HostPromiseState, PendingHostOperation,
         PendingHostOperationKind,
