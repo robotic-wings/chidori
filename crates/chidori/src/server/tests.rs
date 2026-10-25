@@ -2383,14 +2383,8 @@ async fn signal_inbox_resume_child_fixture() {
             }
         }),
     );
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let mut sentinel_server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
+    let _sentinel_server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
     });
 
     let agent_path = write_agent(
@@ -2497,15 +2491,12 @@ async fn signal_inbox_resume_child_fixture() {
         "{SIGNAL_INBOX_RESUME_OBSERVATION_PREFIX}{}",
         serde_json::to_string(&observation).unwrap()
     );
-
-    let _ = shutdown_tx.send(());
-    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut sentinel_server).await {
-        Ok(result) => result.unwrap(),
-        Err(_) => {
-            sentinel_server.abort();
-            let _ = sentinel_server.await;
-        }
-    }
+    use std::io::Write as _;
+    std::io::stdout().flush().unwrap();
+    // This fixture runs only in the env-gated subprocess above. The parent
+    // has captured and will validate the complete observation, so terminate
+    // the child instead of waiting on unrelated test-runtime lifetime owners.
+    std::process::exit(0);
 }
 
 #[test]
