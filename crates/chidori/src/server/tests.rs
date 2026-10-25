@@ -1848,13 +1848,13 @@ async fn warm_fallback_replay_produces_identical_journal() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
-/// A fleet-only server has no default agent, but a paused session may have
-/// started with an explicit agent name. If its warm VM is gone and its old
-/// snapshot/host-promise artifacts cannot be used, resume must either recover
-/// that session's real source or explain the missing durable state. It must
-/// never attempt the fleet sentinel as though it were the session's source.
+/// A fleet-only server has no default agent, but a paused session started with
+/// an explicit agent has durable source history. Losing its warm VM and the
+/// state artifacts used by the fast path must therefore re-materialize that
+/// recorded source and replay through both pauses; the fleet sentinel is never
+/// a possible resume source.
 #[tokio::test]
-async fn fleet_only_resume_without_snapshot_or_host_promises_never_uses_default_sentinel() {
+async fn fleet_only_cold_fallback_materializes_recorded_source_and_completes() {
     let temp_dir = std::env::temp_dir().join(format!(
         "chidori-server-fleet-resume-{}",
         uuid::Uuid::new_v4()
@@ -1893,24 +1893,123 @@ async fn fleet_only_resume_without_snapshot_or_host_promises_never_uses_default_
         .unwrap();
     state.warm_runs.lock().unwrap().remove("fleet-resume");
     let run_dir = run_base.join(&run_id);
+    assert!(
+        run_dir.join("history/commits.jsonl").is_file(),
+        "the initial pause must record a durable source tree"
+    );
+    let _ = std::fs::remove_file(run_dir.join("runtime.snapshot.json"));
+    let _ = std::fs::remove_file(run_dir.join("runtime.snapshot"));
+    let _ = std::fs::remove_file(run_dir.join("host_promises.json"));
+    let _ = std::fs::remove_dir_all(run_dir.join("host_promises"));
+    // Make a read of the original recording-node path impossible. Success can
+    // only come from source materialized under `.chidori/materialized/`.
+    std::fs::remove_file(&real_agent).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let (status, body) = resume_with(&state, "fleet-resume", "A").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["status"] == json!("paused") && body["pending_prompt"] == json!("second?"),
+        "the first cold replay response must reach the second pause: {body}"
+    );
+    assert!(
+        crate::runtime::source_history::materialization_root(&run_base, &run_id)
+            .unwrap()
+            .join("agent.ts")
+            .is_file(),
+        "cold fallback must materialize the recorded entry under the run store"
+    );
+    assert!(
+        !body.to_string().contains("__no_default_agent__.ts"),
+        "fleet fallback must never use the server sentinel: {body}"
+    );
+
+    // The replay's second pause receives the same treatment: no warm VM and
+    // no state artifacts that could mask a source-based recovery.
+    state.warm_runs.lock().unwrap().remove("fleet-resume");
     let _ = std::fs::remove_file(run_dir.join("runtime.snapshot.json"));
     let _ = std::fs::remove_file(run_dir.join("runtime.snapshot"));
     let _ = std::fs::remove_file(run_dir.join("host_promises.json"));
     let _ = std::fs::remove_dir_all(run_dir.join("host_promises"));
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let (status, body) = resume_with(&state, "fleet-resume", "A").await;
+    let (status, body) = resume_with(&state, "fleet-resume", "B").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], json!("completed"), "body: {body}");
+    assert_eq!(body["output"], json!({ "a": "A", "b": "B" }));
+    assert!(
+        !body.to_string().contains("__no_default_agent__.ts"),
+        "fleet fallback must never use the server sentinel: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// A fleet session whose recorded source is genuinely absent cannot recover,
+/// but its error must distinguish that durable condition from the server's
+/// synthetic no-default-agent pathname and must not consume the pending input.
+#[tokio::test]
+async fn fleet_only_cold_fallback_without_durable_source_fails_without_advancing_pending_state() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-source-unavailable-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let real_agent = write_agent(&temp_dir, TWO_INPUT_AGENT);
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base.clone(), temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+    let request = CreateSessionRequest {
+        input: json!({}),
+        session_id: Some("fleet-source-unavailable".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(real_agent.file_name().unwrap().to_string_lossy().into_owned()),
+        policy_profile: None,
+    };
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["status"], json!("paused"));
+
+    let before = state
+        .session_store
+        .get("fleet-source-unavailable")
+        .unwrap()
+        .unwrap();
+    let run_id = before.run_id.clone().unwrap();
+    let run_dir = run_base.join(&run_id);
+    state
+        .warm_runs
+        .lock()
+        .unwrap()
+        .remove("fleet-source-unavailable");
+    // Remove both source-history and the manifest/blob legacy source fallback,
+    // while leaving the pending-state files behind as stale artifacts.
+    std::fs::remove_dir_all(run_dir.join("history")).unwrap();
+    std::fs::remove_file(run_dir.join("runtime.snapshot.json")).unwrap();
+    std::fs::remove_file(&real_agent).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let (status, body) = resume_with(&state, "fleet-source-unavailable", "A").await;
     let diagnostic = body["error"].as_str().unwrap_or_default();
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert!(
-        diagnostic.contains("has no default agent source")
-            && diagnostic.contains("will not use its sentinel"),
-        "fleet-only fallback must name only the known source condition; status={status}; body={body}"
+        diagnostic.contains("durable recorded source") && diagnostic.contains("unavailable"),
+        "the refusal must identify the missing durable source: {body}"
     );
     assert!(
         !diagnostic.contains("__no_default_agent__.ts"),
-        "fleet-only resume must not report the server sentinel as the session source; status={status}; body={body}"
+        "the server sentinel is not the session source: {body}"
     );
+    let after = state
+        .session_store
+        .get("fleet-source-unavailable")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.pending_seq, before.pending_seq);
+    assert_eq!(after.pending_prompt, before.pending_prompt);
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }
