@@ -2586,8 +2586,8 @@ fn resume_consumes_valid_signal_inbox_normally() {
 /// A persisted VFS manifest is snapshot state, not replayable call-log state.
 /// A malformed *existing* manifest must therefore stop a resumed server run
 /// before it can consume the pending input, dispatch an effect, or rewrite the
-/// paused session.  The current implementation incorrectly treats every load
-/// error as a missing manifest and constructs an empty VFS instead.
+/// paused session. This regression guards the preflight and ordering contract
+/// that rejects a malformed manifest before any of those advances.
 const PERSISTED_VFS_RESUME_CHILD: &str = "CHIDORI_TEST_PERSISTED_VFS_RESUME_CHILD";
 
 #[tokio::test]
