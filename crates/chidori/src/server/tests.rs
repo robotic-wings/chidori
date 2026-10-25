@@ -2574,12 +2574,18 @@ fn resume_consumes_valid_signal_inbox_normally() {
 /// paused session.  The current implementation incorrectly treats every load
 /// error as a missing manifest and constructs an empty VFS instead.
 const PERSISTED_VFS_RESUME_CHILD: &str = "CHIDORI_TEST_PERSISTED_VFS_RESUME_CHILD";
+/// Makes the persisted-VFS child explicitly retire its parked warm entry before
+/// resume. This selects the cold replay path without relying on the scheduler
+/// reaching an eviction deadline first.
+const PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY: &str =
+    "CHIDORI_TEST_PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY";
 
 #[tokio::test]
 async fn malformed_persisted_vfs_resume_child() {
     if std::env::var_os(PERSISTED_VFS_RESUME_CHILD).is_none() {
         return;
     }
+    let force_cold_replay = std::env::var_os(PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY).is_some();
     let temp = tempfile::tempdir().unwrap();
     let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2620,12 +2626,34 @@ async fn malformed_persisted_vfs_resume_child() {
         ),
     );
     let mut state = signal_test_state(temp.path(), agent);
-    // Force the route through persisted replay rather than the parked warm VM.
-    state.warm_evict = std::time::Duration::from_millis(1);
+    // The original fixture exercises normal eviction. The controlled fixture
+    // below removes the warm entry after the pause has parked, so the resume
+    // route deterministically cannot hand a response to the live VM.
+    state.warm_evict = if force_cold_replay {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_millis(1)
+    };
     let created = create_paused_session(&state, "corrupt-vfs", json!({})).await;
     assert_eq!(created["status"], json!("paused"));
-    while warm_parked(&state, "corrupt-vfs") {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    if force_cold_replay {
+        assert!(
+            warm_parked(&state, "corrupt-vfs"),
+            "fixture must park before its explicit cold-replay transition"
+        );
+        assert!(
+            state
+                .warm_runs
+                .lock()
+                .unwrap()
+                .remove("corrupt-vfs")
+                .is_some(),
+            "fixture must remove the parked warm entry"
+        );
+    } else {
+        while warm_parked(&state, "corrupt-vfs") {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
     let before = state.session_store.get("corrupt-vfs").unwrap().unwrap();
     let run_id = before.run_id.clone().unwrap();
@@ -2707,16 +2735,33 @@ async fn malformed_persisted_vfs_resume_child() {
 
 #[test]
 fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_advance() {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    assert_malformed_persisted_vfs_resume_child(false);
+}
+
+/// The CI failure happened only under workspace/default scheduling. This
+/// bounded child freezes the relevant runtime order: it parks the warm VM,
+/// explicitly retires that entry, and then resumes from a malformed durable
+/// VFS snapshot. It must reject before completing the pending host promise.
+#[test]
+fn resume_fails_closed_on_malformed_persisted_vfs_after_forced_cold_replay_before_host_promise_advance(
+) {
+    assert_malformed_persisted_vfs_resume_child(true);
+}
+
+fn assert_malformed_persisted_vfs_resume_child(force_cold_replay: bool) {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "server::tests::malformed_persisted_vfs_resume_child",
             "--nocapture",
         ])
         .env(PERSISTED_VFS_RESUME_CHILD, "1")
-        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
-        .output()
-        .unwrap();
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+    if force_cold_replay {
+        command.env(PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY, "1");
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "malformed persisted VFS child failed closed check:\nstdout:\n{}\nstderr:\n{}",
