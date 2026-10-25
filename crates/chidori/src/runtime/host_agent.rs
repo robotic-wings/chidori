@@ -10675,6 +10675,8 @@ mod tests {
     /// still resolves.
     #[test]
     fn wakes_from_materialized_source_when_the_local_tree_is_gone() {
+        const GLOBAL_PARTS_CHILD: &str = "CHIDORI_TEST_MATERIALIZED_SOURCE_GLOBAL_PARTS_CHILD";
+        let prove_global_parts_replacement = std::env::var_os(GLOBAL_PARTS_CHILD).is_some();
         let dir = test_dir("materialize");
         write_module(&dir, "lib.ts", "export const greeting = \"hi\";\n");
         write_module(
@@ -10713,31 +10715,34 @@ mod tests {
 
         std::fs::remove_dir_all(dir.join("services")).unwrap();
 
-        // Prove the cross-test failure mode without timing: a replacement
-        // global parts value looks in a different registry and cannot resolve
-        // this unique name. The materialized-source wake must use the parts
-        // captured from this test's spawn, whose run base owns the registry.
-        let competing_dir = test_dir("materialize-competing");
-        let competing_parts = sqlite_test_parts(
-            &competing_dir,
-            competing_dir.join(".chidori").join("runs"),
-            Arc::new(ToolRegistry::new()),
-        );
-        hub().install_parts(competing_parts);
-        let borrowed_error = hub()
-            .send(
-                &hub().installed_parts().unwrap(),
-                &agent_name,
-                "go",
-                json!({ "speed": "wrong-run-base" }),
-                json!({ "kind": "test" }),
-            )
-            .expect_err("replaced global parts must not resolve this test's agent");
-        assert!(
-            borrowed_error.contains(&format!("unknown agent `{agent_name}`")),
-            "unexpected borrowed-parts error: {borrowed_error}"
-        );
-        hub().install_parts(owned_parts.clone());
+        // Only the exact child process mutates the global parts slot. That
+        // proves the cross-test failure mode without allowing this ordinary
+        // parallel test to overwrite another test's installed runtime parts.
+        let competing_dir = if prove_global_parts_replacement {
+            let competing_dir = test_dir("materialize-competing");
+            let competing_parts = sqlite_test_parts(
+                &competing_dir,
+                competing_dir.join(".chidori").join("runs"),
+                Arc::new(ToolRegistry::new()),
+            );
+            hub().install_parts(competing_parts);
+            let borrowed_error = hub()
+                .send(
+                    &hub().installed_parts().unwrap(),
+                    &agent_name,
+                    "go",
+                    json!({ "speed": "wrong-run-base" }),
+                    json!({ "kind": "test" }),
+                )
+                .expect_err("replaced global parts must not resolve this test's agent");
+            assert!(
+                borrowed_error.contains(&format!("unknown agent `{agent_name}`")),
+                "unexpected borrowed-parts error: {borrowed_error}"
+            );
+            Some(competing_dir)
+        } else {
+            None
+        };
         hub()
             .send(
                 &owned_parts,
@@ -10765,8 +10770,28 @@ mod tests {
         assert!(root.join("listener.ts").is_file(), "{}", root.display());
         assert!(root.join("lib.ts").is_file());
 
-        let _ = std::fs::remove_dir_all(competing_dir);
+        if let Some(competing_dir) = competing_dir {
+            let _ = std::fs::remove_dir_all(competing_dir);
+        }
         let _ = std::fs::remove_dir_all(dir);
+
+        if !prove_global_parts_replacement {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::host_agent::tests::wakes_from_materialized_source_when_the_local_tree_is_gone",
+                    "--nocapture",
+                ])
+                .env(GLOBAL_PARTS_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "materialized-source global-parts child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// A run recorded before source history existed has no `history/` at all,
