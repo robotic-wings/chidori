@@ -152,4 +152,35 @@ mod tests {
         let cfg: McpServerConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn timeout_ms_parses_as_a_positive_integer() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"transport":"http","url":"https://mcp.example.test","timeoutMs":75}"#,
+        )
+        .unwrap();
+
+        assert_eq!(serde_json::to_value(&cfg).unwrap()["timeoutMs"], 75);
+        assert!(cfg.validate().is_ok());
+
+        for invalid in [
+            r#"{"transport":"http","url":"https://mcp.example.test","timeoutMs":0}"#,
+            r#"{"transport":"http","url":"https://mcp.example.test","timeoutMs":-1}"#,
+            r#"{"transport":"http","url":"https://mcp.example.test","timeoutMs":1.5}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<McpServerConfig>(invalid).is_err(),
+                "timeoutMs input {invalid} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_ms_defaults_to_thirty_seconds_when_absent() {
+        let cfg: McpServerConfig =
+            serde_json::from_str(r#"{"transport":"http","url":"https://mcp.example.test"}"#)
+                .unwrap();
+
+        assert_eq!(serde_json::to_value(&cfg).unwrap()["timeoutMs"], 30_000);
+    }
 }
