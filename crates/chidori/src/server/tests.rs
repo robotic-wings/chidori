@@ -2384,7 +2384,7 @@ async fn signal_inbox_resume_child_fixture() {
         }),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let sentinel_server = tokio::spawn(async move {
+    let mut sentinel_server = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
@@ -2499,7 +2499,13 @@ async fn signal_inbox_resume_child_fixture() {
     );
 
     let _ = shutdown_tx.send(());
-    sentinel_server.await.unwrap();
+    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut sentinel_server).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            sentinel_server.abort();
+            let _ = sentinel_server.await;
+        }
+    }
 }
 
 #[test]
