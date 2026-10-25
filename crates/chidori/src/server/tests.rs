@@ -1848,6 +1848,73 @@ async fn warm_fallback_replay_produces_identical_journal() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+/// A fleet-only server has no default agent, but a paused session may have
+/// started with an explicit agent name. If its warm VM is gone and its old
+/// snapshot/host-promise artifacts cannot be used, resume must either recover
+/// that session's real source or explain the missing durable state. It must
+/// never attempt the fleet sentinel as though it were the session's source.
+#[tokio::test]
+async fn fleet_only_resume_without_snapshot_or_host_promises_never_uses_default_sentinel() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-resume-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let real_agent = write_agent(&temp_dir, TWO_INPUT_AGENT);
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base.clone(), temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+
+    let request = CreateSessionRequest {
+        input: json!({}),
+        session_id: Some("fleet-resume".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(
+            real_agent
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        policy_profile: None,
+    };
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], json!("paused"));
+
+    let run_id = state
+        .session_store
+        .get("fleet-resume")
+        .unwrap()
+        .unwrap()
+        .run_id
+        .unwrap();
+    state.warm_runs.lock().unwrap().remove("fleet-resume");
+    let run_dir = run_base.join(&run_id);
+    let _ = std::fs::remove_file(run_dir.join("runtime.snapshot.json"));
+    let _ = std::fs::remove_file(run_dir.join("runtime.snapshot"));
+    let _ = std::fs::remove_file(run_dir.join("host_promises.json"));
+    let _ = std::fs::remove_dir_all(run_dir.join("host_promises"));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let (status, body) = resume_with(&state, "fleet-resume", "A").await;
+    let diagnostic = body["error"].as_str().unwrap_or_default();
+    assert!(
+        status == StatusCode::OK
+            || diagnostic.contains("snapshot")
+            || diagnostic.contains("host promise"),
+        "resume must recover the named agent or truthfully name its unavailable durable state; status={status}; body={body}"
+    );
+    assert!(
+        !diagnostic.contains("__no_default_agent__.ts"),
+        "fleet-only resume must not report the server sentinel as the session source; status={status}; body={body}"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
 /// Eviction: a parked run that nobody resumes unwinds after the deadline
 /// and the session remains resumable through the replay path (which then
 /// re-upgrades the continuation onto the warm path).
