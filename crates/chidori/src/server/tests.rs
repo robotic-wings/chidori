@@ -2574,12 +2574,22 @@ fn resume_consumes_valid_signal_inbox_normally() {
 /// paused session.  The current implementation incorrectly treats every load
 /// error as a missing manifest and constructs an empty VFS instead.
 const PERSISTED_VFS_RESUME_CHILD: &str = "CHIDORI_TEST_PERSISTED_VFS_RESUME_CHILD";
+/// Makes the persisted-VFS child explicitly retire its parked warm entry before
+/// resume. This selects the cold replay path without relying on the scheduler
+/// reaching an eviction deadline first.
+const PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY: &str =
+    "CHIDORI_TEST_PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY";
+/// Holds the evicted warm VM after its response channel is disconnected and
+/// before it returns its paused artifact, while a cold replay resume runs.
+const PERSISTED_VFS_RESUME_EVICTION_GATE: &str = "CHIDORI_TEST_PERSISTED_VFS_RESUME_EVICTION_GATE";
 
 #[tokio::test]
 async fn malformed_persisted_vfs_resume_child() {
     if std::env::var_os(PERSISTED_VFS_RESUME_CHILD).is_none() {
         return;
     }
+    let force_cold_replay = std::env::var_os(PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY).is_some();
+    let eviction_gate = std::env::var_os(PERSISTED_VFS_RESUME_EVICTION_GATE).is_some();
     let temp = tempfile::tempdir().unwrap();
     let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2620,13 +2630,69 @@ async fn malformed_persisted_vfs_resume_child() {
         ),
     );
     let mut state = signal_test_state(temp.path(), agent);
-    // Force the route through persisted replay rather than the parked warm VM.
-    state.warm_evict = std::time::Duration::from_millis(1);
+    // The original fixture exercises normal eviction. The controlled fixture
+    // below removes the warm entry after the pause has parked, so the resume
+    // route deterministically cannot hand a response to the live VM.
+    state.warm_evict = if force_cold_replay || eviction_gate {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_millis(1)
+    };
     let created = create_paused_session(&state, "corrupt-vfs", json!({})).await;
     assert_eq!(created["status"], json!("paused"));
-    while warm_parked(&state, "corrupt-vfs") {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let eviction_release = if eviction_gate {
+        assert!(
+            warm_parked(&state, "corrupt-vfs"),
+            "fixture must park before the eviction/cold-replay interleaving"
+        );
+        let run_id = state
+            .session_store
+            .get("corrupt-vfs")
+            .unwrap()
+            .unwrap()
+            .run_id
+            .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *super::WARM_EVICTION_TEST_GATE.lock().unwrap() = Some((run_id, reached_tx, release_rx));
+        assert!(
+            state
+                .warm_runs
+                .lock()
+                .unwrap()
+                .remove("corrupt-vfs")
+                .is_some(),
+            "fixture must disconnect the parked VM's response channel"
+        );
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("warm VM must reach the bounded eviction barrier")
+        })
+        .await
+        .unwrap();
+        Some(release_tx)
+    } else if force_cold_replay {
+        assert!(
+            warm_parked(&state, "corrupt-vfs"),
+            "fixture must park before its explicit cold-replay transition"
+        );
+        assert!(
+            state
+                .warm_runs
+                .lock()
+                .unwrap()
+                .remove("corrupt-vfs")
+                .is_some(),
+            "fixture must remove the parked warm entry"
+        );
+        None
+    } else {
+        while warm_parked(&state, "corrupt-vfs") {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        None
+    };
     let before = state.session_store.get("corrupt-vfs").unwrap().unwrap();
     let run_id = before.run_id.clone().unwrap();
     let run_dir = state.run_base.join(&run_id);
@@ -2646,18 +2712,25 @@ async fn malformed_persisted_vfs_resume_child() {
         "fixture must have an existing malformed manifest"
     );
 
-    let (status, body) = response_json(
-        resume_session(
-            State(state.clone()),
-            Path("corrupt-vfs".to_string()),
-            Json(ResumeRequest {
-                response: "continue".to_string(),
-                allow_source_change: false,
-            }),
+    let resume_state = state.clone();
+    let resume = tokio::spawn(async move {
+        response_json(
+            resume_session(
+                State(resume_state),
+                Path("corrupt-vfs".to_string()),
+                Json(ResumeRequest {
+                    response: "continue".to_string(),
+                    allow_source_change: false,
+                }),
+            )
+            .await,
         )
-        .await,
-    )
-    .await;
+        .await
+    });
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+        .await
+        .expect("cold replay resume must complete while the evicted VM is gated")
+        .expect("cold replay resume task must not panic");
     let after = state.session_store.get("corrupt-vfs").unwrap().unwrap();
     let failures = [
         (
@@ -2696,6 +2769,11 @@ async fn malformed_persisted_vfs_resume_child() {
     .into_iter()
     .filter_map(|(ok, why)| (!ok).then_some(why))
     .collect::<Vec<_>>();
+    if let Some(release) = eviction_release {
+        release
+            .send(())
+            .expect("warm eviction barrier must still be waiting");
+    }
     let _ = shutdown_tx.send(());
     server.await.unwrap();
     assert!(
@@ -2707,6 +2785,51 @@ async fn malformed_persisted_vfs_resume_child() {
 
 #[test]
 fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_advance() {
+    assert_malformed_persisted_vfs_resume_child(false);
+}
+
+/// The CI failure happened only under workspace/default scheduling. This
+/// bounded child freezes the relevant runtime order: it parks the warm VM,
+/// explicitly retires that entry, and then resumes from a malformed durable
+/// VFS snapshot. It must reject before completing the pending host promise.
+#[test]
+fn resume_fails_closed_on_malformed_persisted_vfs_after_forced_cold_replay_before_host_promise_advance(
+) {
+    assert_malformed_persisted_vfs_resume_child(true);
+}
+
+/// Pin the stale warm VM between eviction and its paused-artifact return while
+/// the route chooses cold replay. This constrains the lifecycle race around
+/// the warm-entry response channel: malformed VFS preflight must still happen
+/// before the replay path completes its pending host promise.
+#[test]
+fn resume_fails_closed_on_malformed_persisted_vfs_during_eviction_cold_replay_interleaving() {
+    assert_malformed_persisted_vfs_resume_child_with_eviction_gate();
+}
+
+fn assert_malformed_persisted_vfs_resume_child(force_cold_replay: bool) {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "server::tests::malformed_persisted_vfs_resume_child",
+            "--nocapture",
+        ])
+        .env(PERSISTED_VFS_RESUME_CHILD, "1")
+        .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1");
+    if force_cold_replay {
+        command.env(PERSISTED_VFS_RESUME_FORCE_COLD_REPLAY, "1");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "malformed persisted VFS child failed closed check:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_malformed_persisted_vfs_resume_child_with_eviction_gate() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -2714,12 +2837,13 @@ fn resume_fails_closed_on_malformed_persisted_vfs_before_effect_or_state_advance
             "--nocapture",
         ])
         .env(PERSISTED_VFS_RESUME_CHILD, "1")
+        .env(PERSISTED_VFS_RESUME_EVICTION_GATE, "1")
         .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "malformed persisted VFS child failed closed check:\nstdout:\n{}\nstderr:\n{}",
+        "gated malformed persisted VFS child failed closed check:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
