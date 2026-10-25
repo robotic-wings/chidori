@@ -8358,6 +8358,13 @@ mod tests {
         assert_eq!(status["live"], json!(true), "{status}");
         let mut acknowledged_ids = vec![live_id.clone()];
         let mut other_ids = Vec::new();
+        // The first sender is paused after its live-context snapshot while it
+        // owns this name's send lock. Release it before sending the remaining
+        // messages; the worker remains paused after clearing live context, so
+        // those messages still exercise the queued-inbox side of this race.
+        sender_release_tx.send(()).unwrap();
+        let live_result = sender.join().unwrap().unwrap();
+        assert_eq!(live_result["delivered"], json!(true));
         for index in 1..competing_sends {
             let id = format!("{agent_name}-store-{index}");
             let result = hub()
@@ -8373,10 +8380,6 @@ mod tests {
             acknowledged_ids.push(id.clone());
             other_ids.push(id);
         }
-
-        sender_release_tx.send(()).unwrap();
-        let live_result = sender.join().unwrap().unwrap();
-        assert_eq!(live_result["delivered"], json!(true));
         worker_release_tx.send(()).unwrap();
         if require_wake_resolution {
             let race_returned = hibernate_status_reached
