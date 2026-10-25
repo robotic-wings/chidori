@@ -10706,20 +10706,48 @@ mod tests {
         let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
         assert_eq!(output["status"], json!("hibernating"));
         let run_id = spawned_run_id(&ctx);
+        // Spawning installed these parts for this test's run base. Keep that
+        // capability rather than borrowing the process-global current value:
+        // unrelated tests may install parts for another isolated run base.
+        let owned_parts = hub().installed_parts().unwrap();
 
         std::fs::remove_dir_all(dir.join("services")).unwrap();
 
-        let parts = hub().installed_parts().unwrap();
+        // Prove the cross-test failure mode without timing: a replacement
+        // global parts value looks in a different registry and cannot resolve
+        // this unique name. The materialized-source wake must use the parts
+        // captured from this test's spawn, whose run base owns the registry.
+        let competing_dir = test_dir("materialize-competing");
+        let competing_parts = sqlite_test_parts(
+            &competing_dir,
+            competing_dir.join(".chidori").join("runs"),
+            Arc::new(ToolRegistry::new()),
+        );
+        hub().install_parts(competing_parts);
+        let borrowed_error = hub()
+            .send(
+                &hub().installed_parts().unwrap(),
+                &agent_name,
+                "go",
+                json!({ "speed": "wrong-run-base" }),
+                json!({ "kind": "test" }),
+            )
+            .expect_err("replaced global parts must not resolve this test's agent");
+        assert!(
+            borrowed_error.contains(&format!("unknown agent `{agent_name}`")),
+            "unexpected borrowed-parts error: {borrowed_error}"
+        );
+        hub().install_parts(owned_parts.clone());
         hub()
             .send(
-                &parts,
+                &owned_parts,
                 &agent_name,
                 "go",
                 json!({ "speed": "fast" }),
                 json!({ "kind": "test" }),
             )
             .unwrap();
-        let outcome = wait_for_settled(&parts, &agent_name);
+        let outcome = wait_for_settled(&owned_parts, &agent_name);
         assert_eq!(outcome["status"], json!("completed"), "{outcome}");
         assert_eq!(
             outcome["output"],
@@ -10737,6 +10765,7 @@ mod tests {
         assert!(root.join("listener.ts").is_file(), "{}", root.display());
         assert!(root.join("lib.ts").is_file());
 
+        let _ = std::fs::remove_dir_all(competing_dir);
         let _ = std::fs::remove_dir_all(dir);
     }
 
