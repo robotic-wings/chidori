@@ -65,6 +65,14 @@ pub struct McpServerConfig {
     /// token and never reaches the guest.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Maximum time, in milliseconds, to wait for an HTTP MCP request and its
+    /// response headers. Kept on every server configuration so an omitted
+    /// value preserves the established 30 second behavior.
+    #[serde(
+        default = "default_timeout_ms",
+        deserialize_with = "deserialize_timeout_ms"
+    )]
+    pub timeout_ms: u64,
 }
 
 impl McpServerConfig {
@@ -72,6 +80,9 @@ impl McpServerConfig {
     /// reason when the config can't be started, so `start_from_config` can skip
     /// it with a clear warning rather than panicking or spawning nonsense.
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.timeout_ms == 0 {
+            return Err("server `timeoutMs` must be a positive integer".to_string());
+        }
         match self.transport {
             McpTransport::Stdio => {
                 if self.command.trim().is_empty() {
@@ -91,6 +102,23 @@ impl McpServerConfig {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_timeout_ms() -> u64 {
+    30_000
+}
+
+fn deserialize_timeout_ms<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let timeout_ms = u64::deserialize(deserializer)?;
+    if timeout_ms == 0 {
+        return Err(serde::de::Error::custom(
+            "server `timeoutMs` must be a positive integer",
+        ));
+    }
+    Ok(timeout_ms)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

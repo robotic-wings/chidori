@@ -32,6 +32,7 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub struct McpHttpClient {
     client: reqwest::Client,
     url: String,
+    timeout: std::time::Duration,
     /// The server id, used only to label structured errors.
     server_id: String,
     /// Realized `Authorization` header value (`Bearer <real-token>`), already
@@ -82,6 +83,7 @@ impl McpHttpClient {
         let mut this = Self {
             client,
             url,
+            timeout: std::time::Duration::from_millis(cfg.timeout_ms),
             server_id: server_id.to_string(),
             auth_header,
             session_id: tokio::sync::Mutex::new(None),
@@ -167,7 +169,7 @@ impl McpHttpClient {
         let session = self.session_id.lock().await.clone();
         let req = self.apply_headers(self.client.post(&self.url).json(&payload), &session);
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), req.send())
+        let resp = tokio::time::timeout(self.timeout, req.send())
             .await
             .map_err(|_| anyhow!("MCP `{}` to `{}` timed out", method, self.server_id))?
             .map_err(|err| self.transport_error(method, &err.to_string()))?;
@@ -414,6 +416,7 @@ mod tests {
             transport: super::super::config::McpTransport::Http,
             url: Some(format!("http://{addr}/mcp")),
             auth_token: None,
+            timeout_ms: 30_000,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
