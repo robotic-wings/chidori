@@ -10707,14 +10707,18 @@ mod tests {
         std::fs::write(&path, &src).unwrap();
 
         let ctx = RuntimeContext::new();
+        // This capability belongs to the fixture's own run base. Do not read
+        // the process-global hub slot after spawn: a parallel test may have
+        // installed parts for another isolated run base by then.
+        let owned_parts = sqlite_test_parts(
+            &dir,
+            dir.join(".chidori").join("runs"),
+            Arc::new(ToolRegistry::new()),
+        );
         let backend = test_backend(ctx.clone(), &dir);
         let output = run_agent(&path, &src, &json!({}), &backend).unwrap();
         assert_eq!(output["status"], json!("hibernating"));
         let run_id = spawned_run_id(&ctx);
-        // Spawning installed these parts for this test's run base. Keep that
-        // capability rather than borrowing the process-global current value:
-        // unrelated tests may install parts for another isolated run base.
-        let owned_parts = hub().installed_parts().unwrap();
 
         std::fs::remove_dir_all(dir.join("services")).unwrap();
 
