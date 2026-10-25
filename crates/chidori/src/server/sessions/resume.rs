@@ -453,6 +453,14 @@ pub(in crate::server) async fn resume_session(
         }
     }
 
+    if !state.has_default_agent {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "cannot rebuild this fleet-only session after its warm continuation was lost: the server has no default agent source and will not use its sentinel as the session source"})),
+        )
+            .into_response();
+    }
+
     if let Err(err) = validate_snapshot_manifest_for_resume(
         &state.run_base,
         original.run_id.as_deref(),

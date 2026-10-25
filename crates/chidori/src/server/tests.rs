@@ -1901,11 +1901,11 @@ async fn fleet_only_resume_without_snapshot_or_host_promises_never_uses_default_
 
     let (status, body) = resume_with(&state, "fleet-resume", "A").await;
     let diagnostic = body["error"].as_str().unwrap_or_default();
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert!(
-        status == StatusCode::OK
-            || diagnostic.contains("snapshot")
-            || diagnostic.contains("host promise"),
-        "resume must recover the named agent or truthfully name its unavailable durable state; status={status}; body={body}"
+        diagnostic.contains("has no default agent source")
+            && diagnostic.contains("will not use its sentinel"),
+        "fleet-only fallback must name only the known source condition; status={status}; body={body}"
     );
     assert!(
         !diagnostic.contains("__no_default_agent__.ts"),
