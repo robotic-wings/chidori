@@ -87,6 +87,18 @@ pub(crate) static WARM_POST_RESPONSE_INBOX_TEST_GATE: StdMutex<
     )>,
 > = StdMutex::new(None);
 
+/// One-shot barrier after a parked warm VM has lost its response channel but
+/// before it returns the paused artifact. Test builds only; this pins the
+/// eviction/unwind side of a concurrent cold replay.
+#[cfg(test)]
+pub(crate) static WARM_EVICTION_TEST_GATE: StdMutex<
+    Option<(
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+> = StdMutex::new(None);
+
 /// One-shot test barrier at the former late-bind point, after detached rearm.
 /// An occupied-port startup now returns during early reservation before it can
 /// reach this gate. The port key isolates concurrent serve tests.
@@ -326,7 +338,31 @@ fn install_warm_run(
                 // shutdown — the sender disconnects): unwind into the ordinary
                 // paused artifact; a later /resume replays. The engine thread
                 // and VM are reclaimed.
-                Err(_) => break WarmInputWait::Park,
+                Err(_) => {
+                    #[cfg(test)]
+                    {
+                        let gate = {
+                            let mut slot = WARM_EVICTION_TEST_GATE.lock().unwrap();
+                            if slot
+                                .as_ref()
+                                .is_some_and(|(expected, _, _)| expected == &ctx.run_id())
+                            {
+                                slot.take()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((_, reached, release)) = gate {
+                            reached
+                                .send(())
+                                .expect("warm eviction test observer remains connected");
+                            release
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .expect("warm eviction test barrier is released");
+                        }
+                    }
+                    break WarmInputWait::Park;
+                }
             }
         };
         if let Some(warm) = bridge_warm.upgrade() {
