@@ -8358,6 +8358,16 @@ mod tests {
         assert_eq!(status["live"], json!(true), "{status}");
         let mut acknowledged_ids = vec![live_id.clone()];
         let mut other_ids = Vec::new();
+        // The live sender is intentionally paused after it snapshots the
+        // per-name entry, and it still owns that entry's send lock. Additional
+        // synchronous sends here would wait on that same lock while the test
+        // waits to release it: a fixture self-deadlock, not a missed wake.
+        // Release and join the snapshot holder first. The worker remains
+        // paused after clearing its live context, so the following sends still
+        // exercise the intended queued-inbox side of the interleaving.
+        sender_release_tx.send(()).unwrap();
+        let live_result = sender.join().unwrap().unwrap();
+        assert_eq!(live_result["delivered"], json!(true));
         for index in 1..competing_sends {
             let id = format!("{agent_name}-store-{index}");
             let result = hub()
@@ -8373,10 +8383,6 @@ mod tests {
             acknowledged_ids.push(id.clone());
             other_ids.push(id);
         }
-
-        sender_release_tx.send(()).unwrap();
-        let live_result = sender.join().unwrap().unwrap();
-        assert_eq!(live_result["delivered"], json!(true));
         worker_release_tx.send(()).unwrap();
         if require_wake_resolution {
             let race_returned = hibernate_status_reached
