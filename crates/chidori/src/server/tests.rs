@@ -2595,6 +2595,10 @@ async fn malformed_persisted_vfs_resume_child() {
     if std::env::var_os(PERSISTED_VFS_RESUME_CHILD).is_none() {
         return;
     }
+    // This exact child validates cold persisted replay. Keeping warm resume
+    // disabled before state construction prevents a parked engine from
+    // concurrently rewriting artifacts while the fail-closed snapshots run.
+    std::env::set_var("CHIDORI_WARM_RESUME", "0");
     let temp = tempfile::tempdir().unwrap();
     let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2634,14 +2638,9 @@ async fn malformed_persisted_vfs_resume_child() {
     "#
         ),
     );
-    let mut state = signal_test_state(temp.path(), agent);
-    // Force the route through persisted replay rather than the parked warm VM.
-    state.warm_evict = std::time::Duration::from_millis(1);
+    let state = signal_test_state(temp.path(), agent);
     let created = create_paused_session(&state, "corrupt-vfs", json!({})).await;
     assert_eq!(created["status"], json!("paused"));
-    while warm_parked(&state, "corrupt-vfs") {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
     let before = state.session_store.get("corrupt-vfs").unwrap().unwrap();
     let run_id = before.run_id.clone().unwrap();
     let run_dir = state.run_base.join(&run_id);
