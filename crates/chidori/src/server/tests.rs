@@ -1964,7 +1964,13 @@ async fn fleet_only_cold_fallback_without_durable_source_fails_without_advancing
         session_id: Some("fleet-source-unavailable".to_string()),
         attempt_number: None,
         replay_from: None,
-        agent: Some(real_agent.file_name().unwrap().to_string_lossy().into_owned()),
+        agent: Some(
+            real_agent
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
         policy_profile: None,
     };
     let (status, body) =
