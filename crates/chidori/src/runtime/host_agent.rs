@@ -3911,6 +3911,22 @@ mod tests {
         worker_release: StdMutex<std::sync::mpsc::Receiver<()>>,
         sender_claimed: AtomicBool,
         worker_claimed: AtomicBool,
+        sender_launched: AtomicBool,
+        sender_result: StdMutex<Option<String>>,
+        worker_timed_out: AtomicBool,
+    }
+
+    impl InboxRaceBarriers {
+        fn milestones(&self) -> String {
+            format!(
+                "sender_launched={}, sender_barrier_claimed={}, sender_result={:?}, worker_barrier_claimed={}, worker_timed_out={}",
+                self.sender_launched.load(Ordering::SeqCst),
+                self.sender_claimed.load(Ordering::SeqCst),
+                *self.sender_result.lock().unwrap(),
+                self.worker_claimed.load(Ordering::SeqCst),
+                self.worker_timed_out.load(Ordering::SeqCst),
+            )
+        }
     }
 
     static INBOX_RACE_BARRIERS: OnceLock<StdMutex<Option<Arc<InboxRaceBarriers>>>> =
@@ -8228,14 +8244,21 @@ mod tests {
         .unwrap();
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (ready_release_tx, ready_release_rx) = std::sync::mpsc::channel();
+        let ready_release_rx = Arc::new(StdMutex::new(ready_release_rx));
         let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
         let mut tools = ToolRegistry::new();
         tools.register_native(
             "raceReady",
-            "signals the first listen completed",
+            "holds the live context until the competing sender is armed",
             Vec::new(),
             move |_| {
                 let _ = ready_tx.send(());
+                ready_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("inbox race fixture must release its ready handoff");
                 Ok(json!({ "ready": true }))
             },
         );
@@ -8285,12 +8308,15 @@ mod tests {
             consumed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             json!(seed_id)
         );
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("target run did not enter the live-context readiness handoff");
 
         let sender_arrived_rx;
         let sender_release_tx;
         let worker_arrived_rx;
         let worker_release_tx;
+        let barriers;
         {
             let (sender_arrived_tx, rx) = std::sync::mpsc::channel();
             sender_arrived_rx = rx;
@@ -8302,10 +8328,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             worker_release_tx = release_tx;
             let worker_release_rx = release_rx;
-            *INBOX_RACE_BARRIERS
-                .get_or_init(|| StdMutex::new(None))
-                .lock()
-                .unwrap() = Some(Arc::new(InboxRaceBarriers {
+            barriers = Arc::new(InboxRaceBarriers {
                 agent_name: agent_name.clone(),
                 sender_arrived: sender_arrived_tx,
                 sender_release: StdMutex::new(sender_release_rx),
@@ -8313,7 +8336,14 @@ mod tests {
                 worker_release: StdMutex::new(worker_release_rx),
                 sender_claimed: AtomicBool::new(false),
                 worker_claimed: AtomicBool::new(false),
-            }));
+                sender_launched: AtomicBool::new(false),
+                sender_result: StdMutex::new(None),
+                worker_timed_out: AtomicBool::new(false),
+            });
+            *INBOX_RACE_BARRIERS
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap() = Some(barriers.clone());
         }
 
         let (hibernate_status_reached, hibernate_status_release) = if require_wake_resolution {
@@ -8337,21 +8367,45 @@ mod tests {
         let sender_parts = parts.clone();
         let sender_name = agent_name.clone();
         let live_id_for_thread = live_id.clone();
+        let sender_barriers = barriers.clone();
+        barriers.sender_launched.store(true, Ordering::SeqCst);
         let sender = std::thread::spawn(move || {
-            hub().send(
+            let result = hub().send(
                 &sender_parts,
                 &sender_name,
                 "race",
                 json!({ "id": live_id_for_thread }),
                 json!({ "test": true }),
-            )
+            );
+            *sender_barriers.sender_result.lock().unwrap() = Some(match &result {
+                Ok(_) => "Ok".to_string(),
+                Err(error) => format!("Err({error})"),
+            });
+            result
         });
-        sender_arrived_rx
+        if sender_arrived_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("live sender did not reach the post-snapshot barrier");
-        worker_arrived_rx
+            .is_err()
+        {
+            panic!(
+                "live sender did not reach the post-snapshot barrier: {}",
+                barriers.milestones()
+            );
+        }
+        // `raceReady` is still blocked here, so the sender's successful
+        // snapshot proves this exact run owns a live context. Only now let
+        // the worker move to its next listen and clear that context.
+        ready_release_tx.send(()).unwrap();
+        if worker_arrived_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("worker did not reach the post-context-clear barrier");
+            .is_err()
+        {
+            barriers.worker_timed_out.store(true, Ordering::SeqCst);
+            panic!(
+                "worker did not reach the post-context-clear barrier: {}",
+                barriers.milestones()
+            );
+        }
 
         let status = hub().status(&parts, &agent_name).unwrap();
         assert_eq!(status["status"], json!("running"), "{status}");
