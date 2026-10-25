@@ -2281,7 +2281,7 @@ struct SignalInboxResumeObservation {
 }
 
 fn run_signal_inbox_resume_child(mode: &str) -> SignalInboxResumeObservation {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("server::tests::signal_inbox_resume_child_fixture")
         .arg("--nocapture")
@@ -2289,8 +2289,26 @@ fn run_signal_inbox_resume_child(mode: &str) -> SignalInboxResumeObservation {
         // SSRF allowlisting is process-global and cached; set it before the
         // isolated test process starts rather than mutating this test process.
         .env("CHIDORI_HTTP_ALLOW_HOSTS", "127.0.0.1")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let output = loop {
+        if child.try_wait().unwrap().is_some() {
+            break child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "signal inbox child {mode} exceeded 30 seconds; stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     let report = format!(
         "signal inbox child {mode} exited {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
