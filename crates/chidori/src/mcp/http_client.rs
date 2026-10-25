@@ -369,6 +369,40 @@ mod tests {
         addr
     }
 
+    /// Like `spawn_mock_mcp_server`, but deliberately sleeps before every
+    /// response so a per-server timeout can be observed during `initialize`.
+    fn spawn_delayed_mock_mcp_server(delay: std::time::Duration) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+                std::thread::sleep(delay);
+                let response = match method {
+                    "initialize" => {
+                        json!({"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": "slow"}})
+                    }
+                    "tools/list" => json!({"tools": []}),
+                    _ => json!({}),
+                };
+                let payload = json!({"jsonrpc": "2.0", "id": 1, "result": response}).to_string();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(), payload,
+                );
+                let _ = stream.write_all(http.as_bytes());
+            }
+        });
+        addr
+    }
+
     #[test]
     fn connect_discovers_tools_and_calls_them() {
         let addr = spawn_mock_mcp_server();
@@ -393,5 +427,24 @@ mod tests {
             // Single text content block collapses to a string.
             assert_eq!(out, Value::String("echoed!".to_string()));
         });
+    }
+
+    #[test]
+    fn connect_honors_the_http_servers_configured_timeout() {
+        let addr = spawn_delayed_mock_mcp_server(std::time::Duration::from_millis(100));
+        let cfg: McpServerConfig = serde_json::from_str(&format!(
+            r#"{{"transport":"http","url":"http://{addr}/mcp","timeoutMs":25}}"#
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let err = match rt.block_on(McpHttpClient::connect("slow", cfg)) {
+            Ok(_) => panic!("a 25ms server timeout must abort a 100ms HTTP response"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
     }
 }
