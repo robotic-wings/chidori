@@ -2052,6 +2052,187 @@ async fn fleet_only_cold_fallback_without_durable_source_fails_without_advancing
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+/// `/replay` is a separate execution surface from `/resume`: a completed
+/// fleet session must replay from its own recorded source after the recording
+/// node's explicit agent file is gone, never from the fleet sentinel.
+#[tokio::test]
+async fn fleet_only_replay_materializes_recorded_source_after_original_is_removed() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-replay-source-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = r#"
+        export async function agent(input, chidori) {
+            return { value: input.value, stable: true };
+        }
+    "#;
+    let real_agent = write_agent(&temp_dir, source);
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base.clone(), temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+    let request = CreateSessionRequest {
+        input: json!({ "value": "recorded" }),
+        session_id: Some("fleet-replay-source".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(
+            real_agent
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        policy_profile: None,
+    };
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["status"], json!("completed"), "body: {body}");
+    let original = state
+        .session_store
+        .get("fleet-replay-source")
+        .unwrap()
+        .unwrap();
+    let run_id = original.run_id.clone().unwrap();
+    assert!(run_base
+        .join(&run_id)
+        .join("history/commits.jsonl")
+        .is_file());
+    std::fs::remove_file(&real_agent).unwrap();
+
+    let (status, body) = response_json(
+        replay_session(
+            State(state.clone()),
+            Path("fleet-replay-source".to_string()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body["status"], json!("completed"), "body: {body}");
+    assert_eq!(
+        body["output"],
+        json!({ "value": "recorded", "stable": true })
+    );
+    assert!(!body.to_string().contains("__no_default_agent__.ts"));
+    let replayed = state
+        .session_store
+        .get(body["id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&replayed.call_log).unwrap(),
+        serde_json::to_value(&original.call_log).unwrap(),
+        "replay must preserve the recorded call sequence"
+    );
+    assert!(
+        crate::runtime::source_history::materialization_root(&run_base, &run_id)
+            .unwrap()
+            .join("agent.ts")
+            .is_file()
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// Without durable source, `/replay` must fail before opening the fleet
+/// sentinel or creating a partial replay session; the original completed row
+/// remains intact for later recovery.
+#[tokio::test]
+async fn fleet_only_replay_without_durable_source_fails_before_creating_partial_replay() {
+    use crate::runtime::source_history::{
+        SOURCE_COMMITS_FILE, SOURCE_HEAD_FILE, SOURCE_OBJECTS_PREFIX,
+    };
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-replay-source-unavailable-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let real_agent = write_agent(
+        &temp_dir,
+        "export async function agent() { return { stable: true }; }",
+    );
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base.clone(), temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+    let request = CreateSessionRequest {
+        input: json!({}),
+        session_id: Some("fleet-replay-source-unavailable".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(
+            real_agent
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        policy_profile: None,
+    };
+    let (status, _) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let before = state
+        .session_store
+        .get("fleet-replay-source-unavailable")
+        .unwrap()
+        .unwrap();
+    let run_id = before.run_id.clone().unwrap();
+    let store = crate::runtime::store::RunStoreFactory::shared(&run_base).store_for(&run_id);
+    for key in store
+        .list_blobs()
+        .unwrap()
+        .into_iter()
+        .filter(|key| {
+            key == SNAPSHOT_MANIFEST_FILE
+                || key == SOURCE_COMMITS_FILE
+                || key == SOURCE_HEAD_FILE
+                || key.starts_with(SOURCE_OBJECTS_PREFIX)
+        })
+        .collect::<Vec<_>>()
+    {
+        store.delete_blob(&key).unwrap();
+    }
+    std::fs::remove_file(&real_agent).unwrap();
+
+    let (status, body) = response_json(
+        replay_session(
+            State(state.clone()),
+            Path("fleet-replay-source-unavailable".to_string()),
+        )
+        .await,
+    )
+    .await;
+    let diagnostic = body["error"].as_str().unwrap_or_default();
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        diagnostic.contains("durable recorded source") && diagnostic.contains("unavailable"),
+        "body: {body}"
+    );
+    assert!(
+        !diagnostic.contains("__no_default_agent__.ts"),
+        "body: {body}"
+    );
+    assert_eq!(
+        state.session_store.list().unwrap().len(),
+        1,
+        "source refusal must not create a partial replay session"
+    );
+    let after = state
+        .session_store
+        .get("fleet-replay-source-unavailable")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "source refusal must leave the original session unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
 /// Eviction: a parked run that nobody resumes unwinds after the deadline
 /// and the session remains resumable through the replay path (which then
 /// re-upgrades the continuation onto the warm path).
