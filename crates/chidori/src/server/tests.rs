@@ -2121,7 +2121,11 @@ async fn fleet_only_replay_materializes_recorded_source_after_original_is_remove
         .get(body["id"].as_str().unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(replayed.call_log, original.call_log);
+    assert_eq!(
+        serde_json::to_value(&replayed.call_log).unwrap(),
+        serde_json::to_value(&original.call_log).unwrap(),
+        "replay must preserve the recorded call sequence"
+    );
     assert!(
         crate::runtime::source_history::materialization_root(&run_base, &run_id)
             .unwrap()
@@ -2215,13 +2219,15 @@ async fn fleet_only_replay_without_durable_source_fails_before_creating_partial_
         1,
         "source refusal must not create a partial replay session"
     );
+    let after = state
+        .session_store
+        .get("fleet-replay-source-unavailable")
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        state
-            .session_store
-            .get("fleet-replay-source-unavailable")
-            .unwrap()
-            .unwrap(),
-        before
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "source refusal must leave the original session unchanged"
     );
 
     let _ = std::fs::remove_dir_all(temp_dir);
