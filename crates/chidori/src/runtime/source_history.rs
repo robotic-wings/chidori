@@ -1282,14 +1282,15 @@ mod tests {
     #[test]
     fn materialization_refuses_paths_that_escape_the_root() {
         let (dir, store) = temp_store();
-        let escape = std::env::temp_dir().join("chidori-materialize-escape.ts");
-        let _ = std::fs::remove_file(&escape);
+        let escaped_name = format!("chidori-materialize-escape-{}.ts", uuid::Uuid::new_v4());
+        let external_sentinel = std::env::temp_dir().join(&escaped_name);
+        std::fs::write(&external_sentinel, "outside sentinel\n").unwrap();
+        let malicious_text = "pwned\n";
         let files = vec![
             (PathBuf::from("agent.ts"), "ok\n".to_string()),
             (
-                PathBuf::from("../../../../../../../..")
-                    .join(escape.strip_prefix("/").unwrap_or(&escape)),
-                "pwned\n".to_string(),
+                PathBuf::from("..").join("..").join(&escaped_name),
+                malicious_text.to_string(),
             ),
         ];
         commit_files(&store, SourceCommitEvent::RunStart, &files, 0, None).unwrap();
@@ -1300,7 +1301,15 @@ mod tests {
             format!("{err:#}").contains("escapes its tree"),
             "unexpected error: {err:#}"
         );
-        assert!(!escape.exists(), "materialization wrote outside its root");
+        assert_eq!(
+            std::fs::read_to_string(&external_sentinel).unwrap(),
+            "outside sentinel\n",
+            "materialization changed a file outside its root"
+        );
+        assert!(
+            !tree_contains_name_or_text(&root, &escaped_name, malicious_text),
+            "materialization left malicious content under its root"
+        );
 
         // Absolute paths that share no ancestor with the tree are rebased
         // under the root, never written where they claim to live.
@@ -1323,6 +1332,22 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+        let _ = std::fs::remove_file(external_sentinel);
+    }
+
+    fn tree_contains_name_or_text(root: &Path, name: &str, text: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.file_name().is_some_and(|file_name| file_name == name)
+                || if path.is_dir() {
+                    tree_contains_name_or_text(&path, name, text)
+                } else {
+                    std::fs::read_to_string(&path).is_ok_and(|contents| contents == text)
+                }
+        })
     }
 
     /// The materialization root is a sibling of `runs/` (run enumeration must
