@@ -8,6 +8,7 @@ use crate::runtime::snapshot::{
     HOST_PROMISE_TABLE_FILE, PENDING_HOST_OPERATION_FILE, SIGNAL_INBOX_FILE,
     SNAPSHOT_MANIFEST_FILE,
 };
+use crate::runtime::store::RunStore as _;
 use axum::body;
 use axum::extract::{Path, State};
 use std::sync::atomic::Ordering;
@@ -1710,7 +1711,6 @@ async fn resume_with(state: &AppState, id: &str, response: &str) -> (StatusCode,
 
 /// Records that matter for replay parity: (seq, function, args, result).
 fn journal_shape(run_base: &FsPath, run_id: &str) -> Vec<(u64, String, Value, Value)> {
-    use crate::runtime::store::RunStore as _;
     crate::runtime::store::FsRunStore::new(run_base.join(run_id))
         .load_call_log()
         .unwrap()
@@ -1950,6 +1950,9 @@ async fn fleet_only_cold_fallback_materializes_recorded_source_and_completes() {
 /// synthetic no-default-agent pathname and must not consume the pending input.
 #[tokio::test]
 async fn fleet_only_cold_fallback_without_durable_source_fails_without_advancing_pending_state() {
+    use crate::runtime::source_history::{
+        SOURCE_COMMITS_FILE, SOURCE_HEAD_FILE, SOURCE_OBJECTS_PREFIX,
+    };
     let temp_dir = std::env::temp_dir().join(format!(
         "chidori-server-fleet-source-unavailable-{}",
         uuid::Uuid::new_v4()
@@ -1984,18 +1987,47 @@ async fn fleet_only_cold_fallback_without_durable_source_fails_without_advancing
         .unwrap()
         .unwrap();
     let run_id = before.run_id.clone().unwrap();
-    let run_dir = run_base.join(&run_id);
     state
         .warm_runs
         .lock()
         .unwrap()
         .remove("fleet-source-unavailable");
-    // Remove both source-history and the manifest/blob legacy source fallback,
-    // while leaving the pending-state files behind as stale artifacts.
-    std::fs::remove_dir_all(run_dir.join("history")).unwrap();
-    std::fs::remove_file(run_dir.join("runtime.snapshot.json")).unwrap();
-    std::fs::remove_file(&real_agent).unwrap();
+    // Let the displaced warm leg unwind before deleting its durable source;
+    // otherwise its final persistence can recreate exactly the artifacts this
+    // fixture is meant to make unavailable.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The configured store may tee its local primary to a durable secondary.
+    // Remove source artifacts through that store, rather than deleting only
+    // local files and accidentally leaving the durable source recoverable.
+    let store = crate::runtime::store::RunStoreFactory::shared(&run_base).store_for(&run_id);
+    let source_keys: Vec<_> = store
+        .list_blobs()
+        .unwrap()
+        .into_iter()
+        .filter(|key| {
+            key == SNAPSHOT_MANIFEST_FILE
+                || key == SOURCE_COMMITS_FILE
+                || key == SOURCE_HEAD_FILE
+                || key.starts_with(SOURCE_OBJECTS_PREFIX)
+        })
+        .collect();
+    for key in source_keys {
+        store.delete_blob(&key).unwrap();
+    }
+    assert!(store.list_blobs().unwrap().iter().all(|key| {
+        key != SNAPSHOT_MANIFEST_FILE
+            && key != SOURCE_COMMITS_FILE
+            && key != SOURCE_HEAD_FILE
+            && !key.starts_with(SOURCE_OBJECTS_PREFIX)
+    }));
+    let materialized_root =
+        crate::runtime::source_history::materialization_root(&run_base, &run_id).unwrap();
+    assert!(
+        crate::runtime::source_history::materialize_source(store.as_ref(), &materialized_root)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::remove_file(&real_agent).unwrap();
 
     let (status, body) = resume_with(&state, "fleet-source-unavailable", "A").await;
     let diagnostic = body["error"].as_str().unwrap_or_default();

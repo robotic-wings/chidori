@@ -1000,6 +1000,7 @@ fn retry_startup_signal_recovery(state: AppState, session: StoredSession, run_id
                                 &state,
                                 session.clone(),
                                 call_log,
+                                state.agent_path.clone(),
                             )
                             .await;
                             if !response.status().is_success() {
@@ -1513,6 +1514,7 @@ pub(crate) async fn serve_with_cli_reporter(
                                             &state,
                                             session.clone(),
                                             call_log,
+                                            state.agent_path.clone(),
                                         )
                                         .await;
                                         true

@@ -946,5 +946,5 @@ async fn fire_signal_timeout(state: &AppState, id: &str, seq: u64) {
     };
     let mut call_log = session.call_log.clone();
     call_log.push(signal_resolution_record(&pending, seq, sentinel));
-    let _ = complete_pending_and_resume(state, session, call_log).await;
+    let _ = complete_pending_and_resume(state, session, call_log, state.agent_path.clone()).await;
 }
