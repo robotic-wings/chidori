@@ -373,51 +373,13 @@ pub(in crate::server) async fn resume_session(
     // Resolve a cold fleet recovery source before a later persistence read can
     // hydrate stale local artifacts. This is also before the pending promise
     // completion below, so an unavailable source cannot consume the input.
-    let resume_source = if state.has_default_agent {
-        state.agent_path.clone()
-    } else {
-        let Some(run_id) = original.run_id.as_deref() else {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "durable recorded source unavailable: fleet-only session has no persisted run id"})),
-            )
-                .into_response();
-        };
-        let store =
-            crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
-        let root =
-            match crate::runtime::source_history::materialization_root(&state.run_base, run_id) {
-                Ok(root) => root,
-                Err(error) => {
-                    return (
-                    StatusCode::CONFLICT,
-                    Json(
-                        json!({"error": format!("durable recorded source unavailable: {error:#}")}),
-                    ),
-                )
-                    .into_response();
-                }
-            };
-        match crate::runtime::source_history::materialize_source(store.as_ref(), &root) {
-            Ok(Some(source)) => source,
-            Ok(None) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({"error": "durable recorded source unavailable for this fleet-only session"})),
-                )
-                    .into_response();
-            }
+    let resume_source =
+        match super::resolve_persisted_session_source(&state, original.run_id.as_deref()) {
+            Ok(source) => source,
             Err(error) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(
-                        json!({"error": format!("durable recorded source unavailable: {error:#}")}),
-                    ),
-                )
-                    .into_response();
+                return (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response()
             }
-        }
-    };
+        };
 
     // A parked VM can write its pending completion as soon as it accepts the
     // response. Read the persisted VFS before handing it that response so a

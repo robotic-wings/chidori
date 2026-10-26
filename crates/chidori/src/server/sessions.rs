@@ -33,6 +33,32 @@ use super::{
     store_or_500, warm_resume_enabled, AppState, HostPromiseCompletion,
 };
 
+/// Resolve the source that belongs to a persisted session. Fleet servers have
+/// no configured agent file, so cold recovery must use the run's recorded
+/// source rather than the sentinel used solely to initialize the server.
+pub(super) fn resolve_persisted_session_source(
+    state: &AppState,
+    run_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    if state.has_default_agent {
+        return Ok(state.agent_path.clone());
+    }
+    let run_id = run_id.ok_or_else(|| {
+        "durable recorded source unavailable: fleet-only session has no persisted run id"
+            .to_string()
+    })?;
+    let store = crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
+    let root = crate::runtime::source_history::materialization_root(&state.run_base, run_id)
+        .map_err(|error| format!("durable recorded source unavailable: {error:#}"))?;
+    match crate::runtime::source_history::materialize_source(store.as_ref(), &root) {
+        Ok(Some(source)) => Ok(source),
+        Ok(None) => {
+            Err("durable recorded source unavailable for this fleet-only session".to_string())
+        }
+        Err(error) => Err(format!("durable recorded source unavailable: {error:#}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session API
 // ---------------------------------------------------------------------------
@@ -475,6 +501,13 @@ pub(super) async fn replay_session(
         }
     };
 
+    // Resolve before loading replay state or allocating the replay result, so
+    // an unavailable fleet source cannot leave a partial replay behind.
+    let replay_source = match resolve_persisted_session_source(&state, original.run_id.as_deref()) {
+        Ok(source) => source,
+        Err(error) => return (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
+    };
+
     let call_log = match load_persisted_replay_journal(
         &state.run_base,
         original.run_id.as_deref(),
@@ -532,7 +565,7 @@ pub(super) async fn replay_session(
             engine = crate::server::engine::with_manifest_model(engine, &app_state, run_id);
         }
         engine.run_with_replay_host_promises_and_vfs(
-            &app_state.agent_path,
+            &replay_source,
             &input_clone,
             call_log,
             host_promises,
