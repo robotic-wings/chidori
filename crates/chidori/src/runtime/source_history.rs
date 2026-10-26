@@ -1167,6 +1167,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Source paths are durable data that can be recorded by a Windows fleet
+    /// node and materialized by any later resumer. A Windows current-directory
+    /// spelling is a safe relative entry, not a path escape: it must become
+    /// `agent.ts` beneath the materialization root on every host platform.
+    #[test]
+    fn materializes_windows_current_directory_relative_entry_inside_root() {
+        let (dir, store) = temp_store();
+        let files = vec![(
+            PathBuf::from(r".\agent.ts"),
+            "export async function agent() { return 1; }\n".to_string(),
+        )];
+        commit_files(&store, SourceCommitEvent::RunStart, &files, 0, None).unwrap();
+
+        let root = dir.join("materialized");
+        let entry = materialize_source(&store, &root).unwrap().unwrap();
+        assert_eq!(entry, root.join("agent.ts"));
+        assert_eq!(
+            std::fs::read_to_string(&entry).unwrap(),
+            files[0].1,
+            "the Windows-recorded source must materialize under the run root"
+        );
+        assert!(
+            !root.join(r".\agent.ts").exists(),
+            "a backslash must be treated as a recorded path separator, not a filename character"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Runs recorded before source history existed still carry their entry
     /// text in the snapshot blob's `DurableBlob.bundle` — enough to wake a
     /// single-module agent on a node that has no copy of it.
