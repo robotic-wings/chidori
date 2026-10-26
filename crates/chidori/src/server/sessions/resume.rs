@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 use crate::runtime::call_log::CallRecord;
 use crate::runtime::snapshot::{PendingHostOperation, PendingHostOperationKind};
@@ -88,6 +89,7 @@ pub(in crate::server) async fn complete_pending_and_resume(
     state: &AppState,
     original: StoredSession,
     call_log: Vec<CallRecord>,
+    resume_source: PathBuf,
 ) -> Response {
     // Validate the replay snapshot before reconciling a signal-consumption
     // intent, which can resolve a promise, remove an inbox entry, or append
@@ -159,6 +161,7 @@ pub(in crate::server) async fn complete_pending_and_resume(
     let resume_run_id = original.run_id.clone();
     let policy_profile = original.policy_profile.clone();
     let app_state = state.clone();
+    let run_source = resume_source.clone();
 
     // The resumed leg gets its own warm bridge (when enabled), so a LATER
     // `input()` pause in the continuation parks the live VM for the next
@@ -185,7 +188,7 @@ pub(in crate::server) async fn complete_pending_and_resume(
         match resume_run_id {
             Some(run_id) => engine
                 .run_replay_pausable_with_host_promises_vfs_signals_preserving_run_id(
-                    &app_state.agent_path,
+                    &run_source,
                     &input,
                     call_log,
                     host_promises,
@@ -194,7 +197,7 @@ pub(in crate::server) async fn complete_pending_and_resume(
                     run_id,
                 ),
             None => engine.run_replay_pausable_with_host_promises_vfs_and_signals(
-                &app_state.agent_path,
+                &run_source,
                 &input,
                 call_log,
                 host_promises,
@@ -243,7 +246,7 @@ pub(in crate::server) async fn complete_pending_and_resume(
             (StatusCode::OK, Json(session_view(&session))).into_response()
         }
         Err(e) => {
-            let error = agent_error_string(&state.agent_path, &e);
+            let error = agent_error_string(&resume_source, &e);
             session.status = SessionStatus::Failed;
             session.error = Some(error.clone());
             let _ = state.session_store.put(&session);
@@ -267,7 +270,7 @@ pub(in crate::server) async fn test_resume_from_resolved_signal(
     value: Value,
 ) -> Response {
     let record = signal_resolution_record(pending, pending.seq, value);
-    complete_pending_and_resume(state, original, vec![record]).await
+    complete_pending_and_resume(state, original, vec![record], state.agent_path.clone()).await
 }
 
 /// POST /sessions/:id/resume — supply a response to the agent's pending
@@ -367,6 +370,55 @@ pub(in crate::server) async fn resume_session(
             .into_response();
     }
 
+    // Resolve a cold fleet recovery source before a later persistence read can
+    // hydrate stale local artifacts. This is also before the pending promise
+    // completion below, so an unavailable source cannot consume the input.
+    let resume_source = if state.has_default_agent {
+        state.agent_path.clone()
+    } else {
+        let Some(run_id) = original.run_id.as_deref() else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "durable recorded source unavailable: fleet-only session has no persisted run id"})),
+            )
+                .into_response();
+        };
+        let store =
+            crate::runtime::store::RunStoreFactory::shared(&state.run_base).store_for(run_id);
+        let root =
+            match crate::runtime::source_history::materialization_root(&state.run_base, run_id) {
+                Ok(root) => root,
+                Err(error) => {
+                    return (
+                    StatusCode::CONFLICT,
+                    Json(
+                        json!({"error": format!("durable recorded source unavailable: {error:#}")}),
+                    ),
+                )
+                    .into_response();
+                }
+            };
+        match crate::runtime::source_history::materialize_source(store.as_ref(), &root) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "durable recorded source unavailable for this fleet-only session"})),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(
+                        json!({"error": format!("durable recorded source unavailable: {error:#}")}),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    };
+
     // A parked VM can write its pending completion as soon as it accepts the
     // response. Read the persisted VFS before handing it that response so a
     // corrupt existing snapshot cannot advance the run through the warm path.
@@ -453,25 +505,19 @@ pub(in crate::server) async fn resume_session(
         }
     }
 
-    if !state.has_default_agent {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "cannot rebuild this fleet-only session after its warm continuation was lost: the server has no default agent source and will not use its sentinel as the session source"})),
-        )
-            .into_response();
-    }
-
-    if let Err(err) = validate_snapshot_manifest_for_resume(
-        &state.run_base,
-        original.run_id.as_deref(),
-        &state.agent_path,
-        body.allow_source_change,
-    ) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": err.to_string()})),
-        )
-            .into_response();
+    if state.has_default_agent {
+        if let Err(err) = validate_snapshot_manifest_for_resume(
+            &state.run_base,
+            original.run_id.as_deref(),
+            &resume_source,
+            body.allow_source_change,
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
     }
 
     let _completed_pending = match complete_persisted_pending_host_operation(
@@ -505,7 +551,7 @@ pub(in crate::server) async fn resume_session(
         error: None,
     });
 
-    complete_pending_and_resume(&state, original, call_log).await
+    complete_pending_and_resume(&state, original, call_log, resume_source).await
 }
 
 /// POST /sessions/:id/signal — deliver a signal `{ name, payload, from }` to a
@@ -733,7 +779,8 @@ pub(in crate::server) async fn signal_session(
                 drop(_guard);
                 let mut call_log = original.call_log.clone();
                 call_log.push(signal_resolution_record(&pending, seq, value));
-                complete_pending_and_resume(&state, original, call_log).await
+                complete_pending_and_resume(&state, original, call_log, state.agent_path.clone())
+                    .await
             }
             // No matching pending op on disk (e.g. nothing persisted). Fall back
             // to enqueueing so the signal is not lost.
