@@ -611,7 +611,14 @@ fn materialize_from_bundle(store: &dyn RunStore, root: &Path) -> Result<Option<P
 fn rebase_tree<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Vec<PathBuf>> {
     use std::path::Component;
 
-    let paths: Vec<&Path> = paths.into_iter().collect();
+    // Source history can be replayed on a different platform from the node
+    // that recorded it. Interpret Windows separators before inspecting path
+    // components, rather than creating a literal `\\` filename on Unix (or
+    // allowing `..\\` to evade the escape check there).
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .map(normalize_recorded_separators)
+        .collect();
     anyhow::ensure!(!paths.is_empty(), "recorded source tree is empty");
     for path in &paths {
         anyhow::ensure!(
@@ -638,12 +645,22 @@ fn rebase_tree<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Vec<Path
         anyhow::ensure!(
             relative
                 .components()
-                .all(|component| matches!(component, Component::Normal(_)))
-                && relative.components().next().is_some(),
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+                && relative
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_))),
             "recorded source path `{}` does not rebase to a path inside the \
              materialization root",
             path.display()
         );
+        let relative: PathBuf = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part),
+                Component::CurDir => None,
+                _ => unreachable!("validated source path components"),
+            })
+            .collect();
         anyhow::ensure!(
             seen.insert(relative.clone()),
             "two recorded modules rebase onto `{}`",
@@ -652,6 +669,21 @@ fn rebase_tree<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Vec<Path
         out.push(relative);
     }
     Ok(out)
+}
+
+/// Normalize the separator spelling persisted by a Windows recording node.
+///
+/// A backslash is never a valid materialized filename component: source
+/// histories move between platforms, and treating it as literal would create
+/// a different tree from the recorded one. Standard POSIX paths are returned
+/// unchanged.
+fn normalize_recorded_separators(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text.contains('\\') {
+        PathBuf::from(text.replace('\\', "/"))
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// The longest shared directory prefix of `paths`, `None` when empty.
@@ -1188,6 +1220,9 @@ mod tests {
             files[0].1,
             "the Windows-recorded source must materialize under the run root"
         );
+        // Windows itself treats this spelling as `agent.ts`; Unix is where a
+        // regression would create a literal backslash filename instead.
+        #[cfg(not(windows))]
         assert!(
             !root.join(r".\agent.ts").exists(),
             "a backslash must be treated as a recorded path separator, not a filename character"
