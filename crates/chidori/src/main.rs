@@ -3939,6 +3939,20 @@ fn trace_owner_label(
     }
 }
 
+fn trace_args_preview(args: &str) -> String {
+    const MAX_BYTES: usize = 100;
+    if args.len() <= MAX_BYTES {
+        return args.to_string();
+    }
+    let end = args
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_BYTES)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &args[..end])
+}
+
 fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
     let base_dir = dir
         .map(|d| d.to_path_buf())
@@ -4012,11 +4026,7 @@ fn cmd_trace(run_id: &str, dir: Option<&std::path::Path>) -> Result<()> {
 
     for (r, label) in records.iter().zip(&labels) {
         let args_str = serde_json::to_string(&r.args).unwrap_or_default();
-        let args_short = if args_str.len() > 100 {
-            format!("{}…", &args_str[..100])
-        } else {
-            args_str
-        };
+        let args_short = trace_args_preview(&args_str);
         let err_tag = r
             .error
             .as_ref()
@@ -4960,6 +4970,31 @@ mod tests {
     use super::*;
     use crate::policy::Decision;
     use serde_json::json;
+
+    #[test]
+    fn trace_args_preview_keeps_utf8_boundaries() {
+        assert_eq!(trace_args_preview("short"), "short");
+        assert_eq!(
+            trace_args_preview(&"a".repeat(101)),
+            format!("{}…", "a".repeat(100))
+        );
+        assert_eq!(
+            trace_args_preview(&format!("{}规尾", "a".repeat(98))),
+            format!("{}…", "a".repeat(98))
+        );
+        assert_eq!(
+            trace_args_preview(&format!("{}规尾", "a".repeat(97))),
+            format!("{}规…", "a".repeat(97))
+        );
+        assert_eq!(
+            trace_args_preview(&format!("{}😀尾", "a".repeat(99))),
+            format!("{}…", "a".repeat(99))
+        );
+        assert_eq!(
+            trace_args_preview(&format!("{}😀尾", "a".repeat(96))),
+            format!("{}😀…", "a".repeat(96))
+        );
+    }
 
     // serve_policy reads CHIDORI_POLICY* env vars only on its non-flag paths;
     // the flag-driven branches below are deterministic regardless of ambient
