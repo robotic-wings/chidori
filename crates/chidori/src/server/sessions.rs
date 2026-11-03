@@ -737,9 +737,6 @@ pub(super) async fn cancel_session(
         .unwrap_or_else(|| "session cancelled".to_string());
 
     let active = state.active_sessions.lock().unwrap().remove(&id);
-    // Dropping a warm entry drops its resolution sender: a parked engine
-    // thread wakes with `Park` and unwinds, reclaiming the thread and VM.
-    state.warm_runs.lock().unwrap().remove(&id);
     let was_active = active.is_some();
     let active_attempt_number = active.as_ref().and_then(|active| active.attempt_number);
     if let Some(active) = &active {
@@ -784,6 +781,17 @@ pub(super) async fn cancel_session(
         }
     };
 
+    // Ordinary POST /sessions runs are detached for client-disconnect safety,
+    // but they do not have the streaming runner's cancellation channel. Do
+    // not claim cancellation while the engine may still perform effects and
+    // overwrite the row on completion.
+    if matches!(session.status, SessionStatus::Running) && !was_active {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "running session has no cancellation channel"})),
+        )
+            .into_response();
+    }
     if matches!(session.status, SessionStatus::Completed) && !was_active {
         return (
             StatusCode::CONFLICT,
@@ -791,6 +799,10 @@ pub(super) async fn cancel_session(
         )
             .into_response();
     }
+
+    // Dropping a warm entry drops its resolution sender: a parked engine
+    // thread wakes with `Park` and unwinds, reclaiming the thread and VM.
+    state.warm_runs.lock().unwrap().remove(&id);
 
     session.status = SessionStatus::Cancelled;
     session.error = Some(reason.clone());

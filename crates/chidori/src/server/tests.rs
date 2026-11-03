@@ -2332,6 +2332,17 @@ async fn created_session_is_queryable_while_running_and_after_client_disconnect(
     assert_eq!(duplicate_status, StatusCode::CONFLICT);
     assert_eq!(duplicate_body["session"]["status"], "running");
 
+    let (cancel_status, _) = response_json(
+        cancel_session(
+            State(state.clone()),
+            Path("visible-before-completion".into()),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::CONFLICT);
+
     first.abort(); // Models the client disconnecting while POST is pending.
     let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
