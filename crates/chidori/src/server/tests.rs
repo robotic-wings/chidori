@@ -2286,6 +2286,110 @@ fn create_request(policy_profile: Option<&str>) -> CreateSessionRequest {
     }
 }
 
+#[tokio::test]
+async fn created_session_is_queryable_while_running_and_after_client_disconnect() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = write_agent(
+        temp.path(),
+        r#"export async function agent() {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return { finished: true };
+        }"#,
+    );
+    let mut state = test_state(temp.path().join(".chidori").join("runs"), agent);
+    state.run_semaphore = Arc::new(Semaphore::new(2));
+    state.max_concurrent = 2;
+    let mut request = create_request(None);
+    request.session_id = Some("visible-before-completion".into());
+    let first_state = state.clone();
+    let first =
+        tokio::spawn(async move { create_session(State(first_state), Json(request)).await });
+
+    let running = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (status, body) = response_json(
+                get_session(
+                    State(state.clone()),
+                    Path("visible-before-completion".into()),
+                )
+                .await,
+            )
+            .await;
+            if status == StatusCode::OK && body["status"] == "running" {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("running session should be visible before the agent completes");
+    assert_eq!(running["id"], "visible-before-completion");
+
+    let mut duplicate = create_request(None);
+    duplicate.session_id = Some("visible-before-completion".into());
+    let (duplicate_status, duplicate_body) =
+        response_json(create_session(State(state.clone()), Json(duplicate)).await).await;
+    assert_eq!(duplicate_status, StatusCode::CONFLICT);
+    assert_eq!(duplicate_body["session"]["status"], "running");
+
+    let (cancel_status, _) = response_json(
+        cancel_session(
+            State(state.clone()),
+            Path("visible-before-completion".into()),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::CONFLICT);
+
+    first.abort(); // Models the client disconnecting while POST is pending.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (status, body) = response_json(
+                get_session(
+                    State(state.clone()),
+                    Path("visible-before-completion".into()),
+                )
+                .await,
+            )
+            .await;
+            if status == StatusCode::OK && body["status"] == "completed" {
+                break body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached worker should persist completion after disconnect");
+    assert_eq!(completed["output"], json!({ "finished": true }));
+    assert!(completed["run_id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn failed_created_session_is_queryable() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent = write_agent(
+        temp.path(),
+        r#"export async function agent() { throw new Error('expected failure'); }"#,
+    );
+    let state = test_state(temp.path().join(".chidori").join("runs"), agent);
+    let mut request = create_request(None);
+    request.session_id = Some("failed-session".into());
+    let (status, body) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], "failed");
+    let (get_status, stored) =
+        response_json(get_session(State(state), Path("failed-session".into())).await).await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(stored["status"], "failed");
+    assert!(stored["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("expected failure"));
+}
+
 const HTTP_AGENT: &str = r#"
     export async function agent(input, chidori) {
         const res = await fetch("https://example.invalid/");
