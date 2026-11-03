@@ -89,6 +89,9 @@ pub struct StoredSession {
 }
 
 pub trait SessionStore: Send + Sync {
+    /// Atomically reserve a caller-supplied session id. Returns false when it
+    /// already exists, so an HTTP retry cannot start the agent a second time.
+    fn insert_new(&self, session: &StoredSession) -> Result<bool>;
     fn put(&self, session: &StoredSession) -> Result<()>;
     fn get(&self, id: &str) -> Result<Option<StoredSession>>;
     fn list(&self) -> Result<Vec<StoredSession>>;
@@ -117,6 +120,16 @@ impl Default for MemoryStore {
 }
 
 impl SessionStore for MemoryStore {
+    fn insert_new(&self, s: &StoredSession) -> Result<bool> {
+        use std::collections::hash_map::Entry;
+        match self.inner.lock().unwrap().entry(s.id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(s.clone());
+                Ok(true)
+            }
+            Entry::Occupied(_) => Ok(false),
+        }
+    }
     fn put(&self, s: &StoredSession) -> Result<()> {
         self.inner.lock().unwrap().insert(s.id.clone(), s.clone());
         Ok(())
@@ -181,6 +194,18 @@ impl SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
+    fn insert_new(&self, s: &StoredSession) -> Result<bool> {
+        let data = serde_json::to_string(s)?;
+        let status = serde_json::to_string(&s.status)?;
+        let created_at = s.created_at.to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, created_at, status, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![s.id, created_at, status, data],
+        )?;
+        Ok(inserted == 1)
+    }
     fn put(&self, s: &StoredSession) -> Result<()> {
         let data = serde_json::to_string(s)?;
         let status = serde_json::to_string(&s.status).unwrap_or_else(|_| "\"running\"".into());
@@ -323,6 +348,26 @@ mod tests {
             .unwrap()
             .expect("session survives reopen");
         assert_eq!(got.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn insert_new_never_overwrites_an_existing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: Vec<Box<dyn SessionStore>> = vec![
+            Box::new(MemoryStore::new()),
+            Box::new(SqliteStore::open(dir.path().join("sessions.sqlite3")).unwrap()),
+        ];
+        for store in stores {
+            let mut first = sample_session("same-id");
+            first.status = SessionStatus::Running;
+            first.output = None;
+            assert!(store.insert_new(&first).unwrap());
+            let second = sample_session("same-id");
+            assert!(!store.insert_new(&second).unwrap());
+            let stored = store.get("same-id").unwrap().unwrap();
+            assert_eq!(stored.status, SessionStatus::Running);
+            assert!(stored.output.is_none());
+        }
     }
 
     #[test]

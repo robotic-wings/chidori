@@ -214,23 +214,29 @@ pub(super) async fn create_session(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Response {
-    let permit = match acquire_run_slot(&state).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
-
     let id = body
         .session_id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let input = body.input.clone();
-    let replay_from = body.replay_from.clone();
+    // A retry for an already accepted id should answer immediately even when
+    // every run slot is occupied by the original request. The atomic insert
+    // below still settles the race between two simultaneous first requests.
+    match state.session_store.get(&id) {
+        Ok(Some(existing)) => return duplicate_session_response(&existing),
+        Ok(None) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
     if let Err((status, msg)) = validate_policy_profile(body.policy_profile.as_deref()) {
         return (status, Json(json!({"error": msg}))).into_response();
     }
-    let policy_profile = body.policy_profile.clone();
     // Resolve an optional per-session agent override before spawning
     // the blocking worker — cheaper to reject here than to take a
     // concurrency permit for an invalid request.
@@ -265,8 +271,115 @@ pub(super) async fn create_session(
             &format!("session policy profile '{profile}'"),
         );
     }
-    let app_state = state.clone();
+    let permit = match acquire_run_slot(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let session = StoredSession {
+        id: id.clone(),
+        run_id: None,
+        status: SessionStatus::Running,
+        input: body.input.clone(),
+        output: None,
+        call_log: Vec::new(),
+        error: None,
+        pending_seq: None,
+        pending_prompt: None,
+        pending_details: None,
+        pending_signal_name: None,
+        pending_signal_names: Vec::new(),
+        pending_signal_deadline: None,
+        pending_approval: None,
+        approvals: Vec::new(),
+        policy_profile: body.policy_profile.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    match state.session_store.insert_new(&session) {
+        Ok(true) => {}
+        Ok(false) => {
+            return match state.session_store.get(&id) {
+                Ok(Some(existing)) => duplicate_session_response(&existing),
+                Ok(None) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "session id already exists"})),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            };
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    // The worker owns the run permit and survives an HTTP client timeout.
+    // The outer supervisor also persists an unexpected worker panic.
+    let supervisor_state = state.clone();
+    let supervisor_session = session.clone();
+    let supervisor = tokio::spawn(async move {
+        let worker = tokio::spawn(run_created_session(
+            state,
+            body,
+            id,
+            effective_agent_path,
+            permit,
+            session,
+        ));
+        match worker.await {
+            Ok(response) => response,
+            Err(e) => {
+                let mut failed = supervisor_session;
+                failed.status = SessionStatus::Failed;
+                failed.error = Some(format!("agent run task failed: {e}"));
+                if let Some(err) = store_or_500(&supervisor_state, &failed) {
+                    return err;
+                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": failed.error, "session": session_view(&failed)})),
+                )
+                    .into_response()
+            }
+        }
+    });
+    match supervisor.await {
+        Ok(response) => response,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("session supervisor failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
 
+fn duplicate_session_response(existing: &StoredSession) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "session id already exists; query this session instead of retrying the run",
+            "session": session_view(existing),
+        })),
+    )
+        .into_response()
+}
+
+async fn run_created_session(
+    state: AppState,
+    body: CreateSessionRequest,
+    id: String,
+    effective_agent_path: PathBuf,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    mut session: StoredSession,
+) -> Response {
+    let replay_from = body.replay_from.clone();
+    let app_state = state.clone();
     let result = if warm_resume_enabled() {
         // Warm mode: run the leg under a supervisor task and consume ONE
         // outcome — either an input pause surfaced by the bridge (the VM
@@ -305,28 +418,9 @@ pub(super) async fn create_session(
             }
         })
         .await
-        .unwrap()
+        .unwrap_or_else(|join_err| Err(anyhow::anyhow!("agent run panicked: {join_err}")))
     };
-
-    let mut session = StoredSession {
-        id: id.clone(),
-        run_id: None,
-        status: SessionStatus::Failed,
-        input,
-        output: None,
-        call_log: Vec::new(),
-        error: None,
-        pending_seq: None,
-        pending_prompt: None,
-        pending_details: None,
-        pending_signal_name: None,
-        pending_signal_names: Vec::new(),
-        pending_signal_deadline: None,
-        pending_approval: None,
-        approvals: Vec::new(),
-        policy_profile,
-        created_at: chrono::Utc::now(),
-    };
+    session.status = SessionStatus::Failed;
     match result {
         Ok(run_result) => apply_run_outcome(&mut session, run_result),
         Err(e) => session.error = Some(agent_error_string(&state.agent_path, &e)),
