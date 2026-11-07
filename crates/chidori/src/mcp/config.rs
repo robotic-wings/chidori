@@ -65,9 +65,8 @@ pub struct McpServerConfig {
     /// token and never reaches the guest.
     #[serde(default)]
     pub auth_token: Option<String>,
-    /// Maximum time, in milliseconds, to wait for an HTTP MCP request and its
-    /// response headers. Kept on every server configuration so an omitted
-    /// value preserves the established 30 second behavior.
+    /// Maximum time, in milliseconds, for the complete HTTP MCP response,
+    /// including its body. An omitted value preserves the 30 second default.
     #[serde(
         default = "default_timeout_ms",
         deserialize_with = "deserialize_timeout_ms"
