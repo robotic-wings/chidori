@@ -1945,6 +1945,117 @@ async fn fleet_only_cold_fallback_materializes_recorded_source_and_completes() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+#[tokio::test]
+async fn fleet_only_signal_resumes_the_explicit_agent_and_input_resume_cannot_consume_it() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-signal-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let agent = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(_input, chidori) {
+                const wake = await chidori.signal("run-now", { timeoutMs: 60000 });
+                return { woke: wake.name, value: wake.payload.value };
+            }
+        "#,
+    );
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base, temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+
+    let request = CreateSessionRequest {
+        input: json!({}),
+        session_id: Some("fleet-signal".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(agent.file_name().unwrap().to_string_lossy().into_owned()),
+        policy_profile: None,
+    };
+    let (status, created) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["pending_signal_name"], json!("run-now"));
+
+    let (status, refused) = resume_with(&state, "fleet-signal", "run-now").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("not waiting on input"));
+    assert_eq!(
+        state
+            .session_store
+            .get("fleet-signal")
+            .unwrap()
+            .unwrap()
+            .pending_signal_name,
+        Some("run-now".to_string())
+    );
+
+    let (status, completed) = response_json(
+        signal_session(
+            State(state.clone()),
+            Path("fleet-signal".to_string()),
+            Json(SignalRequest {
+                allow_source_change: false,
+                name: "run-now".to_string(),
+                payload: json!({ "value": 7 }),
+                from: Value::Null,
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {completed}");
+    assert_eq!(completed["status"], json!("completed"));
+    assert_eq!(
+        completed["output"],
+        json!({ "woke": "run-now", "value": 7 })
+    );
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test]
+async fn fleet_only_signal_timeout_resumes_the_explicit_agent() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "chidori-server-fleet-timeout-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let agent = write_agent(
+        &temp_dir,
+        r#"
+            export async function agent(_input, chidori) {
+                const wake = await chidori.signal("run-now", { timeoutMs: 100 });
+                return { timedOut: wake.timedOut === true };
+            }
+        "#,
+    );
+    let run_base = temp_dir.join(".chidori").join("runs");
+    std::fs::create_dir_all(&run_base).unwrap();
+    let mut state = test_state(run_base, temp_dir.join("__no_default_agent__.ts"));
+    state.has_default_agent = false;
+
+    let request = CreateSessionRequest {
+        input: json!({}),
+        session_id: Some("fleet-timeout".to_string()),
+        attempt_number: None,
+        replay_from: None,
+        agent: Some(agent.file_name().unwrap().to_string_lossy().into_owned()),
+        policy_profile: None,
+    };
+    let (status, created) =
+        response_json(create_session(State(state.clone()), Json(request)).await).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["pending_signal_name"], json!("run-now"));
+    let completed = wait_for_status(&state, "fleet-timeout", SessionStatus::Completed).await;
+    assert_eq!(completed.output, Some(json!({ "timedOut": true })));
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
 /// A fleet session whose recorded source is genuinely absent cannot recover,
 /// but its error must distinguish that durable condition from the server's
 /// synthetic no-default-agent pathname and must not consume the pending input.

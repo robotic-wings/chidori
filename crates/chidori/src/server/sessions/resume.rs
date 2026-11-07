@@ -327,6 +327,14 @@ pub(in crate::server) async fn resume_session(
         }
     };
 
+    if original.pending_prompt.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "Session is not waiting on input; use /signal or /approve for its pending operation"})),
+        )
+            .into_response();
+    }
+
     let Some(seq) = original.pending_seq else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -696,6 +704,14 @@ pub(in crate::server) async fn signal_session(
                 .into_response();
         }
 
+        let resume_source =
+            match super::resolve_persisted_session_source(&state, original.run_id.as_deref()) {
+                Ok(source) => source,
+                Err(error) => {
+                    return (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response()
+                }
+            };
+
         if let Err(error) = load_persisted_vfs(&state.run_base, original.run_id.as_deref()) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -704,17 +720,19 @@ pub(in crate::server) async fn signal_session(
                 .into_response();
         }
 
-        if let Err(err) = validate_snapshot_manifest_for_resume(
-            &state.run_base,
-            original.run_id.as_deref(),
-            &state.agent_path,
-            body.allow_source_change,
-        ) {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response();
+        if state.has_default_agent {
+            if let Err(err) = validate_snapshot_manifest_for_resume(
+                &state.run_base,
+                original.run_id.as_deref(),
+                &resume_source,
+                body.allow_source_change,
+            ) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
         }
 
         // The recorded signal result freezes `{name,payload,from}` (doc §8.3) —
@@ -741,8 +759,7 @@ pub(in crate::server) async fn signal_session(
                 drop(_guard);
                 let mut call_log = original.call_log.clone();
                 call_log.push(signal_resolution_record(&pending, seq, value));
-                complete_pending_and_resume(&state, original, call_log, state.agent_path.clone())
-                    .await
+                complete_pending_and_resume(&state, original, call_log, resume_source).await
             }
             // No matching pending op on disk (e.g. nothing persisted). Fall back
             // to enqueueing so the signal is not lost.
