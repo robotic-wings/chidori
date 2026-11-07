@@ -40,6 +40,10 @@ module, each identified by a content hash — plus:
   histories one: any journaled call can be traced back to the exact
   implementation that produced it.
 
+The tree includes Chidori's synthetic `node:` shims. For example, an agent
+importing `node:fs` records the runtime's `fs` and `buffer` shim source
+alongside its own file, even though those modules have no disk path to read.
+
 Commit ids are deterministic, and every recording point **dedupes against the
 head commit**: recording an identical tree is a no-op. Resume-without-edit,
 replay, and repeated safepoints never grow the history; only real changes do.

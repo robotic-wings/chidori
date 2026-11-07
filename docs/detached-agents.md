@@ -107,7 +107,11 @@ executing, the runtime takes a short-lived, regularly renewed lease on the
 agent's run and releases it on hibernate/settle. A wake that finds the lease
 held waits for it: a live holder keeps renewing (so the waiter stands down to
 the genuine driver), while a dead process's lease expires unrenewed and
-transfers. The server also periodically re-drives any `running` agent that has
+transfers. The detached-driver lease lasts five minutes in the current runtime;
+after an abrupt CLI process exit, a different server can report
+`running, live:false` until that lease expires. This is separate from the
+configurable run-store lease described in [Durable Storage](./durable-storage.md).
+The server also periodically re-drives any `running` agent that has
 no worker thread, so an agent whose driver died — including one killed before
 it ever hibernated — is picked back up instead of sitting `running` forever.
 A queued `send` to such an agent also wakes it directly.

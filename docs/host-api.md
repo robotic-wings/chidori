@@ -214,14 +214,16 @@ const answer = await chidori.input("Approve this request?", {
   type: "approval",
   choices: ["yes", "no"],
   default: "no",
-  details: draft, // the artifact under review — shown to the human
+  details: draftText, // string artifact under review — shown to the human
 });
 ```
 
-Pause for a human. `details` carries the thing being approved (a draft, a
-diff, a report): the CLI prints it above the prompt, and a paused session
+Pause for a human. `details` must be a string containing the thing being
+approved (a draft, a diff, a report). The CLI prints it above the prompt, and a paused session
 exposes it as `pending_details` alongside `pending_prompt` — approval gates
-are never blind. It is display-only and never part of the durable record.
+are never blind. A non-string `details` value is ignored and
+`pending_details` remains `null`; serialize structured data yourself when
+needed. It is display-only and never part of the durable record.
 
 - Under `chidori serve`, `input()` **pauses the session**; resume with
   `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
@@ -344,7 +346,11 @@ const child = await chidori.callAgent("child.ts", { topic: "snapshots" });
 ```
 
 Sub-agents share the parent runtime context and journal. Runtime dispatch
-accepts TypeScript `.ts` sub-agents only.
+accepts TypeScript `.ts` sub-agents only. They also share the captured virtual
+filesystem (VFS): if the parent writes `/note.txt` with `node:fs`, the child
+can read it, and a child overwrite is visible to the parent after
+`callAgent` returns. This differs from `chidori.branch`, which copies the VFS
+at the fork anchor.
 
 ## Concurrency and multi-agent
 
@@ -382,6 +388,17 @@ the journal without re-running the branches. Variants run in waves of
 `options.concurrency` worker threads (default 1 — sequential); outcome order
 always follows variant order. Nested `chidori.branch` inside a branch is
 rejected.
+
+The VFS anchor applies to the virtual `node:fs` store. It does not isolate
+`chidori.workspace`: branch writes there reach the shared host workspace and
+can be observed by the parent and other branches. See
+[Branching Execution](./branching-execution.md).
+
+Before starting any variant, `branch` validates every variant and reads every
+`source` file. A missing path rejects the **whole call** before any branch
+runs; it does not appear as one variant's `failed` outcome. A source that
+exists and then throws during execution does produce a `failed` outcome. See
+[Branching Execution](./branching-execution.md#the-agent-facing-api).
 
 Persisted branches are independently operable after the parent moves on:
 
@@ -555,6 +572,11 @@ await chidori.compensation.register("deprovision", "comp/deprovision.ts", {
 });
 ```
 
+`name` and `agent` must each be a non-empty string. In particular, an empty
+`name` rejects registration before a compensation is journaled. The `agent`
+path must also resolve to an existing module; an absent file rejects the
+registration before anything is armed.
+
 The journal runs forward; compensations let it run **backward**. Each
 registration durably records an inverse action — an agent module plus its
 input — for a side effect the run just performed. Registration itself does
@@ -692,6 +714,11 @@ request into an agent event. The endpoint reference lives in
 [Deployment](./deployment.md); typed clients in the
 [TypeScript SDK](../sdk/typescript/README.md) and
 [Python SDK](../sdk/python/README.md).
+
+`POST /sessions` returns `201 Created` with the new session view even when the
+agent pauses on `input()` or `signal()`. A paused run created through the
+catch-all event route instead returns `202 Accepted`. An input-schema refusal
+on `POST /sessions` returns `400` with the failed session view.
 
 ## Providers & model selection
 

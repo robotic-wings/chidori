@@ -27,12 +27,20 @@ branch and compare.
 A branch is a **separate continuation source run once** — not a re-run of the
 parent. Re-running the parent's source would re-reach `chidori.branch` and
 recurse, so the prefix is **handed over as state** (the parent's captured
-workspace state plus an explicit `input`), not replayed. Branches act on the
+virtual filesystem (VFS) state plus an explicit `input`), not replayed. Branches act on the
 *result* of the prefix; they don't re-derive it. Each branch is a new durable
 sub-run seeded from the parent's anchor; the runtime runs each variant's
 module, collects the outcomes, and returns them. The whole fan-out is one
 recorded host call on the parent, so the parent's own [replay](./replay.md)
 returns the outcomes from cache.
+
+The VFS is the in-memory file store used by `node:fs`; it is separate from
+`chidori.workspace`, which writes to the agent's host workspace directory.
+The branch anchor copies the VFS, **not** that host directory. A branch's
+`chidori.workspace.write` is visible to the parent and to other branches
+using the same workspace root. Concurrent branches that write the same path
+can therefore observe different values depending on scheduling; use distinct
+paths or serialize those writes when comparing branch results.
 
 Signals compose with branching — a branch listening on a signal drains the
 parent run's shared mailbox; see
@@ -74,11 +82,22 @@ branch(variants: BranchVariant[], options?: {
 - Every variant is validated (and its source read) **before any branch runs**,
   so a missing `source` or a typo'd path fails the whole call without spending
   anything — and without recording anything.
+- This preflight failure is different from a `failed` outcome: a source file
+  that exists but throws **while running** produces a `failed` outcome for
+  that variant. For example, `branch([{ source: "ok.ts" },
+  { source: "missing.ts" }])` rejects before `ok.ts` runs; replacing
+  `missing.ts` with a file that throws lets the call return both outcomes.
 - Returns **all** outcomes (compare, don't merge). The agent runs its own
   selection: `const best = outcomes.reduce(pick);`
 - A `paused` outcome carries a `branchId` you can resume out-of-band with
   `chidori branch-resume` (see below), keeping the JS surface a single awaited
   Promise.
+
+This depends on the run mode at the pause point. Under bare `chidori run`,
+`chidori.input()` reads stdin, including inside a branch. EOF without an
+input `default` makes that branch **fail** with an end-of-file error; it does
+not create a `paused` branch. A branch created under `chidori serve` can pause
+on `input()` and later be resumed with `chidori branch-resume`.
 
 ## How it works
 
@@ -87,7 +106,7 @@ array — on parent replay it returns cached and the branches never re-run. For
 each variant, the runtime:
 
 1. Anchors the branch on the parent's state at the fork: the parent's captured
-   workspace state plus the variant's explicit `input`.
+   VFS state plus the variant's explicit `input`.
 2. Runs the branch's source module as its own durable sub-run — live, through
    the same recorded-effect path as any run, under the same approval policy as
    the parent, journaling into the branch's own store.
@@ -117,7 +136,7 @@ is persisted under it:
 
 ```text
 <run dir>/branches/op-<fork point>/
-  anchor.json              fork-time anchor: the parent's captured workspace state
+  anchor.json              fork-time anchor: the parent's captured VFS state
   branch-<k>/
     source.ts              the branch's own EDITABLE source copy
     checkpoint.json        the branch's journal artifact (a compacted journal —
@@ -164,7 +183,7 @@ same posture flags as `chidori run`.
   out-of-band.
 - **Edit-and-rerun** discards the branch's previous journal and re-runs the
   branch **fresh from the parent anchor** with whatever `source.ts` now
-  contains. The anchored state (fork-time workspace state + the variant's
+  contains. The anchored state (fork-time VFS state + the variant's
   `input`) is identical to the original fork, so only the branch's code is the
   variable. Branch runs never go through the run manifest's source-identity
   gate — the anchor is the captured state, not a source check.
@@ -189,7 +208,7 @@ and `--diff` compares any two versions (see
   folds its records into the parent's journal, so live runs and replays see
   the identical, collision-free record — a branch that violates this invariant
   fails the call rather than corrupting the journal.
-- **State-handover fidelity:** branches inherit the captured workspace state
+- **State-handover fidelity:** branches inherit the captured VFS state
   plus the explicit `input`, not the parent's in-flight JS locals. The agent passes
   what a branch needs.
 
@@ -199,7 +218,8 @@ N branches make N sets of **live** host calls past the fork — real LLM/tool
 spend. The controls: `options.concurrency` caps simultaneous live branches
 (default 1), the fan-out is hard-capped at 16 variants, and each branch runs
 under the same approval policy as the parent. Branches use separate, isolated
-VMs; no shared mutable state.
+VMs. They still share host-backed effects such as `chidori.workspace` when
+those effects use the same root.
 
 ## Example
 

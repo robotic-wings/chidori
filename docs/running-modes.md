@@ -68,14 +68,20 @@ server would let anyone on the network execute agents
 (`CHIDORI_ALLOW_UNAUTHENTICATED=1` explicitly opts out). See
 [Deployment](./deployment.md).
 
-A **session** is a run addressed over HTTP: a session id *is* a run id, and
-the session's journal lives in `.chidori/runs/<session_id>/`.
+A **session** is a run addressed over HTTP. The session `id` addresses the
+HTTP record; its `run_id` field identifies the underlying durable run and its
+journal at `.chidori/runs/<run_id>/`. These IDs can differ, including for a
+session created without an explicit `session_id`. Use `run_id` for CLI commands
+such as `chidori verify`, `chidori history`, and `chidori branch-resume`.
 
 Exposes:
 - `GET  /health` — health check
 - `ANY  /*` — any other request is folded into `{ event: … }` and run as the
   agent's input (see [Event-driven agents](#3-event-driven-agents))
-- `POST /sessions` — create a session and run the agent with given input
+- `POST /sessions` — create a session and run the agent with given input;
+  returns `201 Created` with the session view whether the run completes or
+  pauses. An input-schema refusal returns `400` with the failed session view
+  and its validation issues instead.
 - `GET  /sessions` — list all sessions
 - `GET  /sessions/{id}` — get session result
 - `GET  /sessions/{id}/checkpoint` — get the session's journal records and snapshot manifest metadata
@@ -182,7 +188,12 @@ curl -X POST http://localhost:8080/hooks/pr \
   -d '{"action": "opened", "pull_request": {"title": "Add login"}}'
 ```
 
-The status-code contract:
+The following status-code contract is for the **catch-all event route**
+(`ANY /*`), such as the `/hooks/pr` example above. It is not the response
+contract for `POST /sessions`, which returns `201 Created` for a newly
+created session even when that session is paused.
+
+The event-route status-code contract:
 
 - An agent output carrying **both** `status` and `body` becomes the HTTP
   response — that status code, JSON body, and any extra `headers`. Any

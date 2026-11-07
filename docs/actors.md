@@ -225,6 +225,13 @@ await worker.status();  // { pid, status, restarts, mailbox, waitingFor? }
 await chidori.actors.lookup("researcher");  // a handle, or null
 ```
 
+For a top-level actor, settling it with `join()` or `stop()` does not remove
+its registered name from that run's actor registry. `lookup(name)` can still
+return its handle; inspect `status()` or the settle outcome to distinguish a
+terminal actor from a running one. Names of children reaped during supervisor
+settlement or a `clean` restart are released so the supervisor can recreate
+them.
+
 ## Restart strategies
 
 | Strategy | On iteration failure |
