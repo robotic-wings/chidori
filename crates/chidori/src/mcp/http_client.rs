@@ -92,7 +92,10 @@ impl McpHttpClient {
             None => None,
         };
 
+        // Bound the complete response, including a streaming body that stalls
+        // after headers. The send-only timeout below cannot cover resp.text().
         let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(cfg.timeout_ms))
             .build()
             .context("building MCP http client")?;
 
@@ -240,7 +243,13 @@ impl McpHttpClient {
         let resp = tokio::time::timeout(self.timeout, req.send())
             .await
             .map_err(|_| anyhow!("MCP `{}` to `{}` timed out", method, self.server_id))?
-            .map_err(|err| self.transport_error(method, &err.to_string()))?;
+            .map_err(|err| {
+                if err.is_timeout() {
+                    anyhow!("MCP `{}` to `{}` timed out", method, self.server_id)
+                } else {
+                    self.transport_error(method, &err.to_string())
+                }
+            })?;
 
         let status = resp.status();
         let response_session = resp
@@ -264,10 +273,13 @@ impl McpHttpClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| self.transport_error(method, &err.to_string()))?;
+        let text = resp.text().await.map_err(|err| {
+            if err.is_timeout() {
+                self.transport_error(method, "response body timed out")
+            } else {
+                self.transport_error(method, &err.to_string())
+            }
+        })?;
 
         let response = if content_type.contains("text/event-stream") {
             parse_sse_response(&text, id)
@@ -662,6 +674,27 @@ mod tests {
         addr
     }
 
+    /// Sends headers promptly, then stalls before completing the JSON body.
+    fn spawn_stalled_body_mcp_server(delay: std::time::Duration) -> std::net::SocketAddr {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = read_mock_request_body(&mut stream);
+                let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(headers.as_bytes());
+                std::thread::sleep(delay);
+                let _ = stream.write_all(payload.as_bytes());
+            }
+        });
+        addr
+    }
+
     #[test]
     fn connect_discovers_tools_and_calls_them() {
         let addr = spawn_mock_mcp_server();
@@ -700,6 +733,25 @@ mod tests {
 
         let err = match rt.block_on(McpHttpClient::connect("slow", cfg)) {
             Ok(_) => panic!("a 25ms server timeout must abort a 100ms HTTP response"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn connect_times_out_when_http_body_stalls_after_headers() {
+        let addr = spawn_stalled_body_mcp_server(std::time::Duration::from_millis(150));
+        let cfg: McpServerConfig = serde_json::from_str(&format!(
+            r#"{{"transport":"http","url":"http://{addr}/mcp","timeoutMs":30}}"#
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let err = match rt.block_on(McpHttpClient::connect("stalled-body", cfg)) {
+            Ok(_) => panic!("a 30ms timeout must abort a stalled response body"),
             Err(err) => err,
         };
         assert!(
