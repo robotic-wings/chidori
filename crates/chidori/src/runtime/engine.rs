@@ -1390,6 +1390,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn scaffold_history_records_synthetic_node_builtin_sources() {
+        use crate::runtime::source_history::{self, SourceCommitEvent};
+        use crate::runtime::store::FsRunStore;
+
+        let base =
+            std::env::temp_dir().join(format!("chidori-builtin-history-{}", uuid::Uuid::new_v4()));
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("agent.ts");
+        let source = "import { readFileSync } from \"node:fs\";\n\
+            export async function agent() { return { loaded: !!readFileSync }; }\n";
+        std::fs::write(&path, source).unwrap();
+        let run_id = "builtin-history";
+        let policy = RuntimePolicy::durable_default(run_id);
+        let ctx = RuntimeContext::new();
+
+        ScaffoldPersister::new(&base, run_id, &path, source, &policy)
+            .persist(&ctx, CheckpointWrite::Compact)
+            .unwrap();
+
+        let store = FsRunStore::new(base.join(run_id));
+        let commits = source_history::load_commits(&store).unwrap();
+        assert_eq!(commits.len(), 1, "node:fs must not omit run_start");
+        assert_eq!(commits[0].event, SourceCommitEvent::RunStart);
+        for name in ["fs", "buffer"] {
+            let builtin_path = std::path::PathBuf::from(format!("/__node_builtins__/{name}.js"));
+            let object = commits[0]
+                .tree_object(&builtin_path)
+                .expect("builtin shim must be present in the source tree");
+            let recorded = source_history::load_object(&store, object)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recorded,
+                crate::runtime::typescript::builtins::source_for(&builtin_path).unwrap()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     /// Under the standard `.chidori/runs` layout, identical trees recorded
     /// by different runs share one stored object: the first run back-fills
     /// the sibling `history-objects/` cache and every later run hardlinks

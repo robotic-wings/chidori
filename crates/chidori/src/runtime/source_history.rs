@@ -470,15 +470,20 @@ pub fn load_object(store: &dyn RunStore, id: &str) -> Result<Option<String>> {
         .context("source object is not UTF-8")
 }
 
-/// Read a set of module files (paths + texts) from disk — the shared shape
-/// every recording point feeds into [`CommitInput::files`].
+/// Read module source texts for a history commit. Synthetic `node:` builtin
+/// modules have no file on disk; read the same shim source as the module graph
+/// and runtime loader so their source versions are recorded too.
 pub fn read_source_files(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
     paths
         .iter()
         .map(|path| {
-            std::fs::read_to_string(path)
-                .map(|text| (path.clone(), text))
-                .with_context(|| format!("reading source file {}", path.display()))
+            let text = if let Some(shim) = crate::runtime::typescript::builtins::source_for(path) {
+                shim.to_string()
+            } else {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading source file {}", path.display()))?
+            };
+            Ok((path.clone(), text))
         })
         .collect()
 }

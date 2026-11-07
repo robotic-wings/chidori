@@ -83,6 +83,11 @@ tags (`{% … %}`) do not leak their trailing newline or leading indentation
 into the output — templates can be indented for readability without producing
 ragged prompt text.
 
+The final newline of a template file is also removed from the rendered result.
+For example, a file containing `Hi {{ who }}\n` renders as `Hi user` for
+`{ who: "user" }`. Add an explicit newline in the template expression if the
+result must end with one.
+
 ## Durability and replay
 
 Every `chidori.template` call is a journaled `template` host call: the

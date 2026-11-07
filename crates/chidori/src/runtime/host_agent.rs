@@ -1393,11 +1393,11 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                         "detached agent is leased to another process; waiting for the lease \
                          to expire or be renewed"
                     );
-                    // Sleep to the holder's expiry in stop-aware slices.
+                    // Even after a local stop request, keep this supervisor
+                    // alive until it can take the lease and settle the run.
+                    // Returning here strands a persisted stop as `running`:
+                    // the send path suppresses new wakes for stopped entries.
                     loop {
-                        if entry.state.lock().unwrap().stop_requested {
-                            return;
-                        }
                         let remaining = previous_expiry - Utc::now();
                         if remaining <= chrono::Duration::zero() {
                             break;
@@ -3168,7 +3168,7 @@ mod tests {
             crate::runtime::store::acquire_lease(
                 store.as_ref(),
                 "other-process-and-run",
-                chrono::Duration::minutes(5),
+                chrono::Duration::seconds(2),
             )
             .unwrap()
             .expect("test fixture must acquire the seeded lease");
@@ -3183,16 +3183,32 @@ mod tests {
                 Err(std::sync::mpsc::TryRecvError::Empty)
             );
 
-            // Stop before opening the contended path so the real stop-aware
-            // loop exits immediately instead of sleeping to the lease TTL.
+            // A stop and matching delivery while another process owns the
+            // lease must not strand the run as running with no driver. The
+            // queued wake cannot execute until the foreign lease expires.
             let entry = hub().ensure_entry(&parts, LEASE_WAIT_AGENT).unwrap();
-            entry.state.lock().unwrap().stop_requested = true;
+            let stop = hub().stop(&parts, LEASE_WAIT_AGENT).unwrap();
+            assert_eq!(stop["stopRequested"], json!(true), "{stop}");
+            let sent = hub()
+                .send(
+                    &parts,
+                    LEASE_WAIT_AGENT,
+                    "never",
+                    json!({ "n": 64 }),
+                    json!({ "kind": "human", "id": "test" }),
+                )
+                .unwrap();
+            assert_eq!(sent["delivered"], json!(true), "{sent}");
             contention_release.send(()).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut state = entry.state.lock().unwrap();
-            while state.thread_live {
+            while state.descriptor.status != "stopped" || state.thread_live {
                 let now = std::time::Instant::now();
-                assert!(now < deadline, "supervisor did not exit after stop request");
+                assert!(
+                    now < deadline,
+                    "supervisor stranded stopped request after contended lease: {:?}",
+                    state.descriptor.status
+                );
                 let (next, _) = entry
                     .signal
                     .wait_timeout(state, deadline.saturating_duration_since(now))
@@ -3201,7 +3217,7 @@ mod tests {
             }
             std::fs::write(
                 std::env::var_os(LEASE_WAIT_CLEANUP_ENV).unwrap(),
-                "supervisor-exited-before-ttl",
+                "stopped-after-foreign-lease-expired",
             )
             .unwrap();
 
@@ -3236,8 +3252,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(cleanup_marker).unwrap(),
-            "supervisor-exited-before-ttl",
-            "child must stop its waiting supervisor before the lease TTL"
+            "stopped-after-foreign-lease-expired",
+            "child must settle the persisted stop after the foreign lease expires"
         );
     }
 

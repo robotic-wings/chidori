@@ -61,7 +61,10 @@ Each namespace is one pretty-printed JSON object at:
 
 `<root>` resolves in precedence order:
 
-1. **`CHIDORI_MEMORY_DIR`** — explicit override, wins outright.
+1. **`CHIDORI_MEMORY_DIR`** — explicit override for `<root>`, wins outright.
+   Despite the variable's name, it is a root directory, not the final
+   `memory/` directory: setting it to `/tmp/my-agent` stores the default
+   namespace at `/tmp/my-agent/.chidori/memory/default.json`.
 2. **The run's workspace root** — the agent file's directory under
    `run`/`resume`/`serve` and for detached agents, or
    `CHIDORI_WORKSPACE_ROOT` when set.

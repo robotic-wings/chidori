@@ -281,14 +281,16 @@ const answer = await chidori.input("Approve this request?", {
   type: "approval",
   choices: ["yes", "no"],
   default: "no",
-  details: draft,   // the artifact under review — shown to the human
+  details: draftText, // string artifact under review — shown to the human
 });
 ```
 
-`details` carries the thing being approved (a draft, a diff, a report): the
+`details` must be a string containing the thing being approved (a draft, a diff, a report). The
 CLI prints it above the prompt, and a paused session exposes it as
 `pending_details` alongside `pending_prompt` — so approval gates are never
-blind. It is display-only and never part of the durable record.
+blind. A non-string value is ignored and `pending_details` remains `null`;
+serialize structured data yourself when needed. It is display-only and never
+part of the durable record.
 
 In server mode, `input()` pauses the session. Resume it with
 `POST /sessions/{id}/resume` or `AgentClient.resume(id, response)`.
@@ -354,7 +356,9 @@ const child = await chidori.callAgent("child.ts", { topic: "snapshots" });
 ```
 
 Sub-agents share the parent runtime context and call log. Runtime dispatch
-accepts TypeScript `.ts` sub-agents only.
+accepts TypeScript `.ts` sub-agents only. They share the captured virtual
+filesystem used by `node:fs`: a child overwrite is visible to the parent
+after `callAgent` returns. `chidori.branch` instead copies the VFS at its fork.
 
 ### util.parallel
 
@@ -391,6 +395,16 @@ waves of `options.concurrency` worker threads (default 1 — sequential);
 outcome order always follows variant order. Nested `chidori.branch` inside a
 branch is rejected.
 
+The VFS anchor applies to the virtual `node:fs` store. It does not isolate
+`chidori.workspace`: branch writes there reach the shared host workspace and
+can be observed by the parent and other branches. Concurrent writes to the
+same path can therefore race.
+
+The runtime validates every variant and reads every `source` file before
+starting any branch. A missing source path rejects the whole `branch` call;
+it does not become one variant's `failed` outcome. If an existing source
+throws while running, that variant does return a `failed` outcome.
+
 When the parent run persists, each branch is stored under
 `.chidori/runs/<run>/branches/op-<seq>/branch-<k>/` (`source.ts`,
 `checkpoint.json`, `branch.json`, plus the fork-time VFS anchor), making
@@ -401,6 +415,11 @@ chidori branches <run-id>                                   # list branch stores
 chidori branch-resume <run-id> <branch-id> --value "blue"   # answer a paused input()
 chidori branch-rerun <run-id> <branch-id>                   # re-run edited source.ts from the anchor
 ```
+
+Under bare `chidori run`, `chidori.input()` inside a branch reads stdin.
+EOF without a declared input `default` fails the branch; it does not pause.
+A branch started under `chidori serve` can pause on input and then use
+`branch-resume`.
 
 A resumed or re-run branch updates only its own store; the parent's recorded
 `branch` outcome is immutable history. See `docs/branching-execution.md`.
@@ -413,6 +432,9 @@ chidori history <run-id>                    # commits + the journal ranges each 
 chidori history <run-id> --show <commit>    # print a stored version
 chidori history <run-id> --diff <a>..<b>    # unified diff between versions
 ```
+
+The recorded tree includes Chidori's synthetic `node:` module shims as well
+as files on disk.
 
 See `docs/source-history.md`.
 
@@ -450,6 +472,11 @@ await worker.stop();                          // cooperative stop, then join
 await worker.status();                        // { pid, status, restarts, mailbox, waitingFor? }
 await chidori.actors.lookup("researcher");    // a handle, or null
 ```
+
+Joining or stopping a top-level actor does not remove its registered name
+from the run's actor registry: `lookup(name)` can still find the terminal
+handle. Check `status()` or the settle outcome rather than using lookup as a
+live/dead test. Names of children reaped by a supervisor are released.
 
 Actors are supervised siblings of branches (`docs/actors.md`): each runs its
 own source module on an isolated VM and its records occupy a reserved,
@@ -519,6 +546,10 @@ registered agent at boot. Requires persistence. Statuses: `running`,
 counterpart yet), `completed`, `failed`, `stopped`. See
 `docs/detached-agents.md`.
 
+After an abrupt process exit, a detached run can remain `running` with
+`live:false` on a new server until its five-minute driver lease expires;
+queued signals are retained for that wake.
+
 ### alarm
 
 ```ts
@@ -559,6 +590,8 @@ const prompt = await chidori.template("prompts/summary.jinja", {
 ```
 
 Use templates for reusable prompt text. Inline templates are also supported.
+Rendering removes a template's final newline: a file containing
+`Hi {{ who }}\n` renders as `Hi user` when `who` is `"user"`.
 
 ### memory
 
@@ -575,7 +608,9 @@ Memory actions are logged and replay-aware. The store lives at
 workspace root (the agent file's directory under `run`/`resume`/`serve`, or
 `CHIDORI_WORKSPACE_ROOT`) — so memory is anchored to the agent, like runs and
 workspace, and persists across sessions regardless of the process's current
-directory. `CHIDORI_MEMORY_DIR` overrides the root.
+directory. `CHIDORI_MEMORY_DIR` overrides the root, not the final memory
+directory: a value of `/tmp/my-agent` stores the default namespace under
+`/tmp/my-agent/.chidori/memory/`.
 
 ### workspace
 
@@ -648,6 +683,10 @@ See `docs/value-checkpoints.md`.
 await chidori.compensation.register("deprovision", "comp/deprovision.ts", { serverId });
 // → { registered: true }
 ```
+
+`name` and `agent` must be non-empty strings, and `agent` must resolve to an
+existing module. An empty name or missing agent file rejects registration
+before a compensation is journaled.
 
 Durably register an inverse action — an agent module + its input — for a side
 effect the run just performed. Registration is one journal record and performs
@@ -802,7 +841,13 @@ pure compute are never gated.
 
 Session endpoints:
 
-- `POST /sessions`: create and run a session.
+The HTTP session `id` and its durable `run_id` can differ. Address the HTTP
+routes with `id`; use `run_id` for CLI commands and the journal directory
+`.chidori/runs/<run_id>/`.
+
+- `POST /sessions`: create and run a session; returns `201 Created` with the
+  session view even if the run pauses, or `400` with the failed session and
+  validation issues when its input schema rejects the input.
 - `GET /sessions`: list sessions.
 - `GET /sessions/{id}`: get session state.
 - `GET /sessions/{id}/checkpoint`: get call log plus optional
@@ -826,6 +871,7 @@ Session endpoints:
   input. `{status, body, headers?}` output shapes the HTTP response; a run
   that PAUSES (signal/input/approval) is stored as a real session and
   answered 202 with the session view, so the caller can deliver/resume it.
+  This 202 response is for the event route, not `POST /sessions`.
 
 Sessions persist across server restarts by default (SQLite at
 `.chidori/sessions.sqlite3` next to the agent). `CHIDORI_DB_PATH` overrides
