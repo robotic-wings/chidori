@@ -1061,6 +1061,14 @@ async fn fire_signal_timeout(state: &AppState, id: &str, seq: u64) {
         return;
     }
 
+    let resume_source = match resolve_persisted_session_source(state, session.run_id.as_deref()) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::error!(session_id = %session.id, run_id = ?session.run_id, %error, "signal timeout cannot recover agent source; preserving pause");
+            return;
+        }
+    };
+
     let sentinel = signal_timeout_sentinel(&names);
     let lock = state.signal_inbox_lock(session.run_id.as_deref().unwrap_or(id));
     let completed = {
@@ -1085,5 +1093,5 @@ async fn fire_signal_timeout(state: &AppState, id: &str, seq: u64) {
     };
     let mut call_log = session.call_log.clone();
     call_log.push(signal_resolution_record(&pending, seq, sentinel));
-    let _ = complete_pending_and_resume(state, session, call_log, state.agent_path.clone()).await;
+    let _ = complete_pending_and_resume(state, session, call_log, resume_source).await;
 }
