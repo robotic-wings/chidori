@@ -19,7 +19,7 @@ pub(crate) fn chidori_agent_env_json() -> String {
     }
 }
 
-pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
+const CHIDORI_JS_HELPERS_SCRIPT_TEMPLATE: &str = r#"
 (() => {
     globalThis.chidori = globalThis.chidori || {};
 
@@ -804,7 +804,21 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
                             );
                         }
                     } catch (e) {
-                        content = String(e && e.message ? e.message : e);
+                        const pauseMsg = String(e && e.message ? e.message : e);
+                        if (pauseMsg.indexOf("__CHIDORI_PAUSE_MARKER__") !== -1) {
+                            // A pause (signal / input / approval) unwinding out
+                            // of a tool body is run-level control flow, not a
+                            // tool failure: re-throw so the engine suspends the
+                            // whole run. On resume the journaled turns replay
+                            // from cache and the tool body re-executes to
+                            // completion (e.g. the signal now finds its
+                            // delivered payload). The model must never see the
+                            // marker; absorbing it here silently degraded the
+                            // pause into an isError tool result and the loop
+                            // kept burning turns.
+                            throw e;
+                        }
+                        content = pauseMsg;
                         isError = true;
                     }
                     current = current.toolResult(call.id, content, isError);
@@ -869,6 +883,18 @@ pub(crate) const CHIDORI_JS_HELPERS_SCRIPT: &str = r#"
     return null;
 })()
 "#;
+
+/// The pause sentinel must stay byte-identical with `runtime::errors`;
+/// splice it into the template so this file holds a single logical copy.
+pub(crate) fn chidori_js_helpers_script() -> &'static str {
+    static COMPOSED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        CHIDORI_JS_HELPERS_SCRIPT_TEMPLATE.replace(
+            "__CHIDORI_PAUSE_MARKER__",
+            crate::runtime::errors::PAUSE_MARKER,
+        )
+    });
+    &COMPOSED
+}
 
 /// Input-schema validation for the `run(handler, { inputSchema })` form.
 ///
