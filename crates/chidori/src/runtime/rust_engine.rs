@@ -846,7 +846,7 @@ fn run_module_inner(
     // `chidori.workspace`). Without this, `chidori.util.retry(...)` /
     // `chidori.memory.set(...)` calls hit `undefined is not a function`.
     engine
-        .eval_cached(crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT)
+        .eval_cached(crate::runtime::typescript::helpers::chidori_js_helpers_script())
         .map_err(|e| anyhow::anyhow!("installing chidori JS SDK helpers: {e}"))?;
     // Install the base networking surface (`globalThis.fetch` + Headers/Request/
     // Response) over the captured `__chidori_http` host op that
@@ -1147,7 +1147,7 @@ pub(crate) fn prewarm_module_graph(
     }
     // The helper scripts every run evaluates verbatim (see `run_module_inner`).
     for script in [
-        crate::runtime::typescript::helpers::CHIDORI_JS_HELPERS_SCRIPT,
+        crate::runtime::typescript::helpers::chidori_js_helpers_script(),
         crate::runtime::typescript::helpers::FETCH_POLYFILL,
         crate::runtime::typescript::helpers::INPUT_SCHEMA_SCRIPT,
     ] {
