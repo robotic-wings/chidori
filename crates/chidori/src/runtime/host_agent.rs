@@ -180,6 +180,30 @@ fn load_detached_signal_inbox(
     }
 }
 
+/// Durably acknowledge one consumed inbox entry: remove it from the signal
+/// inbox file in a store-level critical section, matching the in-context
+/// consume path's `remove_persisted_signal` semantics. A missing entry is
+/// already acknowledged; a malformed inbox fails closed.
+fn ack_detached_signal_delivery(
+    store: &dyn crate::runtime::store::RunStore,
+    queued: &QueuedSignal,
+) -> Result<(), String> {
+    let mut remove = |current: Option<Vec<u8>>| -> anyhow::Result<Vec<u8>> {
+        let mut inbox: Vec<QueuedSignal> = current
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()
+            .map_err(|err| anyhow::anyhow!("parsing signal inbox for acknowledgement: {err}"))?
+            .unwrap_or_default();
+        inbox.retain(|entry| entry.delivery_seq != queued.delivery_seq);
+        Ok(serde_json::to_vec_pretty(&inbox)?)
+    };
+    store
+        .update_blob(SIGNAL_INBOX_FILE, &mut remove)
+        .map(|_| ())
+        .map_err(|err| format!("updating signal inbox for acknowledgement: {err}"))
+}
+
 fn persist_stop_request(
     store: &dyn crate::runtime::store::RunStore,
     run_id: &str,
@@ -1562,6 +1586,7 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
         };
         #[cfg(test)]
         tests::pause_after_supervisor_inbox_snapshot(&entry.name);
+        let consumed_delivery_seq = std::cell::Cell::new(None::<u64>);
         if let Some(listen) = descriptor.listen.clone() {
             let matched = inbox
                 .iter()
@@ -1682,15 +1707,70 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                     }
                 };
                 if let Some(listen) = descriptor.listen.as_ref() {
+                    // Consume the matched delivery HERE rather than leaving it
+                    // for re-execution's take_queued_signal: inject the exact
+                    // CallRecord the live consume would write (lowest
+                    // delivery_seq across the name set wins, mirroring
+                    // take_queued_signal_any) and durably acknowledge the
+                    // entry in the same critical section. Both resume paths
+                    // then agree — replay consumes via try_replay_checked,
+                    // and a mainline VM image validates its frontier-plus-one
+                    // delivery (mainline_image::accept) and resolves the
+                    // parked listen from this record.
                     let matched = inbox
                         .iter()
-                        .any(|queued| listen.names.iter().any(|name| name == &queued.name));
-                    if matched {
+                        .filter(|queued| listen.names.iter().any(|name| name == &queued.name))
+                        .min_by_key(|queued| queued.delivery_seq)
+                        .cloned();
+                    if let Some(queued) = matched.as_ref() {
+                        // The in-memory snapshot handed to the context must
+                        // stay in step with the durable acknowledgement: a
+                        // later listen point must not re-consume this entry
+                        // after the delivery record already answered it.
+                        consumed_delivery_seq.set(Some(queued.delivery_seq));
+                    }
+                    if let Some(queued) = matched {
+                        ack_detached_signal_delivery(store.as_ref(), &queued).map_err(|err| {
+                            HibernateError::Other(format!(
+                                "acknowledging detached-agent signal delivery: {err}"
+                            ))
+                        })?;
                         replay.retain(|record| {
                             !(record.seq == listen.seq
                                 && record.function == listen.function
                                 && record.result.get("timedOut") == Some(&Value::Bool(true)))
                         });
+                        let delivery = CallRecord {
+                            seq: listen.seq,
+                            parent_seq: None,
+                            function: listen.function.clone(),
+                            args: if listen.function == "signal_any" {
+                                json!({ "names": listen.names })
+                            } else {
+                                json!({ "name": listen.names[0] })
+                            },
+                            result: json!({
+                                "name": queued.name,
+                                "payload": queued.payload,
+                                "from": queued.from,
+                            }),
+                            duration_ms: 0,
+                            token_usage: None,
+                            timestamp: Utc::now(),
+                            error: None,
+                        };
+                        // The record must be durable NOW: the replay consume
+                        // path (try_replay_checked) returns early without
+                        // re-recording, so a transient-only injection would
+                        // vanish from the next wake's journal and the
+                        // re-executed listen would pause again on history it
+                        // already consumed.
+                        write_store.append_record(&delivery).map_err(|err| {
+                            HibernateError::Other(format!(
+                                "appending detached-agent signal delivery record: {err}"
+                            ))
+                        })?;
+                        replay.push(delivery);
                     }
                 }
                 crate::runtime::snapshot::reconcile_detached_signal_timeout_promises(
@@ -1708,11 +1788,18 @@ fn supervise_detached(hub: &DetachedAgentHub, entry: &Arc<AgentEntry>) {
                 .map_err(|err| {
                     HibernateError::Other(format!("loading detached-agent host promises: {err:#}"))
                 })?;
+                let consumed_seq = consumed_delivery_seq.take();
                 let ctx = RuntimeContext::with_replay_host_promises_vfs_and_signals(
                     replay,
                     host_promises,
                     vfs,
-                    inbox,
+                    match consumed_seq {
+                        Some(seq) => inbox
+                            .into_iter()
+                            .filter(|entry| entry.delivery_seq != seq)
+                            .collect::<Vec<_>>(),
+                        None => inbox,
+                    },
                 );
                 ctx.set_run_id(run_id.clone());
                 ctx.set_input_mode(crate::runtime::context::InputMode::Pause);
