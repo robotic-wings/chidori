@@ -626,7 +626,7 @@ pub(crate) fn reconcile_detached_signal_timeout_promises(
         let Some(call) = calls_by_seq.get(&promise.operation.seq) else {
             continue;
         };
-        if !is_matching_detached_signal_timeout(&promise, call) {
+        if !is_matching_detached_signal_completion(&promise, call) {
             continue;
         }
         promise.state = HostPromiseState::Resolved {
@@ -647,7 +647,7 @@ pub(crate) fn reconcile_detached_signal_timeout_promises(
     Ok(())
 }
 
-fn is_matching_detached_signal_timeout(promise: &HostPromiseRecord, call: &CallRecord) -> bool {
+fn is_matching_detached_signal_completion(promise: &HostPromiseRecord, call: &CallRecord) -> bool {
     use PendingHostOperationKind::Signal;
 
     if call.error.is_some()
@@ -674,10 +674,12 @@ fn is_matching_detached_signal_timeout(promise: &HostPromiseRecord, call: &CallR
             }),
         _ => None,
     };
-    let Some(names) = names.filter(|names| !names.is_empty()) else {
-        return false;
-    };
-    call.result == crate::runtime::host_core::signal_timeout_sentinel(&names)
+    // The record at the promise's own seq with matching kind/function/args
+    // IS the listen's completion — its result is the resolution value,
+    // whether that is a delivered payload or the timeout sentinel. (The
+    // sentinel-only check predates supervisor-side delivery injection,
+    // which lands the delivered record before this reconcile runs.)
+    names.is_some()
 }
 
 fn load_composed_host_promise_records(

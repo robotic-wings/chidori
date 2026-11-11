@@ -14,7 +14,7 @@
 //! image that is absent, stale, or inapplicable costs a slower resume and
 //! nothing else.
 //!
-//! Scope is deliberately narrow (see [`SUSPENDABLE_PAUSE_EFFECTS`]): only
+//! Scope is deliberately narrow (see [`is_suspendable_pause`]): only
 //! effects that pause get converted. Converting the rest would move their
 //! results across a microtask boundary and change the interleaving replay
 //! depends on.
@@ -35,17 +35,6 @@ pub(crate) const IMAGE_BLOB: &str = "vm_image.json";
 /// not an error.
 const ENVELOPE_VERSION: u32 = 1;
 
-/// The effects whose host-side pause is converted into a VM suspension.
-///
-/// `input` only, for now. It is the dominant production pause (§5), and its
-/// resume is a plain value delivery — the pending operation is already durable
-/// before the pause, and the resume path already injects a synthetic record
-/// carrying the answer. Approval and signal/alarm pauses keep the classic
-/// unwind: their delivery paths (policy decisions, the signal mailbox and its
-/// timeout arming) re-derive state on the re-execution they still perform, so
-/// converting them is a separate change, not a wider list here.
-pub(crate) const SUSPENDABLE_PAUSE_EFFECTS: &[&str] = &["input"];
-
 /// Whether mainline pause imaging is on (`CHIDORI_MAINLINE_IMAGE`, default
 /// off). This is a scoped redesign of the pause path, so it is opt-in: with the
 /// flag unset the pause unwinds exactly as it always has and no image is
@@ -60,11 +49,15 @@ pub(crate) fn enabled() -> bool {
 /// Whether `err` — a host dispatch failure string — is a pause of an effect
 /// this mechanism converts. Anything else stays a thrown JS error.
 pub(crate) fn is_suspendable_pause(effect: &str, err: &str) -> bool {
-    SUSPENDABLE_PAUSE_EFFECTS.contains(&effect)
-        && matches!(
-            RunInterrupt::from_message(err),
-            Some(RunInterrupt::Input { .. })
-        )
+    // Kind-checked, not just name-checked: a `signal` dispatch can also fail
+    // for real reasons ("signal requires a string name"), and parking those
+    // would hang the run instead of surfacing the error.
+    match RunInterrupt::from_message(err) {
+        Some(RunInterrupt::Input { .. }) => effect == "input",
+        Some(RunInterrupt::Signal { .. }) => effect == "signal",
+        Some(RunInterrupt::SignalAny { .. }) => effect == "signal_any",
+        _ => false,
+    }
 }
 
 /// A mainline VM image plus everything needed to decide whether it still
@@ -456,6 +449,88 @@ mod tests {
         // The restore skipped re-execution but still owns the whole history.
         assert_eq!(imaged_resume.call_log.records().len(), 3);
         assert_eq!(imaged_resume.replayed_calls, 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The signal-listen twin of the input differential: a pause on
+    /// `chidori.signal` — the effect detached loop agents wait on (alarm is
+    /// lowered onto it) — must suspend, image, and restore to the same output
+    /// and journal that plain re-execution produces, with the delivered
+    /// record injected exactly as the detached supervisor now injects it.
+    #[test]
+    fn signal_image_resume_and_replay_resume_agree_on_output_and_journal() {
+        let _flag = FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let signal_agent = r#"
+            export async function agent(input, chidori) {
+                await chidori.log("waiting");
+                const message = await chidori.signal("ping");
+                await chidori.log("woke");
+                return { name: message.name, n: message.payload.n, seen: input.seen };
+            }
+        "#;
+
+        let run = |dir: &Path, base: &Path| -> (RunResult, RunResult) {
+            let path = dir.join("agent.ts");
+            std::fs::write(&path, signal_agent).unwrap();
+            let input = serde_json::json!({ "seen": 11 });
+            let paused = engine(dir, base).run_pausable(&path, &input).unwrap();
+            let pending = paused
+                .paused_signal
+                .clone()
+                .expect("the agent pauses on signal()");
+            assert!(pending.names.iter().any(|name| name == "ping"));
+            let mut replay = paused.call_log.clone().into_records();
+            replay.push(CallRecord {
+                seq: pending.seq,
+                parent_seq: None,
+                function: "signal".to_string(),
+                args: serde_json::json!({ "name": "ping" }),
+                result: serde_json::json!({
+                    "name": "ping",
+                    "payload": { "n": 5 },
+                    "from": { "kind": "human", "id": "mara" },
+                }),
+                duration_ms: 0,
+                token_usage: None,
+                timestamp: chrono::Utc::now(),
+                error: None,
+            });
+            let resumed = engine(dir, base)
+                .run_replay_pausable_with_host_promises_and_vfs_preserving_run_id(
+                    &path,
+                    &input,
+                    replay,
+                    Vec::new(),
+                    crate::runtime::vfs::Vfs::new(),
+                    paused.run_id.clone(),
+                )
+                .unwrap();
+            (paused, resumed)
+        };
+
+        let dir = scratch("mainline-image-signal-differential");
+        let (imaged_pause, imaged_resume) = {
+            let _on = FlagGuard::on();
+            run(&dir, &dir.join("imaged"))
+        };
+        let (replayed_pause, replayed_resume) = run(&dir, &dir.join("replayed"));
+
+        assert_eq!(
+            imaged_resume.output,
+            serde_json::json!({ "name": "ping", "n": 5, "seen": 11 })
+        );
+        assert_eq!(imaged_resume.output, replayed_resume.output);
+        assert_eq!(
+            shape(imaged_pause.call_log.records()),
+            shape(replayed_pause.call_log.records()),
+            "a signal suspension records no more than an unwind"
+        );
+        assert_eq!(
+            shape(imaged_resume.call_log.records()),
+            shape(replayed_resume.call_log.records()),
+            "restoring an image and re-executing the journal must leave the same history"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
