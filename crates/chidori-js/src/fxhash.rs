@@ -46,12 +46,10 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            // unwrap: chunks_exact(8) yields exactly 8 bytes.
-            self.add_to_hash(u64::from_le_bytes(c.try_into().unwrap()));
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for c in chunks {
+            self.add_to_hash(u64::from_le_bytes(*c));
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             let mut buf = [0u8; 8];
             buf[..rem.len()].copy_from_slice(rem);

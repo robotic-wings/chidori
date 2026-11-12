@@ -4468,7 +4468,7 @@ mod tests {
                     "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![
                         "run-bad-order",
-                        seq,
+                        seq as i64,
                         pos as i64,
                         serde_json::to_string(&record(seq, "tool")).unwrap()
                     ],
@@ -4525,7 +4525,7 @@ mod tests {
                     "INSERT INTO run_records (run_id, seq, pos, data) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![
                         "run-corrupt",
-                        seq,
+                        seq as i64,
                         pos as i64,
                         serde_json::to_string(&record(seq, "tool")).unwrap()
                     ],

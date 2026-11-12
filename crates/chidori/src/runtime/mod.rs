@@ -46,6 +46,7 @@ pub mod store;
 /// S3-compatible blob backend for the run store (S3 / R2 / GCS / MinIO).
 pub mod store_blob;
 pub mod template;
+mod tool_loop_resume_tests;
 pub mod typescript;
 pub mod vfs;
 pub mod workspace;
