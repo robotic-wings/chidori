@@ -26,6 +26,8 @@ pub mod native;
 // no-op module with the identical public surface compiles in its place, and
 // every call site works unchanged (start_run_span returns None, so all span
 // paths are dead).
+#[cfg(test)]
+mod characterization_tests;
 #[cfg(feature = "otel")]
 pub mod otel;
 #[cfg(not(feature = "otel"))]
