@@ -32,7 +32,6 @@ use crate::policy::{PolicyCache, PolicyConfig};
 use crate::providers::{LlmProvider, LlmRequest, LlmResponse, ProviderRegistry};
 use crate::runtime::call_log::CallRecord;
 use crate::runtime::context::RuntimeContext;
-use crate::runtime::engine::Engine;
 use crate::runtime::rust_engine::run_agent_file;
 use crate::runtime::snapshot::RuntimePolicy;
 use crate::runtime::template::TemplateEngine;
@@ -77,15 +76,6 @@ impl LlmProvider for SeqProvider {
     }
 }
 
-pub(crate) fn test_engine(dir: &Path, base: &Path) -> Engine {
-    Engine::new(
-        Arc::new(ProviderRegistry::new()),
-        Arc::new(TemplateEngine::new(dir)),
-        Arc::new(tokio::runtime::Runtime::new().unwrap()),
-    )
-    .with_persist_base(base.to_path_buf())
-}
-
 pub(crate) fn test_backend(ctx: RuntimeContext, providers: ProviderRegistry) -> HostBindingBackend {
     HostBindingBackend::for_runtime(
         ctx,
@@ -123,43 +113,9 @@ pub(crate) fn run_agent_src(
     }
 }
 
-/// Same as run_agent_src but with a pre-built context (for replay testing).
-pub(crate) fn run_agent_with_ctx(
-    dir: &Path,
-    src: &str,
-    input: Value,
-    providers: ProviderRegistry,
-    ctx: RuntimeContext,
-) -> Result<Value, String> {
-    let path = dir.join("agent.ts");
-    std::fs::write(&path, src).unwrap();
-    let backend = test_backend(ctx, providers);
-    match run_agent_file(&path, &input, &backend) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// Extract the recorded calls from a context after a run.
 pub(crate) fn recorded_calls(ctx: &RuntimeContext) -> Vec<CallRecord> {
     ctx.call_log().into_records()
-}
-
-/// Helper: shape of a CallRecord for comparison.
-pub(crate) type RecShape = (u64, String, Value, Value, Option<String>);
-pub(crate) fn shape(records: &[CallRecord]) -> Vec<RecShape> {
-    records
-        .iter()
-        .map(|r| {
-            (
-                r.seq,
-                r.function.clone(),
-                r.args.clone(),
-                r.result.clone(),
-                r.error.clone(),
-            )
-        })
-        .collect()
 }
 
 /// Provider that returns a single fixed response.
@@ -281,7 +237,7 @@ fn ct_003_agent_throwing_returns_error_string() {
 fn ct_004_null_input_to_agent() {
     let dir = scratch("ct004");
     let (p, _) = fixed_provider("x");
-    let out = run_agent_src(
+    let _out = run_agent_src(
         &dir,
         r#"
         export async function agent(input) {
@@ -483,6 +439,7 @@ fn ct_012_step_effect_records_begin_end() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
 fn ct_013_memory_set_get_roundtrip() {
     let dir = scratch("ct013");
     let (p, _) = fixed_provider("x");
@@ -600,11 +557,9 @@ fn ct_017_signal_empty_mailbox_pauses_run() {
     // In Pause mode, the run should pause with a signal listen point
     assert!(
         result.is_err()
-            || result
-                .as_ref()
-                .err()
-                .map_or(true, |e| e.to_string().contains("PAUSED")
-                    || e.to_string().contains("nobody-home"))
+            || result.as_ref().err().is_none_or(
+                |e| e.to_string().contains("PAUSED") || e.to_string().contains("nobody-home")
+            )
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -894,7 +849,7 @@ fn ct_027_signal_requires_string_name() {
         p,
     );
     // characterize: either error or pause — pin that it fails
-    assert!(result.is_err() || result.as_ref().err().map_or(true, |e| !e.is_empty()));
+    assert!(result.is_err() || result.as_ref().err().is_none_or(|e| !e.is_empty()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -922,6 +877,7 @@ fn ct_028_alarm_as_signal_in_journal() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
 fn ct_029_signal_timeout_ms_recorded_in_args() {
     let dir = scratch("ct029");
     let ctx = RuntimeContext::new();
@@ -1035,7 +991,7 @@ fn ct_033_input_journal_args_carry_prompt() {
     let dir = scratch("ct033");
     let ctx = RuntimeContext::new();
     let (p, _) = fixed_provider("x");
-    let backend = test_backend(ctx.clone(), p);
+    let _backend = test_backend(ctx.clone(), p);
     let path = dir.join("agent.ts");
     std::fs::write(
         &path,
@@ -1055,8 +1011,8 @@ fn ct_033_input_journal_args_carry_prompt() {
 #[test]
 fn ct_034_input_with_choices_option() {
     let dir = scratch("ct034");
-    let (p, reqs) = fixed_provider("yes");
-    let out = run_agent_src(
+    let (p, _reqs) = fixed_provider("yes");
+    let _out = run_agent_src(
         &dir,
         r#"
         export async function agent(_input: {}) {
@@ -1079,7 +1035,7 @@ fn ct_034_input_with_choices_option() {
 #[test]
 fn ct_035_input_replay_with_delivered_answer() {
     let dir = scratch("ct035");
-    let (p, _) = fixed_provider("x");
+    let (_p, _) = fixed_provider("x");
     let path = dir.join("agent.ts");
     std::fs::write(
         &path,
@@ -1149,16 +1105,8 @@ fn ct_047_tool_error_becomes_is_error_tool_result() {
     let ctx = RuntimeContext::new();
     let (p, _) = tool_provider(vec![vec![("fail", r#"{}"#)]], "handled");
     let backend = test_backend(ctx.clone(), p);
+    // An agent with a tool that always throws
     let path = dir.join("agent.ts");
-    std::fs::write(
-        &path,
-        r#"
-        import { chididori, run, defineTool } from "chidori:agent";
-        // @ts-ignore — intentional typo to test error path? No, that won't compile.
-        // Use a working import and a tool that throws:
-    "#,
-    );
-    // Write a proper agent that has a tool that throws
     std::fs::write(
         &path,
         r#"
@@ -1379,7 +1327,7 @@ fn ct_052_tool_mark_journaled_with_name() {
             && r.args
                 .get("label")
                 .and_then(|l| l.as_str())
-                .map_or(false, |s| s.starts_with("tool:"))
+                .is_some_and(|s| s.starts_with("tool:"))
     });
     assert!(
         tool_mark.is_some(),
@@ -1817,7 +1765,7 @@ fn ct_076_supervisor_consumes_lowest_delivery_seq() {
     // which may be FIFO (last enqueued = first consumed) or delivery_seq based
     let consumed = out["seq"].as_i64().unwrap_or(0);
     assert!(
-        consumed >= 1 && consumed <= 3,
+        (1..=3).contains(&consumed),
         "should consume one of the queued entries"
     );
     let _ = std::fs::remove_dir_all(dir);

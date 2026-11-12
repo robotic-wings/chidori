@@ -171,6 +171,10 @@ pub(super) fn build_cors_layer() -> CorsLayer {
 /// the semaphore via `acquire_owned`, so holding it across an `.await`
 /// (e.g. `spawn_blocking`) is fine — dropping the permit releases the
 /// slot automatically.
+// The `Err` payload is an axum `Response` (large but cheap to move in the
+// error path this function takes at most once per rejected request); boxing
+// it would ripple through every caller for no behavioral gain.
+#[allow(clippy::result_large_err)]
 pub(super) async fn acquire_run_slot(
     state: &AppState,
 ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, Response> {
