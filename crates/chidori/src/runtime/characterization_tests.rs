@@ -20,6 +20,7 @@
 //!   096-100  Host effects (memory, alarm, log, mark, template)
 
 #![cfg(test)]
+#![allow(unused)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
